@@ -17,7 +17,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import caller, config, discovery, registry
+from . import caller, config, discovery, registry, uihook
 
 
 logger = logging.getLogger('cross_agent_mcp.bridge')
@@ -146,9 +146,28 @@ def _run_cli(command: List[str], cwd: str, env: Dict[str, str], timeout: int) ->
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
-def _call_claude(message: str, session_id: Optional[str], cwd: str,
-                 env: Dict[str, str], timeout: int) -> Dict[str, Any]:
+def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, Any],
+                    timeout: int) -> Dict[str, Any]:
+    """Deliver through the editor panel shim, so the exchange shows up in the panel."""
+    response = uihook.send(message, ui_shim, session_id, timeout)
+    if not response.get('ok'):
+        raise BridgeError(f'IDE panel relay failed: {response.get("error")}')
+
+    return {
+        'session_id': response.get('sessionId') or session_id or '',
+        'reply': str(response.get('reply') or '').strip(),
+        'is_new_session': False,
+        'usage': None,
+        'cost_usd': None,
+    }
+
+
+def _call_claude(message: str, session_id: Optional[str], cwd: str, env: Dict[str, str],
+                 timeout: int, ui_shim: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Resume (or create) a Claude Code session and return its final message."""
+    if ui_shim:
+        return _call_via_panel(message, session_id, ui_shim, timeout)
+
     is_new = session_id is None
     target_id = session_id or str(uuid.uuid4())
 
@@ -190,9 +209,17 @@ def _call_claude(message: str, session_id: Optional[str], cwd: str,
     }
 
 
-def _call_codex(message: str, session_id: Optional[str], cwd: str,
-                env: Dict[str, str], timeout: int) -> Dict[str, Any]:
-    """Resume (or create) a Codex thread and return its final message."""
+def _call_codex(message: str, session_id: Optional[str], cwd: str, env: Dict[str, str],
+                timeout: int, ui_shim: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Deliver to a Codex thread and return its final message.
+
+    With a shim available the turn is started on the app-server the editor panel is attached
+    to, so the exchange shows up in the panel. Otherwise the thread is resumed over the CLI,
+    which keeps the context but stays invisible to the panel until it is reopened.
+    """
+    if ui_shim:
+        return _call_via_panel(message, session_id, ui_shim, timeout)
+
     is_new = session_id is None
 
     if is_new:
@@ -249,10 +276,60 @@ CALLERS = {config.AGENT_CLAUDE: _call_claude, config.AGENT_CODEX: _call_codex}
 
 # ------------------------------------------------------------------ dispatch
 
+PANEL_SETTING = {
+    config.AGENT_CODEX: 'chatgpt.cliExecutable -> codex-shim.sh',
+    config.AGENT_CLAUDE: 'claudeCode.claudeProcessWrapper -> claude-shim.sh',
+}
+
+
+def _resolve_ide_panel(target_agent: str, exclude_ids: List[str], session_id: Optional[str],
+                       cwd: str) -> Optional[Dict[str, Any]]:
+    """The peer session open in this editor window, reached through its panel shim.
+
+    An explicit session id wins, then a sticky pin, then the tab the user last typed into.
+    A requested session that is not open in any panel falls through to the CLI path.
+    """
+    if not uihook.is_enabled():
+        return None
+
+    wanted = session_id
+    if not wanted:
+        pin = registry.get_pin(target_agent, cwd)
+        if pin and pin.get('is_sticky'):
+            wanted = pin.get('session_id')
+
+    live = uihook.find_live_session(target_agent, wanted)
+    if not live and wanted:
+        return None
+
+    if not live or live.get('session_id') in exclude_ids:
+        if config.UI_HOOK_MODE == uihook.UI_HOOK_REQUIRE:
+            raise BridgeError(
+                f'CROSS_AGENT_UI_HOOK=require but no live {target_agent} panel session was found '
+                f'for this editor window. Check that {PANEL_SETTING.get(target_agent)} is set and '
+                'that a panel is open.')
+        return None
+
+    return {
+        'agent': target_agent,
+        'session_id': live['session_id'],
+        'cwd': live.get('cwd'),
+        'source': 'ide-panel',
+        'ui_shim': live['shim'],
+        'is_active': True,
+        'mtime': live.get('last_seen', time.time()),
+    }
+
+
 def _resolve_target(target_agent: str, session_id: Optional[str], scope: str, cwd: str,
                     is_new_forced: bool, exclude_ids: List[str]) -> Optional[Dict[str, Any]]:
     if is_new_forced:
         return None
+
+    # the panel the user is actually looking at wins over anything inferred from transcripts
+    panel = _resolve_ide_panel(target_agent, exclude_ids, session_id, cwd)
+    if panel:
+        return panel
 
     if session_id:
         found = discovery.find_session(target_agent, session_id)
@@ -327,6 +404,14 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
                     f'(conversation {e.holder.get("conversation_id")}). Answer directly instead '
                     'of relaying back into it.')
 
+        # Mark our own session busy too. Panel delivery bypasses the child-process env, so this
+        # file lock is what stops the peer from relaying straight back into a session that is
+        # already blocked waiting for it.
+        if self_session_id:
+            with contextlib.suppress(registry.SessionBusyError):
+                stack.enter_context(
+                    registry.busy_lock(sender_agent, self_session_id, conversation_id))
+
         record = registry.bump_conversation(conversation_id, sender_agent, target_agent)
         hop = int(record.get('hops', 1))
         remaining = max(config.MAX_HOPS - hop, 0)
@@ -349,7 +434,8 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         logger.info(f'send_message [BEGIN]: {sender_agent}->{target_agent} '
                     f'session={target_id or "NEW"} conv={conversation_id} hop={hop}')
 
-        result = CALLERS[target_agent](payload, target_id, run_cwd, env, timeout)
+        ui_shim = (target or {}).get('ui_shim')
+        result = CALLERS[target_agent](payload, target_id, run_cwd, env, timeout, ui_shim)
 
     if result['is_new_session'] and result['session_id']:
         registry.set_pin(target_agent, cwd, result['session_id'], run_cwd,
@@ -367,6 +453,8 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         'target_session_id': result['session_id'],
         'session_origin': 'created' if result['is_new_session'] else (target or {}).get('source', 'unknown'),
         'was_session_created': result['is_new_session'],
+        'delivery': 'ide-panel' if (target or {}).get('ui_shim') else 'cli-resume',
+        'is_visible_in_panel': bool((target or {}).get('ui_shim')),
         'sender_agent': sender_agent,
         'conversation_id': conversation_id,
         'is_new_conversation': is_new_conversation,

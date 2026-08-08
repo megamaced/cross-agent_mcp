@@ -59,6 +59,11 @@ SEND_TIMEOUT_SECONDS: int = get_env_int('CROSS_AGENT_TIMEOUT', 600)
 # 'cwd' = only sessions rooted at the same directory, 'any' = every recorded session
 DEFAULT_SCOPE: str = get_env_str('CROSS_AGENT_SCOPE', 'cwd')
 
+# Deliver into the Codex thread open in this editor window through the app-server shim.
+# 'auto' uses it when a shim is running, 'off' always relays over the CLI, 'require' fails
+# rather than silently falling back to a headless resume the panel will not show.
+UI_HOOK_MODE: str = get_env_str('CROSS_AGENT_UI_HOOK', 'auto')
+
 # applied only when the bridge has to spawn a brand new session
 CODEX_SANDBOX: str = get_env_str('CROSS_AGENT_CODEX_SANDBOX', 'read-only')
 CODEX_MODEL: Optional[str] = get_env_optional('CROSS_AGENT_CODEX_MODEL')

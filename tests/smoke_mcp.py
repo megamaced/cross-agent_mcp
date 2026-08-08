@@ -16,7 +16,7 @@ from mcp.client.stdio import stdio_client
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + '/src')
 
-from cross_agent_mcp import config, discovery, registry  # noqa: E402
+from cross_agent_mcp import config, discovery, registry, uihook  # noqa: E402
 
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -84,8 +84,12 @@ async def main() -> int:
                 return 1
             print(f'[ok] hop guard -> refused after {config.MAX_HOPS} hops')
 
-            target = discovery.find_active_session(
-                config.AGENT_CODEX, config.DEFAULT_SCOPE, ROOT_DIR)
+            # resolve the target the same way the bridge does: the panel session wins over
+            # anything inferred from transcripts, and the lock has to land on that one
+            target = (uihook.find_live_session(config.AGENT_CODEX) if uihook.is_enabled() else None)
+            if not target:
+                target = discovery.find_active_session(
+                    config.AGENT_CODEX, config.DEFAULT_SCOPE, ROOT_DIR)
             if target:
                 with registry.busy_lock(config.AGENT_CODEX, target['session_id'], 'conv_smoke_busy'):
                     blocked = json.loads(_text_of(await session.call_tool(
@@ -95,7 +99,7 @@ async def main() -> int:
                     return 1
                 print('[ok] busy guard -> refused while the peer session is awaiting a reply')
             else:
-                print('[skip] busy guard -> no active Codex thread in this directory')
+                print('[skip] busy guard -> no reachable Codex session in this directory')
 
     print('\nALL CHECKS PASSED')
     return 0

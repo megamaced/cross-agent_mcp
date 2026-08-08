@@ -19,10 +19,12 @@ session A        thread B
    (~/.cross-agent/registry.json)
 ```
 
-| 방향 | 도구 | 내부 동작 |
-|---|---|---|
-| Claude → Codex | `send_to_codex` | `codex exec resume <thread-id> --json "<msg>"` |
-| Codex → Claude | `send_to_claude` | `claude -p --resume <session-id> --output-format json "<msg>"` |
+| 방향 | 도구 | 패널 셰임이 있을 때 | 없을 때 (폴백) |
+|---|---|---|---|
+| Claude → Codex | `send_to_codex` | 패널 app-server에 `turn/start` 주입 | `codex exec resume <thread-id> --json` |
+| Codex → Claude | `send_to_claude` | 패널 프로세스에 stream-json 사용자 메시지 주입 | `claude -p --resume <session-id> --output-format json` |
+
+셰임을 붙이면 교신이 **실제 VS Code 패널에 그대로 렌더링**된다(3장 참고).
 
 ---
 
@@ -86,7 +88,7 @@ codex mcp add cross-agent \
 ```toml
 [mcp_servers.cross-agent]
 command = "/Users/dexter/project/cross-agent_mcp/run-server.sh"
-default_tools_approval_mode = "auto"   # UI에서 매번 승인 프롬프트가 뜨지 않도록 (수동 추가)
+default_tools_approval_mode = "approve"   # UI에서 매번 승인 프롬프트가 뜨지 않도록 (수동 추가)
 
 [mcp_servers.cross-agent.env]
 CROSS_AGENT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
@@ -94,7 +96,22 @@ CROSS_AGENT_CODEX_SANDBOX = "danger-full-access"
 ```
 
 `default_tools_approval_mode`는 `codex mcp add`에 해당 플래그가 없어 config.toml에 직접 넣는다.
-헤드리스 `codex exec`의 취소 문제는 이것으로 해결되지 않는다(9장 참고).
+유효값은 `auto` / `prompt` / `writes` / `approve`이며, 매번 뜨는 승인 프롬프트를 없애려면
+`approve`를 쓴다(`auto`로는 계속 물어봤다). 헤드리스 `codex exec`의 취소 문제는 이것으로
+해결되지 않는다(9장 참고). UI 프롬프트에서 **"Always allow"** 를 한 번 눌러도 같은 효과다.
+
+### 승인 프롬프트 끄기 (Claude Code)
+
+Claude Code는 MCP 도구 호출마다 승인을 묻는다. `~/.claude/settings.json`에 서버 단위
+규칙을 추가하면 된다(도구별 나열이나 `*` 와일드카드가 아니라 **서버 이름 하나**).
+
+```json
+{
+  "permissions": {
+    "allow": ["mcp__cross-agent"]
+  }
+}
+```
 
 > ⚠️ 위 두 환경변수는 **브리지를 통해 도달한 에이전트의 안전장치를 끈다.**
 > Claude는 권한 확인 없이 파일을 수정·명령을 실행하고, 새로 생성되는 Codex 세션은
@@ -103,6 +120,79 @@ CROSS_AGENT_CODEX_SANDBOX = "danger-full-access"
 
 > 등록 직후에는 **VS Code 창을 새로고침**하거나 새 세션을 시작해야 도구가 잡힌다.
 > MCP 서버는 세션 시작 시점에만 연결된다.
+
+### IDE 패널 연동 (양방향)
+
+CLI resume 경로(`codex exec resume` / `claude -p --resume`)는 세션 기록에 턴을 덧붙이므로
+문맥은 유지되지만 **VS Code 패널에는 나타나지 않는다.** 패널의 세션은 확장이 stdio로 직결해
+띄운 자식 프로세스 안에만 살아 있고, 밖에서 들어갈 통로가 없기 때문이다.
+
+두 셰임을 그 파이프 가운데 끼우면 해결된다.
+
+```
+VS Code 확장 ──stdio──▶ codex-shim.sh  ──stdio──▶ 진짜 codex app-server
+VS Code 확장 ──stdio──▶ claude-shim.sh ──stdio──▶ 진짜 claude (stream-json)
+                            ▲
+                            │ 유닉스 소켓
+                      cross-agent MCP  ──▶ 메시지 주입 ──▶ 패널에 렌더링
+```
+
+VS Code 사용자 설정에 추가하고 **창을 새로고침**한다.
+
+```json
+"chatgpt.cliExecutable": "/Users/dexter/project/cross-agent_mcp/codex-shim.sh",
+"claudeCode.claudeProcessWrapper": "/Users/dexter/project/cross-agent_mcp/claude-shim.sh"
+```
+
+| | Codex | Claude Code |
+|---|---|---|
+| 설정 키 | `chatgpt.cliExecutable` (바이너리 **교체**) | `claudeCode.claudeProcessWrapper` (`<wrapper> <진짜경로> <args>`) |
+| 가로채는 호출 | plain `app-server` | `--input-format stream-json` 세션 |
+| 주입 방식 | JSON-RPC `turn/start` (id는 `xagent-` 네임스페이스) | stream-json `{"type":"user",...}` |
+| 세션 id 출처 | `thread/started` · 요청 params | argv `--resume=` · `system/init` |
+| 사람 입력 관측 | 확장이 보낸 `turn/start` · `turn/steer` | 확장이 보낸 `{"type":"user"}` |
+| 패널 표시 | 사용자 메시지 + 응답 | 사용자 메시지 + 응답 |
+| 설정 성격 | "DEVELOPMENT ONLY" 표시 | 정식 설정 |
+
+공통 규칙:
+
+- 모든 바이트를 그대로 통과시키고, **패널 세션 호출만** 가로챈다
+  (`--version`, `login`, `app-server daemon`, `claude -p` 등은 진짜 바이너리로 exec)
+- 진짜 바이너리는 확장 디렉터리에서 자동 탐색한다
+  (`CROSS_AGENT_REAL_CODEX` / `CROSS_AGENT_REAL_CLAUDE`로 지정 가능)
+- 어떤 이유로든 실패하면 진짜 바이너리를 그대로 exec 한다 (fail-open)
+- 셰임은 자기 pid 조상 목록을 `~/.cross-agent/panels/<agent>-<pid>.json`에 기록한다.
+  브리지는 **자신과 조상을 공유하는 셰임**을 고르므로, 창이 여러 개여도
+  "지금 이 IDE 인스턴스"를 정확히 겨냥한다
+- Claude 셰임은 사용자가 대화 중이면 그 턴이 끝날 때까지 기다렸다가 주입한다
+
+#### 어느 대화 탭으로 가는가
+
+확장은 **대화 탭마다 프로세스를 따로 띄우므로** 한 창에 셰임이 여러 개 뜬다. 어느 탭이
+포커스인지는 어디에도 기록되지 않으므로, 다음 순서의 증거로 고른다.
+
+```
+1. send_to_*(session_id=...) 로 명시한 세션
+2. pin_agent_session 으로 고정한 세션
+3. 사람이 마지막으로 입력한 탭 (셰임이 확장→에이전트 방향에서 직접 관측)
+4. (셰임 기동 후 아무도 입력하지 않은 경우 - 예: 창 새로고침 직후)
+   트랜스크립트가 가장 최근에 갱신된 탭
+5. 가장 나중에 열린 탭
+```
+
+관측된 사람 입력이 트랜스크립트 시각보다 **항상 우선**한다. 브리지가 주입한 턴도
+트랜스크립트를 건드리므로, 그렇지 않으면 브리지가 자기가 마지막에 쓴 탭을 계속
+다시 고르게 된다. 주입 턴은 관측 대상이 아니라 이 오염이 애초에 생기지 않는다.
+
+`bridge_status`의 `ide_panels`가 열린 탭 목록과 선택 결과를 그대로 보여준다.
+원하는 탭이 아니면 `pin_agent_session`으로 고정하면 된다.
+
+`CROSS_AGENT_UI_HOOK`으로 동작을 고른다 — `auto`(기본, 있으면 쓰고 없으면 CLI로 폴백),
+`off`(항상 CLI), `require`(패널을 못 찾으면 조용히 폴백하지 않고 실패).
+
+> ⚠️ 셰임은 확장과 에이전트 사이에 끼는 프로세스다. 확장이 업데이트되면 깨질 수 있고,
+> `chatgpt.cliExecutable`은 확장이 "DEVELOPMENT ONLY"로 표시한 application 스코프 설정이다.
+> 되돌리려면 해당 설정 줄을 지우고 창을 새로고침하면 된다.
 
 ### 상태 점검
 
@@ -194,6 +284,9 @@ CROSS_AGENT_CODEX_SANDBOX = "danger-full-access"
 | `CROSS_AGENT_MAX_HOPS` | `4` | 대화당 최대 중계 횟수 |
 | `CROSS_AGENT_TIMEOUT` | `600` | 상대 턴 대기 시간(초) |
 | `CROSS_AGENT_SCOPE` | `cwd` | 기본 탐색 범위 (`cwd` / `tree` / `any`) |
+| `CROSS_AGENT_UI_HOOK` | `auto` | Codex 패널 주입 (`auto` / `off` / `require`) |
+| `CROSS_AGENT_REAL_CODEX` | (자동 탐색) | 셰임이 감쌀 진짜 codex 바이너리 |
+| `CROSS_AGENT_REAL_CLAUDE` | (자동 탐색) | 셰임이 감쌀 진짜 claude 바이너리 |
 | `CROSS_AGENT_CODEX_SANDBOX` | `read-only` | **신규 생성** Codex 세션의 샌드박스 (`read-only` / `workspace-write` / `danger-full-access`) |
 | `CROSS_AGENT_CLAUDE_PERMISSION_MODE` | (미설정) | Claude 호출 시 `--permission-mode` (`acceptEdits` / `bypassPermissions` / `plan` 등) |
 | `CROSS_AGENT_CODEX_MODEL` / `CROSS_AGENT_CLAUDE_MODEL` | (미설정) | 모델 강제 |
@@ -215,6 +308,10 @@ Codex에서는 `codex mcp add cross-agent --env KEY=VALUE -- <script>`.
 ```bash
 # 잠금/pin/스코프/타임아웃 단위 검증 (에이전트 턴 소비 없음)
 PYTHONPATH=src .venv/bin/python tests/unit_guards.py
+
+# 셰임 통과·주입·패널 렌더링 검증 (VS Code 설정 불필요)
+PYTHONPATH=src .venv/bin/python tests/shim_roundtrip.py          # Codex 턴 1회
+PYTHONPATH=src .venv/bin/python tests/claude_shim_roundtrip.py   # Claude 턴 2회
 
 # 프로토콜 핸드셰이크 + 탐색 + 3종 가드 (에이전트 턴 소비 없음)
 PYTHONPATH=src .venv/bin/python tests/smoke_mcp.py
@@ -245,8 +342,13 @@ PYTHONPATH=src .venv/bin/python tests/live_roundtrip.py
   참고로 `[permissions.<profile>]` / `default_permissions`는 실재하는 설정이지만
   샌드박스 파일시스템·네트워크 권한용이라 이 문제와 무관하다.
   즉 **헤드리스 Codex→Claude는 현재 upstream 한계**이며, 대화형 사용에는 영향이 없다.
-- **UI 반영 시점** — 브리지는 세션 트랜스크립트에 턴을 덧붙인다. VS Code 채팅창은
-  실시간으로 갱신되지 않고, 해당 세션을 다시 열거나 이어서 대화할 때 반영된다.
+- **UI 반영 시점** — 셰임을 붙이지 않으면 브리지는 세션 트랜스크립트에 턴을 덧붙일 뿐이라
+  VS Code 채팅창이 실시간으로 갱신되지 않는다(해당 세션을 다시 열 때 반영).
+  3장의 두 셰임을 설정하면 양방향 모두 패널에 그려진다.
+- **셰임 경유 시 체인 상태 전파** — 패널 주입은 자식 프로세스를 새로 띄우지 않으므로
+  `CROSS_AGENT_CONVERSATION_ID` 같은 환경변수가 상대에게 전달되지 않는다. 대신 발신자
+  자신의 세션에도 busy 잠금을 걸어 되돌아오는 relay를 막고, 봉투 헤더에 conversation id를
+  실어 상대가 같은 대화로 이어붙일 수 있게 한다.
 - **동시 쓰기** — busy 잠금은 브리지가 보내는 relay끼리는 원자적으로 막아 주지만,
   **사람이 VS Code 채팅창에 직접 입력 중인 세션**은 보호하지 못한다(그쪽은 잠금을 모른다).
   상대가 지금 타이핑 중인 세션을 겨냥하지 않는 것이 안전하다.

@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from mcp.server import MCPServer
 
-from . import bridge, caller, config, discovery, registry
+from . import bridge, caller, config, discovery, registry, uihook
 
 
 logger = logging.getLogger('cross_agent_mcp')
@@ -224,6 +224,21 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None) 
         except Exception as e:
             resolved[name] = {'error': str(e)}
 
+    panels: Dict[str, Any] = {}
+    for name in (config.AGENT_CLAUDE, config.AGENT_CODEX):
+        sessions = (await _run_blocking(uihook.find_live_sessions, name)
+                    if uihook.is_enabled() else [])
+        panels[name] = {
+            'selected_session_id': sessions[0]['session_id'] if sessions else None,
+            'open_sessions': [{
+                'session_id': s['session_id'],
+                'cwd': s.get('cwd'),
+                'shim_pid': s.get('shim_pid'),
+                'last_user_activity': s.get('last_user_activity'),
+                'started_at': s.get('started_at'),
+            } for s in sessions],
+        }
+
     return {
         'ok': True,
         'running_under': identity['agent'],
@@ -231,6 +246,14 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None) 
         'cwd': target_cwd,
         'scope': scope,
         'resolved_sessions': resolved,
+        'ide_panels': {
+            'mode': config.UI_HOOK_MODE,
+            'note': ('open_sessions lists every conversation tab of this editor window, ordered '
+                     'by when the human last typed into it; selected_session_id is where a relay '
+                     'would land. Use pin_agent_session to force a different one. A peer with no '
+                     'open_sessions falls back to a headless CLI resume the panel will not show.'),
+            **panels,
+        },
         'settings': {
             'active_window_minutes': config.ACTIVE_WINDOW_MINUTES,
             'max_hops': config.MAX_HOPS,

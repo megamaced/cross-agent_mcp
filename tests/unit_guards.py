@@ -179,6 +179,60 @@ def test_timeout_kills_descendants() -> None:
               not registry._is_pid_alive(grandchild), f'pid {grandchild} still alive')
 
 
+# --------------------------------------- which conversation tab a relay lands in
+
+def test_panel_session_selection() -> None:
+    from cross_agent_mcp import uihook
+
+    now = time.time()
+    shims = [
+        {'agent': 'claude', 'pid': 1, 'socket': '/s1', 'ancestors': [99], 'started_at': now - 300},
+        {'agent': 'claude', 'pid': 2, 'socket': '/s2', 'ancestors': [99], 'started_at': now - 200},
+        {'agent': 'claude', 'pid': 3, 'socket': '/s3', 'ancestors': [99], 'started_at': now - 100},
+    ]
+    statuses = {
+        '/s1': {'ok': True, 'last_user_activity': 0,
+                'sessions': [{'session_id': 'old-tab', 'cwd': '/w'}]},
+        '/s2': {'ok': True, 'last_user_activity': now - 5,
+                'sessions': [{'session_id': 'typed-tab', 'cwd': '/w'}]},
+        '/s3': {'ok': True, 'last_user_activity': 0,
+                'sessions': [{'session_id': 'newest-tab', 'cwd': '/w'}]},
+    }
+    transcripts = {'old-tab': now - 900, 'typed-tab': now - 900, 'newest-tab': now - 10}
+
+    originals = (uihook.list_shims, uihook.process_ancestry,
+                 uihook.read_status, uihook._transcript_mtime)
+    uihook.list_shims = lambda agent=None: [s for s in shims if not agent or s['agent'] == agent]
+    uihook.process_ancestry = lambda pid, depth=12: [99]
+    uihook.read_status = lambda shim: statuses[shim['socket']]
+    uihook._transcript_mtime = lambda agent, session_id: transcripts.get(session_id, 0.0)
+
+    try:
+        check('the tab the human typed into wins',
+              uihook.find_live_session('claude')['session_id'] == 'typed-tab',
+              str([s['session_id'] for s in uihook.find_live_sessions('claude')]))
+
+        check('an explicit session id overrides the ordering',
+              uihook.find_live_session('claude', 'old-tab')['session_id'] == 'old-tab')
+        check('a session that is not open in any panel is not matched',
+              uihook.find_live_session('claude', 'not-open') is None)
+
+        # nobody has typed since the shims started: fall back to the freshest transcript
+        statuses['/s2']['last_user_activity'] = 0
+        check('with no observed input the freshest transcript wins',
+              uihook.find_live_session('claude')['session_id'] == 'newest-tab',
+              str([s['session_id'] for s in uihook.find_live_sessions('claude')]))
+
+        # and with no evidence at all, the most recently opened tab
+        for session_id in transcripts:
+            transcripts[session_id] = 0.0
+        check('with no evidence at all the newest tab wins',
+              uihook.find_live_session('claude')['session_id'] == 'newest-tab')
+    finally:
+        (uihook.list_shims, uihook.process_ancestry,
+         uihook.read_status, uihook._transcript_mtime) = originals
+
+
 if __name__ == '__main__':
     test_busy_lock_is_exclusive()
     test_busy_lock_release_respects_owner()
@@ -187,6 +241,7 @@ if __name__ == '__main__':
     test_cwd_relations()
     test_codex_scan_filters_before_limit()
     test_timeout_kills_descendants()
+    test_panel_session_selection()
 
     print(f'\n{"ALL UNIT CHECKS PASSED" if not FAILURES else str(len(FAILURES)) + " CHECK(S) FAILED"}')
     sys.exit(1 if FAILURES else 0)
