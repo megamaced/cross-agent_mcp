@@ -84,7 +84,9 @@ class PanelShim:
     def status(self) -> Dict[str, Any]:
         raise NotImplementedError
 
-    def inject(self, text: str, session_id: Optional[str], timeout: int) -> Dict[str, Any]:
+    def inject(self, text: str, session_id: Optional[str], timeout: int,
+               cwd: Optional[str] = None, title: Optional[str] = None) -> Dict[str, Any]:
+        """Deliver a message into the panel, opening a conversation if none is running."""
         raise NotImplementedError
 
     # --------------------------------------------------------------- registry
@@ -124,6 +126,8 @@ class PanelShim:
                 str(request.get('text') or ''),
                 request.get('sessionId') or request.get('threadId'),
                 int(request.get('timeout') or DEFAULT_INJECT_TIMEOUT),
+                request.get('cwd'),
+                request.get('title'),
             )
         return {'ok': False, 'error': f'unknown op: {operation}'}
 

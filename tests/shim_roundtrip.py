@@ -167,8 +167,58 @@ def main() -> int:
     finally:
         extension.stop()
 
+    check_idle_panel_opens_a_thread()
+
     print('\n' + ('ALL SHIM CHECKS PASSED' if not FAILURES else f'{len(FAILURES)} CHECK(S) FAILED'))
     return 1 if FAILURES else 0
+
+
+def check_idle_panel_opens_a_thread() -> None:
+    """A panel showing only its chat list must still get a visible conversation."""
+    print('\n--- panel with no open thread ---')
+    extension = FakeExtension()
+    try:
+        init = extension.call(1, 'initialize', {
+            'clientInfo': {'name': 'fake-vscode-extension', 'version': '0.1.0'},
+            'capabilities': {'experimentalApi': True},
+        })
+        check('idle panel: shim forwards initialize', bool(init and 'result' in init))
+        extension.send({'method': 'initialized', 'params': {}})
+        time.sleep(0.5)
+
+        shims = [s for s in uihook.list_shims('codex') if s['pid'] == extension.proc.pid]
+        if not shims:
+            check('idle panel: shim registered itself', False)
+            return
+        socket_path = shims[0]['socket']
+
+        status = socket_request(socket_path, {'op': 'status'}, 5)
+        check('idle panel: no thread is open yet', not status.get('sessions'), str(status)[:150])
+
+        response = socket_request(
+            socket_path,
+            {'op': 'send', 'text': 'Reply with exactly: OPENED_OK',
+             'cwd': ROOT_DIR, 'title': 'Claude Code: OPENED_OK check', 'timeout': 240},
+            260)
+        print(f'       inject -> {json.dumps(response, ensure_ascii=False)[:220]}')
+        check('idle panel: a thread was opened for the message',
+              response.get('ok') and response.get('wasCreated') is True, str(response)[:250])
+        check('idle panel: the reply came back',
+              'OPENED_OK' in (response.get('reply') or ''), str(response.get('reply'))[:120])
+
+        started = extension.notifications('thread/started')
+        check('idle panel: extension was told about the new thread (panel renders it)',
+              any((m.get('params', {}).get('thread') or {}).get('id') == response.get('threadId')
+                  for m in started),
+              f'{len(started)} thread/started notifications')
+
+        named = extension.notifications('thread/name/updated')
+        check('idle panel: the new thread got a recognisable title',
+              any('OPENED_OK check' in json.dumps(m.get('params'), ensure_ascii=False)
+                  for m in named),
+              json.dumps([m.get('params') for m in named], ensure_ascii=False)[:200])
+    finally:
+        extension.stop()
 
 
 if __name__ == '__main__':

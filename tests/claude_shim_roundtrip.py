@@ -165,9 +165,44 @@ def main() -> int:
     finally:
         extension.stop()
 
+    check_idle_panel_opens_a_session(real_binary)
+
     print('\n' + ('ALL CLAUDE SHIM CHECKS PASSED' if not FAILURES
                   else f'{len(FAILURES)} CHECK(S) FAILED'))
     return 1 if FAILURES else 0
+
+
+def check_idle_panel_opens_a_session(real_binary: str) -> None:
+    """A panel that has not been talked to yet must still get a visible conversation."""
+    print('\n--- panel with no conversation yet ---')
+    extension = FakeExtension(real_binary)
+    try:
+        time.sleep(0.5)
+        shims = [s for s in uihook.list_shims('claude') if s['pid'] == extension.proc.pid]
+        if not shims:
+            check('idle panel: shim registered itself', False, str(uihook.list_shims('claude'))[:150])
+            return
+        socket_path = shims[0]['socket']
+
+        status = socket_request(socket_path, {'op': 'status'}, 5)
+        check('idle panel: no session is open yet', not status.get('sessions'), str(status)[:150])
+
+        response = socket_request(
+            socket_path,
+            {'op': 'send', 'text': 'Reply with exactly: OPENED_OK',
+             'cwd': ROOT_DIR, 'timeout': 240},
+            260)
+        print(f'       inject -> {json.dumps(response, ensure_ascii=False)[:220]}')
+        check('idle panel: a session was opened for the message',
+              response.get('ok') and response.get('wasCreated') is True, str(response)[:250])
+        check('idle panel: the reply came back',
+              'OPENED_OK' in (response.get('reply') or ''), str(response.get('reply'))[:120])
+        check('idle panel: the new session id is reported',
+              bool(response.get('sessionId')), str(response.get('sessionId')))
+        check('idle panel: extension stream received the assistant message',
+              bool(extension.messages('assistant')), str(len(extension.messages('assistant'))))
+    finally:
+        extension.stop()
 
 
 if __name__ == '__main__':

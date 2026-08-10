@@ -189,11 +189,38 @@ def find_live_session(agent: str, session_id: Optional[str] = None) -> Optional[
     return sessions[0] if sessions else None
 
 
-def send(text: str, shim: Dict[str, Any], session_id: Optional[str], timeout: int) -> Dict[str, Any]:
-    """Hand a message to the live panel session and wait for the turn to finish."""
+def find_panel_target(agent: str, session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Where a relay should land in this window's panel.
+
+    A panel showing only its conversation list still has a live process behind it, so it can
+    host a brand new conversation. Falling through to the CLI instead would answer the caller
+    while leaving the panel blank, which reads as the bridge having done nothing.
+    """
+    if session_id:
+        return find_live_session(agent, session_id)
+
+    session = find_live_session(agent)
+    if session:
+        return session
+
+    shims = find_local_shims(agent)
+    if not shims:
+        return None
+
+    newest = max(shims, key=lambda s: float(s.get('started_at') or 0))
+    return {'session_id': None, 'cwd': None, 'shim': newest, 'opens_new_session': True}
+
+
+def send(text: str, shim: Dict[str, Any], session_id: Optional[str], timeout: int,
+         cwd: Optional[str] = None, title: Optional[str] = None) -> Dict[str, Any]:
+    """Hand a message to the panel and wait for the turn to finish."""
     payload: Dict[str, Any] = {'op': 'send', 'text': text, 'timeout': timeout}
     if session_id:
         payload['sessionId'] = session_id
+    if cwd:
+        payload['cwd'] = cwd
+    if title:
+        payload['title'] = title
 
     logger.info(f'send [BEGIN]: via {shim.get("agent")} panel shim '
                 f'pid={shim.get("pid")} session={session_id}')

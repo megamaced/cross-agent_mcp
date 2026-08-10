@@ -36,6 +36,12 @@ INJECT_ID_PREFIX = 'xagent-'
 # `codex app-server` has sub-subcommands that are not the stdio server; leave those alone
 APP_SERVER_SUBCOMMANDS = {'daemon', 'proxy', 'generate-ts', 'generate-json-schema', 'help'}
 
+# opening a thread is a local operation; it should answer well within this
+THREAD_OPEN_TIMEOUT_SECONDS = 30
+
+# how much of the relayed message becomes the thread title in the panel list
+THREAD_NAME_LIMIT = 60
+
 
 def find_real_codex() -> Optional[str]:
     """Locate the genuine Codex binary this shim should wrap."""
@@ -78,6 +84,15 @@ class Injection:
         self.done = threading.Event()
 
 
+class ThreadOpen:
+    """A `thread/start` the shim issued so a bridged message has somewhere visible to land."""
+
+    def __init__(self) -> None:
+        self.thread_id: Optional[str] = None
+        self.error: Optional[str] = None
+        self.done = threading.Event()
+
+
 class CodexAppServerShim(PanelShim):
 
     agent = config.AGENT_CODEX
@@ -87,6 +102,7 @@ class CodexAppServerShim(PanelShim):
         self.real_codex = real_codex
         self.threads: Dict[str, Dict[str, Any]] = {}
         self.injections: Dict[str, Injection] = {}
+        self.opens: Dict[str, ThreadOpen] = {}
         # only turns the extension itself starts count as the human being here; injected
         # turns are written straight to the child and never pass through the observer
         self.last_user_activity = 0.0
@@ -128,6 +144,17 @@ class CodexAppServerShim(PanelShim):
         if isinstance(message_id, str) and message_id.startswith(INJECT_ID_PREFIX):
             with self.state_lock:
                 injection = self.injections.get(message_id)
+                opening = self.opens.get(message_id)
+
+            if opening:
+                if 'error' in message:
+                    opening.error = json.dumps(message['error'], ensure_ascii=False)[:500]
+                result = message.get('result')
+                thread = result.get('thread') if isinstance(result, dict) else None
+                if isinstance(thread, dict) and isinstance(thread.get('id'), str):
+                    opening.thread_id = thread['id']
+                opening.done.set()
+
             if injection:
                 if 'error' in message:
                     injection.error = json.dumps(message['error'], ensure_ascii=False)[:500]
@@ -232,10 +259,57 @@ class CodexAppServerShim(PanelShim):
             newest = max(self.threads.values(), key=lambda t: t.get('last_seen', 0))
         return newest['thread_id']
 
-    def inject(self, text: str, session_id: Optional[str], timeout: int) -> Dict[str, Any]:
+    def _open_thread(self, cwd: Optional[str], timeout: int) -> ThreadOpen:
+        """Start a conversation in the panel so the relay has somewhere visible to land.
+
+        The app-server answers `thread/start` with the new thread *and* broadcasts a
+        `thread/started` notification, which is what tells the extension to render it.
+        """
+        request_id = INJECT_ID_PREFIX + uuid.uuid4().hex[:12]
+        opening = ThreadOpen()
+        with self.state_lock:
+            self.opens[request_id] = opening
+
+        params: Dict[str, Any] = {'cwd': cwd} if cwd else {}
+        try:
+            self.write_to_child(json.dumps(
+                {'id': request_id, 'method': 'thread/start', 'params': params},
+                ensure_ascii=False) + '\n')
+            opening.done.wait(timeout=min(THREAD_OPEN_TIMEOUT_SECONDS, timeout))
+        except Exception as e:
+            opening.error = f'failed to open a panel thread: {e}'
+        finally:
+            with self.state_lock:
+                self.opens.pop(request_id, None)
+
+        return opening
+
+    def _name_thread(self, thread_id: str, name: str) -> None:
+        """Give a bridge-opened thread a title, so the panel list is not just "New chat"."""
+        request_id = INJECT_ID_PREFIX + uuid.uuid4().hex[:12]
+        with contextlib.suppress(Exception):
+            self.write_to_child(json.dumps(
+                {'id': request_id, 'method': 'thread/name/set',
+                 'params': {'threadId': thread_id, 'name': name[:THREAD_NAME_LIMIT]}},
+                ensure_ascii=False) + '\n')
+
+    def inject(self, text: str, session_id: Optional[str], timeout: int,
+               cwd: Optional[str] = None, title: Optional[str] = None) -> Dict[str, Any]:
         target = self._pick_thread(session_id)
+        is_created = False
+
         if not target:
-            return {'ok': False, 'error': 'no live thread seen on this app-server yet'}
+            if session_id:
+                return {'ok': False, 'error': f'thread {session_id} is not open in this panel'}
+            opening = self._open_thread(cwd, timeout)
+            if not opening.thread_id:
+                return {'ok': False,
+                        'error': opening.error or 'could not open a new thread in the panel'}
+            target = opening.thread_id
+            is_created = True
+            self._note_thread(target, cwd)
+            if title:
+                self._name_thread(target, title)
 
         request_id = INJECT_ID_PREFIX + uuid.uuid4().hex[:12]
         injection = Injection(target, request_id)
@@ -264,17 +338,19 @@ class CodexAppServerShim(PanelShim):
             self.injections.pop(request_id, None)
 
         if injection.error:
-            return {'ok': False, 'error': injection.error, 'sessionId': target}
+            return {'ok': False, 'error': injection.error,
+                    'sessionId': target, 'wasCreated': is_created}
         if not is_finished:
             return {'ok': False, 'error': f'turn did not complete within {timeout}s',
                     'sessionId': target, 'turnId': injection.turn_id,
-                    'partial': '\n'.join(injection.messages)}
+                    'wasCreated': is_created, 'partial': '\n'.join(injection.messages)}
 
         return {
             'ok': True,
             'sessionId': target,
             'threadId': target,
             'turnId': injection.turn_id,
+            'wasCreated': is_created,
             'reply': injection.messages[-1] if injection.messages else '',
         }
 

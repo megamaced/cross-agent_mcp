@@ -173,8 +173,13 @@ def test_timeout_kills_descendants() -> None:
 
         check('timeout surfaces as a BridgeError', raised)
 
-        time.sleep(0.7)
+        # the group gets SIGTERM first, so give it a moment - polling, because a loaded
+        # machine can take noticeably longer than a fixed sleep would allow
         grandchild = int(open(marker).read().strip())
+        deadline = time.time() + 10
+        while registry._is_pid_alive(grandchild) and time.time() < deadline:
+            time.sleep(0.1)
+
         check('grandchild process is killed with the group',
               not registry._is_pid_alive(grandchild), f'pid {grandchild} still alive')
 

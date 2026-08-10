@@ -181,10 +181,17 @@ class ClaudeStreamShim(PanelShim):
             time.sleep(IDLE_POLL_SECONDS)
         return False
 
-    def inject(self, text: str, session_id: Optional[str], timeout: int) -> Dict[str, Any]:
-        if session_id and self.session_id and session_id != self.session_id:
+    def inject(self, text: str, session_id: Optional[str], timeout: int,
+               cwd: Optional[str] = None, title: Optional[str] = None) -> Dict[str, Any]:
+        with self.state_lock:
+            current = self.session_id
+        if session_id and session_id != current:
             return {'ok': False,
-                    'error': f'this panel drives session {self.session_id}, not {session_id}'}
+                    'error': f'this panel drives session {current}, not {session_id}'}
+
+        # A panel sitting on its conversation list has a process but no conversation yet.
+        # Writing the message anyway makes the CLI open one, and the panel renders it.
+        is_created = current is None
 
         # the CLI serialises turns; injecting mid-turn would make us collect the wrong reply
         if not self._wait_for_idle(time.time() + min(IDLE_WAIT_SECONDS, timeout)):
@@ -216,13 +223,16 @@ class ClaudeStreamShim(PanelShim):
             session = self.session_id
 
         if injection.error:
-            return {'ok': False, 'error': injection.error, 'sessionId': session}
+            return {'ok': False, 'error': injection.error,
+                    'sessionId': session, 'wasCreated': is_created}
         if not is_finished:
             return {'ok': False, 'error': f'turn did not complete within {timeout}s',
-                    'sessionId': session, 'partial': '\n'.join(injection.messages)}
+                    'sessionId': session, 'wasCreated': is_created,
+                    'partial': '\n'.join(injection.messages)}
 
         reply = injection.result or (injection.messages[-1] if injection.messages else '')
-        return {'ok': True, 'sessionId': session, 'threadId': session, 'reply': reply}
+        return {'ok': True, 'sessionId': session, 'threadId': session,
+                'wasCreated': is_created, 'reply': reply}
 
     # -------------------------------------------------------------------- run
 
