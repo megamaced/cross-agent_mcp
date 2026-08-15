@@ -42,6 +42,9 @@ THREAD_OPEN_TIMEOUT_SECONDS = 30
 # how much of the relayed message becomes the thread title in the panel list
 THREAD_NAME_LIMIT = 60
 
+# the app server's wording when a thread belongs to a multi-agent run and cannot be driven
+REJECTS_DIRECT_INPUT = 'direct app-server input is not allowed'
+
 
 def find_real_codex() -> Optional[str]:
     """Locate the genuine Codex binary this shim should wrap."""
@@ -109,6 +112,18 @@ class CodexAppServerShim(PanelShim):
 
     # ------------------------------------------------------------ observation
 
+    @staticmethod
+    def _accepts_direct_input(thread: Dict[str, Any]) -> bool:
+        """Whether a bridged turn may be started on this thread.
+
+        Multi-agent runs spawn sub-agent threads that the app server refuses direct input
+        for ("direct app-server input is not allowed for multi-agent v2 sub-agents"). They
+        are identified by a parent thread or an assigned agent identity.
+        """
+        if thread.get('parentThreadId') or thread.get('agentNickname') or thread.get('agentRole'):
+            return False
+        return thread.get('canAcceptDirectInput') is not False
+
     def _note_thread(self, thread_id: Optional[str], cwd: Optional[str] = None) -> None:
         if not thread_id or not isinstance(thread_id, str):
             return
@@ -118,13 +133,33 @@ class CodexAppServerShim(PanelShim):
             if cwd:
                 record['cwd'] = cwd
 
+    def _touch_thread(self, thread_id: str) -> None:
+        """Refresh a thread we already trust; never let a notification introduce a new one."""
+        with self.state_lock:
+            record = self.threads.get(thread_id)
+            if record:
+                record['last_seen'] = time.time()
+
+    def _forget_thread(self, thread_id: str) -> None:
+        with self.state_lock:
+            self.threads.pop(thread_id, None)
+
     def _observe_from_client(self, message: Dict[str, Any]) -> None:
-        """Learn which threads the panel is driving."""
+        """Learn which threads the panel is driving.
+
+        Only the extension's own thread-driving requests count. Sub-agent ids also travel
+        through this connection, and targeting one of those is exactly what the app server
+        rejects.
+        """
         params = message.get('params')
         if not isinstance(params, dict):
             return
 
-        if message.get('method') in ('turn/start', 'turn/steer'):
+        method = message.get('method')
+        if method not in ('thread/start', 'thread/resume', 'turn/start', 'turn/steer'):
+            return
+
+        if method in ('turn/start', 'turn/steer'):
             with self.state_lock:
                 self.last_user_activity = time.time()
                 thread_id = params.get('threadId')
@@ -170,10 +205,10 @@ class CodexAppServerShim(PanelShim):
 
         if method == 'thread/started':
             thread = params.get('thread')
-            if isinstance(thread, dict):
+            if isinstance(thread, dict) and self._accepts_direct_input(thread):
                 self._note_thread(thread.get('id'), thread.get('cwd'))
         elif isinstance(params.get('threadId'), str):
-            self._note_thread(params['threadId'])
+            self._touch_thread(params['threadId'])
 
         with self.state_lock:
             waiting = [i for i in self.injections.values() if not i.done.is_set()]
@@ -295,6 +330,21 @@ class CodexAppServerShim(PanelShim):
 
     def inject(self, text: str, session_id: Optional[str], timeout: int,
                cwd: Optional[str] = None, title: Optional[str] = None) -> Dict[str, Any]:
+        result = self._inject_once(text, session_id, timeout, cwd, title)
+
+        # A thread can stop accepting direct input after we learned about it - the panel may
+        # have handed it to a multi-agent run. Drop it and try once on a fresh conversation.
+        if (not result.get('ok') and not session_id
+                and REJECTS_DIRECT_INPUT in str(result.get('error', ''))):
+            stale = result.get('sessionId')
+            if stale:
+                self._forget_thread(stale)
+            return self._inject_once(text, None, timeout, cwd, title)
+
+        return result
+
+    def _inject_once(self, text: str, session_id: Optional[str], timeout: int,
+                     cwd: Optional[str], title: Optional[str]) -> Dict[str, Any]:
         target = self._pick_thread(session_id)
         is_created = False
 

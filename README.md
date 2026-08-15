@@ -165,6 +165,12 @@ VS Code 사용자 설정에 추가하고 **창을 새로고침**한다.
   브리지는 **자신과 조상을 공유하는 셰임**을 고르므로, 창이 여러 개여도
   "지금 이 IDE 인스턴스"를 정확히 겨냥한다
 - Claude 셰임은 사용자가 대화 중이면 그 턴이 끝날 때까지 기다렸다가 주입한다
+- Codex 셰임은 **서브에이전트 스레드를 대상에서 제외**한다. 멀티에이전트 실행이 만드는
+  스레드는 app-server가 직접 입력을 거부하며(`direct app-server input is not allowed for
+  multi-agent v2 sub-agents`), `parentThreadId`·`agentNickname`·`agentRole`·
+  `canAcceptDirectInput`로 판별한다. 알림에 실려 오는 thread id만으로는 대상을 새로 만들지
+  않고, 확장이 직접 보낸 `thread/start`·`thread/resume`·`turn/start`·`turn/steer`만 신뢰한다.
+  그래도 거부당하면 그 스레드를 버리고 새 대화를 열어 한 번 재시도한다
 
 #### 패널에 열린 대화가 없을 때
 

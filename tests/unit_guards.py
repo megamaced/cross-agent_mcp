@@ -184,6 +184,52 @@ def test_timeout_kills_descendants() -> None:
               not registry._is_pid_alive(grandchild), f'pid {grandchild} still alive')
 
 
+# ------------------------------- sub-agent threads must never receive a relay
+
+def test_subagent_threads_are_rejected() -> None:
+    from cross_agent_mcp.appserver_shim import CodexAppServerShim
+
+    accepts = CodexAppServerShim._accepts_direct_input
+    check('a plain panel thread accepts direct input', accepts({'id': 'a'}))
+    check('a thread with a parent is a sub-agent',
+          not accepts({'id': 'b', 'parentThreadId': 'a'}))
+    check('a thread with an agent nickname is a sub-agent',
+          not accepts({'id': 'c', 'agentNickname': 'Turing'}))
+    check('a thread with an agent role is a sub-agent',
+          not accepts({'id': 'd', 'agentRole': 'reviewer'}))
+    check('an explicit canAcceptDirectInput=false is honoured',
+          not accepts({'id': 'e', 'canAcceptDirectInput': False}))
+
+    # a notification must never be able to introduce an unvetted thread
+    shim = CodexAppServerShim.__new__(CodexAppServerShim)
+    shim.threads = {}
+    shim.injections = {}
+    shim.state_lock = threading.Lock()
+    shim.last_user_activity = 0.0
+
+    shim._observe_from_server({'method': 'item/started',
+                               'params': {'threadId': 'sub-agent-thread'}})
+    check('a bare threadId in a notification does not create a target',
+          'sub-agent-thread' not in shim.threads, str(shim.threads))
+
+    shim._observe_from_server({'method': 'thread/started',
+                               'params': {'thread': {'id': 'sub', 'parentThreadId': 'main'}}})
+    check('thread/started for a sub-agent is ignored', 'sub' not in shim.threads, str(shim.threads))
+
+    shim._observe_from_server({'method': 'thread/started',
+                               'params': {'thread': {'id': 'main', 'cwd': '/w'}}})
+    check('thread/started for a user thread is recorded', 'main' in shim.threads, str(shim.threads))
+
+    # and only the extension's own thread-driving requests may register one
+    shim._observe_from_client({'method': 'thread/read', 'params': {'threadId': 'peeked'}})
+    check('an unrelated client request does not register a thread',
+          'peeked' not in shim.threads, str(shim.threads))
+
+    shim._observe_from_client({'method': 'turn/start', 'params': {'threadId': 'driven'}})
+    check('a turn the extension started registers its thread',
+          'driven' in shim.threads, str(shim.threads))
+
+
 # --------------------------------------- which conversation tab a relay lands in
 
 def test_panel_session_selection() -> None:
@@ -246,6 +292,7 @@ if __name__ == '__main__':
     test_cwd_relations()
     test_codex_scan_filters_before_limit()
     test_timeout_kills_descendants()
+    test_subagent_threads_are_rejected()
     test_panel_session_selection()
 
     print(f'\n{"ALL UNIT CHECKS PASSED" if not FAILURES else str(len(FAILURES)) + " CHECK(S) FAILED"}')
