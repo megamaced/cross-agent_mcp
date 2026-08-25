@@ -230,6 +230,69 @@ def test_subagent_threads_are_rejected() -> None:
           'driven' in shim.threads, str(shim.threads))
 
 
+# ------------------- a new conversation is the last resort, never a silent one
+
+def test_new_session_is_the_last_resort() -> None:
+    from cross_agent_mcp import uihook
+
+    calls = []
+    originals = (uihook.is_enabled, uihook.find_live_session, uihook.find_panel_host,
+                 discovery.find_active_session, discovery.find_session,
+                 discovery.find_session_by_name, registry.get_pin)
+
+    uihook.is_enabled = lambda: True
+    uihook.find_panel_host = lambda agent: {'shim': {'pid': 1, 'socket': '/s'}}
+    registry.get_pin = lambda agent, cwd: None
+
+    def restore():
+        (uihook.is_enabled, uihook.find_live_session, uihook.find_panel_host,
+         discovery.find_active_session, discovery.find_session,
+         discovery.find_session_by_name, registry.get_pin) = originals
+
+    try:
+        # an existing session on disk must win over opening a fresh conversation
+        uihook.find_live_session = lambda agent, session_id=None: None
+        discovery.find_active_session = lambda agent, scope, cwd, exclude=None: {
+            'session_id': 'on-disk', 'source': 'discovery', 'cwd': '/w'}
+        target = bridge._resolve_target('codex', None, 'cwd', '/w', False, [])
+        check('an existing session outranks opening a new conversation',
+              target.get('session_id') == 'on-disk', str(target))
+
+        # only when nothing can be resumed anywhere
+        discovery.find_active_session = lambda agent, scope, cwd, exclude=None: None
+        target = bridge._resolve_target('codex', None, 'cwd', '/w', False, [])
+        check('a new conversation is opened only when nothing exists',
+              target.get('source') == 'ide-panel-new', str(target))
+
+        # a named session that matches nothing must fail instead of starting over
+        discovery.find_session = lambda agent, sid: None
+        discovery.find_session_by_name = lambda agent, name, limit=500: None
+        raised = ''
+        try:
+            bridge._resolve_target('codex', 'studio_v4_orginial', 'cwd', '/w', False, [])
+        except bridge.BridgeError as e:
+            raised = str(e)
+        check('an unmatched session name fails loudly',
+              'no codex session matches' in raised and 'was created' in raised, raised[:160])
+
+        # a name that does match is resolved to its id
+        discovery.find_session_by_name = lambda agent, name, limit=500: {
+            'session_id': 'named-id', 'title': name, 'mtime': 0}
+        calls.clear()
+
+        def find_session(agent, sid):
+            calls.append(sid)
+            return {'session_id': sid} if sid == 'named-id' else None
+
+        discovery.find_session = find_session
+        target = bridge._resolve_target('codex', 'studio_v4_orginial', 'cwd', '/w', False, [])
+        check('a conversation name resolves to its session',
+              target.get('session_id') == 'named-id' and target.get('source') == 'name',
+              str(target))
+    finally:
+        restore()
+
+
 # --------------------------------------- which conversation tab a relay lands in
 
 def test_panel_session_selection() -> None:
@@ -293,6 +356,7 @@ if __name__ == '__main__':
     test_codex_scan_filters_before_limit()
     test_timeout_kills_descendants()
     test_subagent_threads_are_rejected()
+    test_new_session_is_the_last_resort()
     test_panel_session_selection()
 
     print(f'\n{"ALL UNIT CHECKS PASSED" if not FAILURES else str(len(FAILURES)) + " CHECK(S) FAILED"}')

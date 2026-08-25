@@ -349,6 +349,38 @@ def find_session(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
     raise ValueError(f'unknown agent: {agent}')
 
 
+def find_session_by_name(agent: str, name: str, limit: int = 500) -> Optional[Dict[str, Any]]:
+    """Look one session up by the title the user sees, not by its uuid.
+
+    People refer to a conversation by its name; only the agents keep the ids. An exact
+    (case-insensitive) title wins over a substring one, and the freshest match wins overall.
+    """
+    wanted = ' '.join(name.split()).casefold()
+    if not wanted:
+        return None
+
+    exact: List[Dict[str, Any]] = []
+    partial: List[Dict[str, Any]] = []
+
+    for candidate in list_sessions(agent, SCOPE_ANY, os.getcwd(), limit=limit):
+        title = ' '.join(str(candidate.get('title') or '').split()).casefold()
+        if not title:
+            continue
+        if title == wanted:
+            exact.append(candidate)
+        elif wanted in title:
+            partial.append(candidate)
+
+    matches = exact or partial
+    if not matches:
+        return None
+
+    best = max(matches, key=lambda s: s['mtime'])
+    best['source'] = 'name'
+    best['matched_name'] = name
+    return best
+
+
 def find_active_session(agent: str, scope: str, cwd: str,
                         exclude_ids: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """Resolve the session the user is currently talking to.

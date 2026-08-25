@@ -294,28 +294,15 @@ PANEL_SETTING = {
 }
 
 
-def _resolve_ide_panel(target_agent: str, exclude_ids: List[str], session_id: Optional[str],
-                       cwd: str) -> Optional[Dict[str, Any]]:
-    """The peer session open in this editor window, reached through its panel shim.
-
-    An explicit session id wins, then a sticky pin, then the tab the user last typed into.
-    A requested session that is not open in any panel falls through to the CLI path.
-    """
+def _panel_session(target_agent: str, wanted_id: Optional[str],
+                   exclude_ids: List[str]) -> Optional[Dict[str, Any]]:
+    """An already-open conversation in this window's panel, or None."""
     if not uihook.is_enabled():
         return None
 
-    wanted = session_id
-    if not wanted:
-        pin = registry.get_pin(target_agent, cwd)
-        if pin and pin.get('is_sticky'):
-            wanted = pin.get('session_id')
-
-    live = uihook.find_panel_target(target_agent, wanted)
-    if not live and wanted:
-        return None
-
-    if not live or (live.get('session_id') and live['session_id'] in exclude_ids):
-        if config.UI_HOOK_MODE == uihook.UI_HOOK_REQUIRE:
+    live = uihook.find_live_session(target_agent, wanted_id)
+    if not live or live['session_id'] in exclude_ids:
+        if not wanted_id and config.UI_HOOK_MODE == uihook.UI_HOOK_REQUIRE:
             raise BridgeError(
                 f'CROSS_AGENT_UI_HOOK=require but no live {target_agent} panel session was found '
                 f'for this editor window. Check that {PANEL_SETTING.get(target_agent)} is set and '
@@ -324,33 +311,102 @@ def _resolve_ide_panel(target_agent: str, exclude_ids: List[str], session_id: Op
 
     return {
         'agent': target_agent,
-        'session_id': live.get('session_id'),
+        'session_id': live['session_id'],
         'cwd': live.get('cwd'),
-        'source': 'ide-panel-new' if live.get('opens_new_session') else 'ide-panel',
+        'source': 'ide-panel',
         'ui_shim': live['shim'],
         'is_active': True,
         'mtime': live.get('last_seen', time.time()),
     }
 
 
-def _resolve_target(target_agent: str, session_id: Optional[str], scope: str, cwd: str,
-                    is_new_forced: bool, exclude_ids: List[str]) -> Optional[Dict[str, Any]]:
-    if is_new_forced:
+def _new_panel_conversation(target_agent: str) -> Optional[Dict[str, Any]]:
+    """Last resort: a panel process that can host a fresh conversation."""
+    if not uihook.is_enabled():
         return None
 
-    # the panel the user is actually looking at wins over anything inferred from transcripts
-    panel = _resolve_ide_panel(target_agent, exclude_ids, session_id, cwd)
+    host = uihook.find_panel_host(target_agent)
+    if not host:
+        return None
+
+    return {
+        'agent': target_agent,
+        'session_id': None,
+        'cwd': None,
+        'source': 'ide-panel-new',
+        'ui_shim': host['shim'],
+        'is_active': True,
+        'mtime': time.time(),
+    }
+
+
+def _requested_session_id(target_agent: str, session_id: Optional[str],
+                          cwd: str) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve what the caller asked for into a session id.
+
+    `session_id` may be a real id or the conversation's name, because that is what a human
+    hands the agent. A sticky pin stands in when nothing was named.
+    """
+    if session_id:
+        if discovery.find_session(target_agent, session_id):
+            return session_id, session_id
+        named = discovery.find_session_by_name(target_agent, session_id)
+        if named:
+            logger.info(f'_requested_session_id [resolved by name]: '
+                        f'{session_id!r} -> {named["session_id"]}')
+            return named['session_id'], session_id
+        raise BridgeError(
+            f'no {target_agent} session matches {session_id!r}, by id or by name. '
+            'Use list_agent_sessions to see what exists; nothing was sent and no session '
+            'was created.')
+
+    pin = registry.get_pin(target_agent, cwd)
+    if pin and pin.get('is_sticky'):
+        return pin.get('session_id'), None
+    return None, None
+
+
+def _resolve_target(target_agent: str, session_id: Optional[str], scope: str, cwd: str,
+                    is_new_forced: bool, exclude_ids: List[str]) -> Optional[Dict[str, Any]]:
+    """Pick the conversation a relay lands in.
+
+    Starting a fresh conversation is the LAST resort: it silently drops whatever context the
+    caller meant to reach, which in the middle of a long task looks like the peer forgetting
+    everything. Everything else is tried first.
+    """
+    if is_new_forced:
+        return _new_panel_conversation(target_agent)
+
+    wanted_id, requested = _requested_session_id(target_agent, session_id, cwd)
+
+    # 1. the session that was named (or pinned) - in the panel if it happens to be open there
+    if wanted_id:
+        panel = _panel_session(target_agent, wanted_id, exclude_ids)
+        if panel:
+            return panel
+
+        found = discovery.find_session(target_agent, wanted_id)
+        if not found:
+            label = requested or wanted_id
+            raise BridgeError(
+                f'{target_agent} session {label!r} no longer exists. Nothing was sent and no '
+                'session was created; clear the pin with pin_agent_session or name another one.')
+        found['source'] = 'name' if requested else 'pin'
+        return found
+
+    # 2. the conversation the user is working in, in this window's panel
+    panel = _panel_session(target_agent, None, exclude_ids)
     if panel:
         return panel
 
-    if session_id:
-        found = discovery.find_session(target_agent, session_id)
-        if not found:
-            raise BridgeError(f'{target_agent} session not found: {session_id}')
-        found['source'] = 'explicit'
-        return found
+    # 3. an existing session on disk. The panel will not show the exchange, but the peer keeps
+    #    its context - always better than starting over
+    active = discovery.find_active_session(target_agent, scope, cwd, exclude_ids)
+    if active:
+        return active
 
-    return discovery.find_active_session(target_agent, scope, cwd, exclude_ids)
+    # 4. nothing to resume anywhere
+    return _new_panel_conversation(target_agent)
 
 
 def send_message(target_agent: str, message: str, session_id: Optional[str] = None,
@@ -459,9 +515,18 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
     logger.info(f'send_message [END]: {sender_agent}->{target_agent} '
                 f'session={result["session_id"]} chars={len(result["reply"])}')
 
+    warning = None
+    if result['is_new_session']:
+        warning = (f'No existing {target_agent} session was reachable for {run_cwd}, so a NEW '
+                   'conversation was started. It has none of the earlier context. Tell the user '
+                   'this happened before relying on the reply, and pass session_id (an id or the '
+                   'conversation name) or pin_agent_session to target a specific one.')
+        logger.info(f'send_message [new session]: {target_agent} {result["session_id"]}')
+
     return {
         'ok': True,
         'reply': result['reply'],
+        'warning': warning,
         'target_agent': target_agent,
         'target_session_id': result['session_id'],
         'session_origin': 'created' if result['is_new_session'] else (target or {}).get('source', 'unknown'),

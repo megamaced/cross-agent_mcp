@@ -189,20 +189,14 @@ def find_live_session(agent: str, session_id: Optional[str] = None) -> Optional[
     return sessions[0] if sessions else None
 
 
-def find_panel_target(agent: str, session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Where a relay should land in this window's panel.
+def find_panel_host(agent: str) -> Optional[Dict[str, Any]]:
+    """A panel process that can host a brand new conversation, or None.
 
-    A panel showing only its conversation list still has a live process behind it, so it can
-    host a brand new conversation. Falling through to the CLI instead would answer the caller
-    while leaving the panel blank, which reads as the bridge having done nothing.
+    This is a last resort. A panel showing only its conversation list still has a live
+    process behind it, so a new conversation started there is at least visible - but starting
+    one when an existing session could have been resumed would throw away the context the
+    caller meant to reach, so callers must exhaust every lookup before asking for this.
     """
-    if session_id:
-        return find_live_session(agent, session_id)
-
-    session = find_live_session(agent)
-    if session:
-        return session
-
     shims = find_local_shims(agent)
     if not shims:
         return None

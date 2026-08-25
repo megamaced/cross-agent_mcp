@@ -100,7 +100,8 @@ async def send_to_codex(
 ) -> Dict[str, Any]:
     """Args:
     message: What to ask Codex. Be self-contained; Codex cannot see this conversation.
-    session_id: Target a specific Codex thread id instead of the auto-detected one.
+    session_id: Target a specific Codex thread - its id, or the conversation name shown in
+        the panel. Fails loudly rather than creating a new thread when nothing matches.
     new_session: Force a brand new Codex thread even when an active one exists.
     scope: 'cwd' (default) = same directory or below, 'tree' = also parent directories,
         'any' = every recorded thread.
@@ -140,7 +141,8 @@ async def send_to_claude(
 ) -> Dict[str, Any]:
     """Args:
     message: What to ask Claude. Be self-contained; Claude cannot see this conversation.
-    session_id: Target a specific Claude session id instead of the auto-detected one.
+    session_id: Target a specific Claude session - its id, or the conversation name shown in
+        the panel. Fails loudly rather than creating a new session when nothing matches.
     new_session: Force a brand new Claude session even when an active one exists.
     scope: 'cwd' (default) = same directory or below, 'tree' = also parent directories,
         'any' = every recorded session.
@@ -279,8 +281,10 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None) 
     name='pin_agent_session',
     title='Pin a peer session',
     description=(
-        'Force every later relay for this working directory to target one specific session id. '
-        'A pin survives inactivity, unlike auto-discovery. Call with session_id empty to clear.'
+        'Force every later relay for this working directory to target one specific session. '
+        'Accepts the session id or the conversation name. A pin survives inactivity, unlike '
+        'auto-discovery, and stops the bridge from ever starting a fresh conversation instead. '
+        'Call with session_id empty to clear.'
     ),
 )
 async def pin_agent_session(
@@ -290,7 +294,7 @@ async def pin_agent_session(
 ) -> Dict[str, Any]:
     """Args:
     agent: 'claude' or 'codex'.
-    session_id: Session/thread id to pin, or empty to remove the pin.
+    session_id: Session/thread id - or the conversation name - to pin. Empty removes the pin.
     cwd: Working directory the pin applies to.
     """
     if agent not in (config.AGENT_CLAUDE, config.AGENT_CODEX):
@@ -304,7 +308,11 @@ async def pin_agent_session(
 
     found = await _run_blocking(discovery.find_session, agent, session_id)
     if not found:
-        return {'ok': False, 'error': f'{agent} session not found: {session_id}'}
+        found = await _run_blocking(discovery.find_session_by_name, agent, session_id)
+    if not found:
+        return {'ok': False,
+                'error': f'no {agent} session matches {session_id!r}, by id or by name'}
+    session_id = found['session_id']
 
     await _run_blocking(registry.set_pin, agent, target_cwd, session_id,
                         found.get('cwd') or target_cwd, True, False)
