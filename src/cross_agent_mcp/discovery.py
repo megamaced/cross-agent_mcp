@@ -7,6 +7,7 @@ user talking to right now" reduces to "which transcript was written to most rece
   Codex       : ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl
 """
 
+import datetime
 import glob
 import json
 import logging
@@ -451,13 +452,31 @@ def _tail_lines(path: str) -> List[str]:
     return data.decode('utf-8', errors='replace').splitlines()
 
 
-def last_agent_message(agent: str, session_id: str) -> Optional[str]:
+def _entry_epoch(entry: Dict[str, Any]) -> Optional[float]:
+    """Both agents stamp every transcript entry with an ISO 8601 instant."""
+    raw = entry.get('timestamp')
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.datetime.fromisoformat(raw.replace('Z', '+00:00')).timestamp()
+    except ValueError:
+        return None
+
+
+def last_agent_message(agent: str, session_id: str,
+                       after: Optional[float] = None) -> Optional[str]:
     """The final assistant message a session wrote, read straight from its transcript.
 
     The bridge normally carries an answer back from the process it started. When that process
     dies first - the editor window reloaded, the machine slept - the answer is not gone, it is
     just unread: the peer already wrote it to disk. This reads it from there, so an answer is
     lost only when the peer never produced one.
+
+    `after` is the instant the request was delivered, and without it this reads the peer's last
+    message whether or not it has anything to do with the question. That is not a hypothetical:
+    the same paragraph, written nine minutes before the request existed, came back as the
+    answer to two different questions. A message that predates its own question is not an
+    answer, and saying nothing is the honest result.
     """
     session = find_session(agent, session_id)
     if not session:
@@ -483,8 +502,17 @@ def last_agent_message(agent: str, session_id: str) -> Optional[str]:
                 block.get('text', '') for block in (payload.get('content') or [])
                 if isinstance(block, dict))
 
-        if text.strip():
-            return text.strip()
+        if text.strip() == '':
+            continue
+
+        if after is not None:
+            written = _entry_epoch(entry)
+            if written is None or written <= after:
+                logger.info(
+                    f'last_agent_message [stale]: {agent} {session_id} last spoke before the '
+                    'request was delivered, so there is no answer to recover')
+                return None
+        return text.strip()
     return None
 
 

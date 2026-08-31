@@ -634,7 +634,8 @@ def _recover_reply(job: outbox.Job) -> Optional[str]:
     session_id = job.resolved_session_id or job.target_session_id
     if not session_id:
         return None
-    return discovery.last_agent_message(job.target_agent, session_id)
+    # Only what the peer wrote after we reached it can be an answer to what we asked.
+    return discovery.last_agent_message(job.target_agent, session_id, after=job.started_at)
 
 
 outbox.OUTBOX.deliver = _deliver

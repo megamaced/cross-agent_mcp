@@ -625,6 +625,54 @@ def test_the_envelope_carries_a_return_address() -> None:
           'session_id="' not in anonymous)
 
 
+def test_recovery_refuses_a_message_older_than_the_question() -> None:
+    """It happened twice: one paragraph written before either request existed came back as the
+    answer to both. A message that predates its own question is not an answer."""
+    import datetime
+
+    spoke_at = datetime.datetime(2026, 9, 1, 2, 5, 21, tzinfo=datetime.timezone.utc)
+    with tempfile.TemporaryDirectory(prefix='transcript-') as store:
+        path = store + '/session.jsonl'
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(json.dumps({
+                'type': 'assistant',
+                'timestamp': spoke_at.isoformat().replace('+00:00', 'Z'),
+                'message': {'content': [{'type': 'text', 'text': '이전에 하던 말'}]},
+            }) + '\n')
+
+        original = discovery.find_session
+        discovery.find_session = lambda agent, session_id: {'path': path}
+        try:
+            check('without a cutoff the last message is returned',
+                  discovery.last_agent_message('claude', 'sid') == '이전에 하던 말')
+            check('a message written before the request is not an answer',
+                  discovery.last_agent_message(
+                      'claude', 'sid', after=spoke_at.timestamp() + 1) is None)
+            check('a message written after it still is',
+                  discovery.last_agent_message(
+                      'claude', 'sid', after=spoke_at.timestamp() - 1) == '이전에 하던 말')
+        finally:
+            discovery.find_session = original
+
+
+def test_recovery_refuses_a_message_with_no_timestamp_when_asked_for_one() -> None:
+    with tempfile.TemporaryDirectory(prefix='transcript-') as store:
+        path = store + '/session.jsonl'
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(json.dumps({
+                'type': 'assistant',
+                'message': {'content': [{'type': 'text', 'text': '시각 없는 발화'}]},
+            }) + '\n')
+
+        original = discovery.find_session
+        discovery.find_session = lambda agent, session_id: {'path': path}
+        try:
+            check('an undatable message cannot be shown to be an answer',
+                  discovery.last_agent_message('claude', 'sid', after=0) is None)
+        finally:
+            discovery.find_session = original
+
+
 def test_a_recovered_answer_says_it_may_not_be_finished() -> None:
     """Recovery reads the peer's last message, which is not always its answer.
 
@@ -991,6 +1039,8 @@ def run_all() -> None:
     test_the_caller_identifies_its_own_session_exactly()
     test_a_pin_never_answers_who_the_caller_is()
     test_the_envelope_carries_a_return_address()
+    test_recovery_refuses_a_message_older_than_the_question()
+    test_recovery_refuses_a_message_with_no_timestamp_when_asked_for_one()
     test_a_recovered_answer_says_it_may_not_be_finished()
     test_the_recovered_flag_reaches_the_envelope()
     test_a_reply_runs_where_the_senders_session_lives()
