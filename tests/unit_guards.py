@@ -545,6 +545,118 @@ def test_another_window_is_reachable_only_when_named() -> None:
          uihook.read_status, uihook._transcript_mtime) = originals
 
 
+def test_the_caller_identifies_its_own_session_exactly() -> None:
+    """Who we are comes from the shim hosting us, never from a pin saying where to send."""
+    from cross_agent_mcp import uihook
+
+    now = time.time()
+    shims = [
+        # the shim this process is running under: its pid is in our own ancestry
+        {'agent': 'claude', 'pid': 500, 'socket': '/mine', 'ancestors': [99], 'started_at': now},
+        # a sibling tab in the same window - local, but not hosting us
+        {'agent': 'claude', 'pid': 501, 'socket': '/sibling', 'ancestors': [99],
+         'started_at': now},
+    ]
+    statuses = {
+        '/mine': {'ok': True, 'last_user_activity': 0,
+                  'sessions': [{'session_id': 'me', 'cwd': '/w'}]},
+        '/sibling': {'ok': True, 'last_user_activity': now,
+                     'sessions': [{'session_id': 'not-me', 'cwd': '/w'}]},
+    }
+
+    originals = (uihook.list_shims, uihook.process_ancestry,
+                 uihook.read_status, uihook._transcript_mtime)
+    uihook.list_shims = lambda agent=None: [s for s in shims if not agent or s['agent'] == agent]
+    uihook.process_ancestry = lambda pid, depth=12: [500, 99]
+    uihook.read_status = lambda shim: statuses[shim['socket']]
+    uihook._transcript_mtime = lambda agent, session_id: 0.0
+
+    try:
+        own = uihook.find_own_session('claude')
+        # the sibling was typed into more recently, so "the active tab" would pick it
+        check('our own session is the one whose shim hosts us',
+              own is not None and own['session_id'] == 'me',
+              str(own and own['session_id']))
+    finally:
+        (uihook.list_shims, uihook.process_ancestry,
+         uihook.read_status, uihook._transcript_mtime) = originals
+
+
+def test_a_pin_never_answers_who_the_caller_is() -> None:
+    """The regression: a stale pin stood in as the return address and the reply went nowhere."""
+    from cross_agent_mcp import uihook
+
+    originals = (uihook.is_enabled, uihook.find_own_session, discovery.find_active_session)
+    recorded = {}
+
+    def record_lookup(agent, scope, cwd, exclude_ids=None, use_pin=True):
+        recorded['use_pin'] = use_pin
+        return {'session_id': 'from-transcript'}
+
+    uihook.is_enabled = lambda: True
+    uihook.find_own_session = lambda agent: {'session_id': 'from-panel'}
+    discovery.find_active_session = record_lookup
+
+    try:
+        check('the panel answers before anything on disk is consulted',
+              bridge._own_session_id('claude') == 'from-panel')
+
+        uihook.find_own_session = lambda agent: None
+        check('with no panel it falls back to the transcript',
+              bridge._own_session_id('claude') == 'from-transcript')
+        check('and that fallback is asked WITHOUT pins',
+              recorded.get('use_pin') is False, str(recorded))
+    finally:
+        (uihook.is_enabled, uihook.find_own_session, discovery.find_active_session) = originals
+
+
+def test_the_envelope_carries_a_return_address() -> None:
+    envelope = bridge._build_envelope('claude', 'codex', 'conv_x', 1, 3, 'body', 'sender-sid')
+    check('the envelope states where a reply should go',
+          'reply-to: claude session sender-sid' in envelope)
+    check('and tells the peer how to address a new request',
+          'session_id="sender-sid"' in envelope)
+
+    anonymous = bridge._build_envelope('claude', 'codex', 'conv_x', 1, 3, 'body', None)
+    check('a sender with no session says so instead of leaving it blank',
+          'reply-to: (unknown' in anonymous)
+    check('and does not hand out a bogus session id',
+          'session_id="' not in anonymous)
+
+
+def test_a_reply_runs_where_the_senders_session_lives() -> None:
+    """A Claude transcript is filed under its own project dir; resuming elsewhere fails."""
+    with tempfile.TemporaryDirectory(prefix='sender-home-') as sender_home:
+        original = discovery.find_session
+        discovery.find_session = lambda agent, session_id: (
+            {'session_id': session_id, 'cwd': sender_home} if session_id == 'sender-sid' else None)
+        try:
+            request = outbox.Job(
+                target_agent=config.AGENT_CODEX, target_session_id='peer-sid', payload='x',
+                run_cwd='/elsewhere', pin_cwd='/elsewhere', env={}, timeout=5, ui_shim=None,
+                title=None, conversation_id='conv_reply', hop=1,
+                sender_agent=config.AGENT_CLAUDE, sender_session_id='sender-sid',
+                wants_reply=True, summary='req')
+            reply = bridge._build_reply_job(request, 'the answer')
+
+            check('the reply is aimed at the sender session',
+                  reply is not None and reply.target_session_id == 'sender-sid')
+            check('and runs in that session\'s own directory, not the request\'s',
+                  reply is not None and reply.run_cwd == sender_home, str(reply and reply.run_cwd))
+            check('a reply expects no reply of its own',
+                  reply is not None and reply.wants_reply is False)
+        finally:
+            discovery.find_session = original
+
+    orphan = outbox.Job(
+        target_agent=config.AGENT_CODEX, target_session_id='peer-sid', payload='x',
+        run_cwd='/elsewhere', pin_cwd='/elsewhere', env={}, timeout=5, ui_shim=None, title=None,
+        conversation_id='conv_reply', hop=1, sender_agent=config.AGENT_CLAUDE,
+        sender_session_id=None, wants_reply=True, summary='req')
+    check('a sender with no session produces no undeliverable reply job',
+          bridge._build_reply_job(orphan, 'the answer') is None)
+
+
 def test_a_message_queued_in_the_wakeup_gap_is_not_lost() -> None:
     """The lost-wakeup window: a submit that notifies before the worker starts waiting.
 
@@ -594,6 +706,10 @@ if __name__ == '__main__':
     test_new_session_is_the_last_resort()
     test_panel_session_selection()
     test_another_window_is_reachable_only_when_named()
+    test_the_caller_identifies_its_own_session_exactly()
+    test_a_pin_never_answers_who_the_caller_is()
+    test_the_envelope_carries_a_return_address()
+    test_a_reply_runs_where_the_senders_session_lives()
     test_submit_does_not_block_the_caller()
     test_same_session_deliveries_are_serialised()
     test_different_sessions_deliver_in_parallel()

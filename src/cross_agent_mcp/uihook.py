@@ -234,6 +234,27 @@ def find_live_session(agent: str, session_id: Optional[str] = None) -> Optional[
     return foreign
 
 
+def find_own_session(agent: str) -> Optional[Dict[str, Any]]:
+    """The conversation this very process is running inside.
+
+    Every other lookup here answers "which session should we talk to". This one answers "which
+    session are we", and it is not a guess: the shim sits between the extension and the agent,
+    so the agent - and this MCP server under it - are its descendants. The shim whose pid is
+    in our own ancestry is therefore the one hosting us, not merely a plausible candidate.
+
+    Worth having a separate answer for. Inferring our own identity from the registry lets a
+    pin - which records where to *send* - stand in for who we *are*, and a pin left over from
+    an old session then sends our return address somewhere that no longer exists.
+    """
+    own_chain = set(process_ancestry(os.getpid()))
+    hosting = [s for s in find_local_shims(agent) if s.get('pid') in own_chain]
+    if not hosting:
+        return None
+
+    sessions = sessions_of(agent, hosting)
+    return sessions[0] if sessions else None
+
+
 def find_panel_host(agent: str) -> Optional[Dict[str, Any]]:
     """A panel process that can host a brand new conversation, or None.
 

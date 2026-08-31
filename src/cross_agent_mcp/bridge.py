@@ -69,12 +69,30 @@ def _resolve_conversation_id(conversation_id: Optional[str]) -> Tuple[str, bool]
     return 'conv_' + uuid.uuid4().hex[:12], True
 
 
-def _build_envelope(sender: str, target: str, conversation_id: str,
-                    hop: int, remaining: int, message: str) -> str:
+def _address_line(sender: str, reply_to: Optional[str]) -> str:
+    """The sender's own address, written on the envelope the way an email carries From.
+
+    The bridge already routes the answer on its own, so this is not what makes a reply work.
+    It matters when the automatic path cannot: it lets the peer send a NEW request straight
+    back to the exact session that wrote to it, instead of re-deriving the address from
+    whatever happens to look active on this side.
+    """
+    if not reply_to:
+        return ('reply-to: (unknown - this sender has no session of its own, so an automatic '
+                'answer cannot be delivered back)\n')
+    return f'reply-to: {sender} session {reply_to}\n'
+
+
+def _build_envelope(sender: str, target: str, conversation_id: str, hop: int, remaining: int,
+                    message: str, reply_to: Optional[str] = None) -> str:
     sender_label = AGENT_LABEL.get(sender, sender)
     reply_tool = PEER_TOOL.get(target, 'the cross-agent tool')
 
-    if remaining > 0:
+    if remaining > 0 and reply_to:
+        follow_up = (f'- For a NEW request back to {sender_label}, call `{reply_tool}` with '
+                     f'session_id="{reply_to}" ({remaining} bridge hop(s) left). Otherwise '
+                     'just answer.')
+    elif remaining > 0:
         follow_up = (f'- If you need to send a NEW request back to {sender_label}, call the '
                      f'`{reply_tool}` tool ({remaining} bridge hop(s) left). Otherwise just answer.')
     else:
@@ -84,6 +102,7 @@ def _build_envelope(sender: str, target: str, conversation_id: str,
     return (
         '=== CROSS-AGENT BRIDGE MESSAGE ===\n'
         f'from: {sender_label} (peer AI agent, not the human user)\n'
+        f'{_address_line(sender, reply_to)}'
         f'conversation: {conversation_id} | hop {hop}/{config.MAX_HOPS}\n'
         '\n'
         f'{message}\n'
@@ -97,13 +116,16 @@ def _build_envelope(sender: str, target: str, conversation_id: str,
     )
 
 
-def _build_reply_envelope(sender: str, target: str, conversation_id: str,
-                          hop: int, remaining: int, reply: str) -> str:
+def _build_reply_envelope(sender: str, target: str, conversation_id: str, hop: int,
+                          remaining: int, reply: str, reply_to: Optional[str] = None) -> str:
     """Wrap a peer's answer so the original sender reads it as an answer, not a new request."""
     sender_label = AGENT_LABEL.get(sender, sender)
     reply_tool = PEER_TOOL.get(target, 'the cross-agent tool')
 
-    if remaining > 0:
+    if remaining > 0 and reply_to:
+        follow_up = (f'- Only if you have a NEW request, call `{reply_tool}` with '
+                     f'session_id="{reply_to}" ({remaining} bridge hop(s) left).')
+    elif remaining > 0:
         follow_up = (f'- Only if you have a NEW request, call `{reply_tool}` '
                      f'({remaining} bridge hop(s) left).')
     else:
@@ -113,6 +135,7 @@ def _build_reply_envelope(sender: str, target: str, conversation_id: str,
     return (
         '=== CROSS-AGENT BRIDGE REPLY ===\n'
         f'from: {sender_label} (peer AI agent, not the human user)\n'
+        f'{_address_line(sender, reply_to)}'
         f'conversation: {conversation_id} | answering hop {hop}/{config.MAX_HOPS}\n'
         '\n'
         f'{reply}\n'
@@ -476,23 +499,31 @@ def _build_reply_job(job: outbox.Job, reply: str) -> Optional[outbox.Job]:
 
     hop = int(registry.get_conversation(job.conversation_id).get('hops', job.hop))
     remaining = max(config.MAX_HOPS - hop, 0)
+    answering_id = job.resolved_session_id or job.target_session_id
     payload = _build_reply_envelope(job.target_agent, job.sender_agent, job.conversation_id,
-                                    hop, remaining, reply)
+                                    hop, remaining, reply, answering_id)
 
     # resolved fresh: the sender's panel may have opened, closed or moved during the turn
     panel: Optional[Dict[str, Any]] = None
     with contextlib.suppress(Exception):
         panel = _panel_session(job.sender_agent, job.sender_session_id, [])
 
-    answering_id = job.resolved_session_id or job.target_session_id
+    # An answer runs where the sender's session lives, not where the request was aimed. A
+    # Claude transcript is filed under its own project directory, so resuming it from the
+    # target's directory fails with "No conversation found" even though the session is fine.
+    reply_cwd = job.pin_cwd
+    known = discovery.find_session(job.sender_agent, job.sender_session_id)
+    if known and known.get('cwd') and os.path.isdir(known['cwd']):
+        reply_cwd = known['cwd']
+
     child_busy = [f'{job.target_agent}:{answering_id}'] if answering_id else []
 
     return outbox.Job(
         target_agent=job.sender_agent,
         target_session_id=job.sender_session_id,
         payload=payload,
-        run_cwd=job.pin_cwd,
-        pin_cwd=job.pin_cwd,
+        run_cwd=reply_cwd,
+        pin_cwd=reply_cwd,
         env=_child_env(job.conversation_id, hop, job.target_agent, child_busy),
         timeout=job.timeout,
         ui_shim=(panel or {}).get('ui_shim'),
@@ -508,6 +539,29 @@ def _build_reply_job(job: outbox.Job, reply: str) -> Optional[outbox.Job]:
 
 outbox.OUTBOX.deliver = _deliver
 outbox.OUTBOX.build_reply = _build_reply_job
+
+
+def _own_session_id(sender_agent: str) -> Optional[str]:
+    """The caller's own session - the return address the peer's answer is delivered to.
+
+    Asked of the panel first, which knows it exactly: the shim hosting this process is an
+    ancestor of it. Only when there is no panel does this fall back to the transcript on
+    disk, and even then without pins - a pin says where to send, and letting it answer this
+    question addressed a reply to a session that had not existed for weeks.
+    """
+    if sender_agent not in CALLERS:
+        return None
+
+    if uihook.is_enabled():
+        own = uihook.find_own_session(sender_agent)
+        if own:
+            return own['session_id']
+
+    # rooted at the directory this server was launched from, not at the `cwd` argument,
+    # which may point anywhere
+    found = discovery.find_active_session(
+        sender_agent, discovery.SCOPE_CWD, os.getcwd(), use_pin=False)
+    return found['session_id'] if found else None
 
 
 def send_message(target_agent: str, message: str, session_id: Optional[str] = None,
@@ -536,14 +590,7 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
     identity = caller.detect_caller()
     sender_agent = identity['agent']
 
-    # The caller's own session is the freshest transcript on its own side, rooted at the
-    # directory this server was launched from - not at the `cwd` argument, which may point
-    # anywhere. This is where the peer's answer will be delivered, and it is never a valid
-    # target for the message itself.
-    self_session_id: Optional[str] = None
-    if sender_agent in CALLERS:
-        own = discovery.find_active_session(sender_agent, discovery.SCOPE_CWD, os.getcwd())
-        self_session_id = own['session_id'] if own else None
+    self_session_id = _own_session_id(sender_agent)
 
     if sender_agent == target_agent and not allows_same_agent and not session_id:
         raise BridgeError(
@@ -571,7 +618,7 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
     remaining = max(config.MAX_HOPS - hop, 0)
 
     payload = message if is_raw else _build_envelope(
-        sender_agent, target_agent, conversation_id, hop, remaining, message)
+        sender_agent, target_agent, conversation_id, hop, remaining, message, self_session_id)
 
     run_cwd = cwd
     if target and target.get('cwd') and os.path.isdir(target['cwd']):

@@ -382,16 +382,20 @@ def find_session_by_name(agent: str, name: str, limit: int = 500) -> Optional[Di
 
 
 def find_active_session(agent: str, scope: str, cwd: str,
-                        exclude_ids: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+                        exclude_ids: Optional[List[str]] = None,
+                        use_pin: bool = True) -> Optional[Dict[str, Any]]:
     """Resolve the session the user is currently talking to.
 
     Order of preference:
       1. a pin recorded in the registry (sticky pins never expire)
       2. the most recently written transcript inside the active window
+
+    `use_pin=False` skips step 1. A pin records where to *send*, so it must not answer a
+    question about who the caller itself is - see uihook.find_own_session.
     """
     blocked = set(exclude_ids or [])
 
-    pin = registry.get_pin(agent, cwd)
+    pin = registry.get_pin(agent, cwd) if use_pin else None
     if pin and pin.get('session_id') not in blocked:
         pinned = find_session(agent, pin['session_id'])
         if pinned and (pin.get('is_sticky') or pinned['is_active']):
