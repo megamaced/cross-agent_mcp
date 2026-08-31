@@ -115,11 +115,31 @@ def _extract_text(message: Any) -> str:
     return ''
 
 
+def _latest_custom_title(path: str) -> Optional[str]:
+    """The name a conversation carries *now*.
+
+    The entry is re-emitted as the transcript grows, so the copy near the head is the name the
+    session opened with - and renames happen. Only sessions that already showed a name in the
+    head reach this, so the extra read is paid by the few that have one.
+    """
+    for line in reversed(_tail_lines(path)):
+        if '"custom-title"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        if entry.get('type') == 'custom-title' and entry.get('customTitle'):
+            return str(entry['customTitle'])
+    return None
+
+
 def _parse_claude_session(path: str) -> Optional[Dict[str, Any]]:
     session_id = os.path.basename(path)[:-len('.jsonl')]
     session_cwd: Optional[str] = None
     origin: Optional[str] = None
     title = ''
+    custom_title = ''
     has_user_message = False
     is_sidechain_only = True
 
@@ -132,6 +152,9 @@ def _parse_claude_session(path: str) -> Optional[Dict[str, Any]]:
                     entry = json.loads(line)
                 except Exception:
                     continue
+
+                if entry.get('type') == 'custom-title' and entry.get('customTitle'):
+                    custom_title = str(entry['customTitle'])
 
                 if entry.get('type') == 'ai-title' and entry.get('aiTitle'):
                     title = str(entry['aiTitle'])
@@ -155,13 +178,20 @@ def _parse_claude_session(path: str) -> Optional[Dict[str, Any]]:
     if not has_user_message or is_sidechain_only:
         return None
 
+    # A name the human gave the conversation, shown at the top of its panel. It outranks the
+    # generated title and the first message, because it is the only one they can be expected
+    # to say back to us - "the koppa_studio session" means this, not the words it opened with.
+    if custom_title:
+        custom_title = _latest_custom_title(path) or custom_title
+
     info: Dict[str, Any] = {
         'agent': config.AGENT_CLAUDE,
         'session_id': session_id,
         'cwd': session_cwd,
         'path': path,
         'origin': origin,
-        'title': title,
+        'title': custom_title or title,
+        'is_named': bool(custom_title),
     }
     info.update(_describe_age(_safe_mtime(path)))
     return info
@@ -352,10 +382,13 @@ def find_session(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
 def find_session_by_name(agent: str, name: str, limit: int = 500) -> Optional[Dict[str, Any]]:
     """Look one session up by the title the user sees, not by its uuid.
 
-    The match is exact (case- and whitespace-insensitive) and nothing else. Substring matching
-    used to be allowed and it picked the wrong conversation: a Claude session has no name of
-    its own - its title is the first thing the human typed - so a path quoted in that first
-    message made "koppa_studio" match a months-old session and resume it headlessly.
+    A conversation the human named answers to that name; one they did not falls back to a
+    title made from its first message, which is a description and not something to be called
+    by. Either way the match is exact, case- and whitespace-insensitive, and nothing else.
+
+    Substring matching used to be allowed and it picked the wrong conversation: "koppa_studio"
+    found a path quoted in a months-old session's opening prompt and resumed it headlessly,
+    while the session actually named koppa_studio went unseen.
 
     A name the caller half-remembers must fail loudly. Guessing is how a message ends up in a
     conversation nobody is watching.

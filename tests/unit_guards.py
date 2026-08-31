@@ -768,6 +768,64 @@ def test_recovery_is_skipped_when_the_transport_already_answered() -> None:
     check('and is not labelled recovered', job.is_reply_recovered is False)
 
 
+def _write_claude_transcript(path: str, names: list, first_message: str) -> None:
+    """A transcript shaped like Claude Code's: the name entry repeats as the session grows."""
+    lines = []
+    for name in names[:1]:
+        lines.append(json.dumps({'type': 'custom-title', 'customTitle': name}))
+    lines.append(json.dumps({
+        'type': 'user', 'isSidechain': False, 'cwd': '/w', 'entrypoint': 'claude-vscode',
+        'message': {'content': first_message}}))
+    for name in names[1:]:
+        lines.append(json.dumps({'type': 'custom-title', 'customTitle': name}))
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+
+
+def test_a_conversations_own_name_is_what_it_is_called_by() -> None:
+    """The incident's real cause: the name was there and the bridge was not reading it.
+
+    A Claude conversation carries the name the human gave it, shown at the top of its panel and
+    stored in the transcript. The bridge was inventing a title from the first message instead,
+    so "the koppa_studio session" matched nothing it should have - and matched a path quoted
+    inside an unrelated session's opening prompt.
+    """
+    with tempfile.TemporaryDirectory(prefix='claude-titles-') as store:
+        named = store + '/11111111-1111-1111-1111-111111111111.jsonl'
+        _write_claude_transcript(named, ['koppa_studio'], '.')
+        parsed = discovery._parse_claude_session(named)
+        check('a named conversation is titled by its name, not its first message',
+              parsed is not None and parsed['title'] == 'koppa_studio',
+              str(parsed and parsed['title']))
+        check('and is marked as named', parsed is not None and parsed['is_named'] is True)
+
+        # renames happen - 3 of the 11 named sessions on this machine had been renamed
+        renamed = store + '/22222222-2222-2222-2222-222222222222.jsonl'
+        _write_claude_transcript(renamed, ['studio_v4', 'studio_v4_orginial', 'studio_v4 2nd'],
+                                 'first prompt')
+        parsed = discovery._parse_claude_session(renamed)
+        check('a renamed conversation answers to its current name',
+              parsed is not None and parsed['title'] == 'studio_v4 2nd',
+              str(parsed and parsed['title']))
+
+        unnamed = store + '/33333333-3333-3333-3333-333333333333.jsonl'
+        _write_claude_transcript(unnamed, [], 'implement the thing in /src/koppa_studio')
+        parsed = discovery._parse_claude_session(unnamed)
+        check('an unnamed conversation still falls back to its first message',
+              parsed is not None and 'koppa_studio' in parsed['title'])
+        check('but is not marked as named', parsed is not None and parsed['is_named'] is False)
+
+        # the fallback title is not a name: it must not answer to a word inside it
+        originals = discovery.list_sessions
+        discovery.list_sessions = lambda agent, scope, cwd, limit=500, **kw: [
+            discovery._parse_claude_session(unnamed)]
+        try:
+            check('a word quoted in an unnamed conversation is still not a name',
+                  discovery.find_session_by_name('claude', 'koppa_studio') is None)
+        finally:
+            discovery.list_sessions = originals
+
+
 def test_a_session_name_matches_exactly_or_not_at_all() -> None:
     """The incident: 'koppa_studio' matched a path quoted inside an old session's first message.
 
@@ -899,6 +957,7 @@ if __name__ == '__main__':
     test_a_finished_delivery_outlives_the_process_that_carried_it()
     test_an_answer_is_recovered_from_the_peer_transcript()
     test_recovery_is_skipped_when_the_transport_already_answered()
+    test_a_conversations_own_name_is_what_it_is_called_by()
     test_a_session_name_matches_exactly_or_not_at_all()
     test_a_named_session_is_never_silently_created()
     test_naming_a_session_and_forcing_a_new_one_is_refused()
