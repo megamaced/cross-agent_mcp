@@ -929,6 +929,59 @@ def test_an_answer_is_recovered_from_the_peer_transcript() -> None:
             outbox.config.DELIVERY_DIR = original_dir
 
 
+def test_a_busy_peer_is_retried_rather_than_failed() -> None:
+    """Both agents handle concurrent input already — Claude waits out the turn, Codex queues —
+    they just have a limit. Past it the shim says "busy", which is a moment, not a verdict."""
+    original = outbox.BUSY_RETRY_SECONDS
+    outbox.BUSY_RETRY_SECONDS = 0.02
+    try:
+        box = outbox.Outbox()
+        attempts = {'count': 0}
+
+        def busy_until_the_third_try(job):
+            attempts['count'] += 1
+            if attempts['count'] < 3:
+                raise outbox.PeerBusyError('the panel session is busy with another turn')
+            return {'session_id': job.target_session_id, 'reply': '늦게 받았습니다',
+                    'is_new_session': False}
+
+        box.deliver = busy_until_the_third_try
+        delivery_id = box.submit(_job(box, 'sid-busy-peer'))
+        _drain(box)
+
+        job = box.find(delivery_id)
+        check('a busy peer is retried until it is free',
+              job.state == outbox.STATE_DELIVERED and attempts['count'] == 3,
+              f'{job.state} after {attempts["count"]} attempts')
+        check('and the message is delivered, not recovered',
+              job.reply == '늦게 받았습니다' and not job.is_reply_recovered)
+    finally:
+        outbox.BUSY_RETRY_SECONDS = original
+
+
+def test_a_shim_busy_answer_is_told_apart_from_a_real_failure() -> None:
+    busy = {'ok': False, 'error': 'the panel session is busy with another turn'}
+    inflight = {'ok': False, 'error': 'another bridged message is already in flight'}
+    broken = {'ok': False, 'error': 'failed to write to the claude process: EPIPE'}
+
+    original = bridge.uihook.send
+    try:
+        for response, expected, label in [
+            (busy, outbox.PeerBusyError, 'a busy panel'),
+            (inflight, outbox.PeerBusyError, 'a message already in flight'),
+            (broken, bridge.BridgeError, 'a broken pipe'),
+        ]:
+            bridge.uihook.send = lambda *a, **kw: response
+            try:
+                bridge._call_via_panel('hi', 'sid', {'socket': '/s'}, 5, '/w')
+                check(f'{label} raises something', False, 'nothing raised')
+            except Exception as e:
+                check(f'{label} is classified correctly', isinstance(e, expected),
+                      f'{type(e).__name__} for {response["error"]!r}')
+    finally:
+        bridge.uihook.send = original
+
+
 def test_a_panel_delivery_keeps_watching_after_the_transport_gives_up() -> None:
     """Giving up listening is not the peer giving up working.
 
@@ -1200,6 +1253,8 @@ def run_all() -> None:
     test_a_message_queued_in_the_wakeup_gap_is_not_lost()
     test_a_finished_delivery_outlives_the_process_that_carried_it()
     test_an_answer_is_recovered_from_the_peer_transcript()
+    test_a_busy_peer_is_retried_rather_than_failed()
+    test_a_shim_busy_answer_is_told_apart_from_a_real_failure()
     test_a_panel_delivery_keeps_watching_after_the_transport_gives_up()
     test_a_cli_delivery_does_not_wait_for_a_turn_that_was_killed()
     test_recovery_is_skipped_when_the_transport_already_answered()

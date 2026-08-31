@@ -35,6 +35,13 @@ KILL_GRACE_SECONDS = 5
 # how much of the relayed message is used to title a conversation the bridge opened
 PANEL_TITLE_LIMIT = 50
 
+# Shim answers that mean "not now" rather than "no". Matched as substrings because the shim
+# builds them as prose; a phrase that stops appearing costs a retry, never a wrong delivery.
+PEER_BUSY_SIGNALS = (
+    'busy with another turn',
+    'already in flight',
+)
+
 AGENT_LABEL: Dict[str, str] = {
     config.AGENT_CLAUDE: 'Claude Code',
     config.AGENT_CODEX: 'Codex',
@@ -311,7 +318,12 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
     """Deliver through the editor panel shim, so the exchange shows up in the panel."""
     response = uihook.send(message, ui_shim, session_id, timeout, cwd, title)
     if not response.get('ok'):
-        raise BridgeError(f'IDE panel relay failed: {response.get("error")}')
+        error = str(response.get('error') or '')
+        # The shim waits for the peer to be free and gives up after a while. That deadline is
+        # its own, not ours: the peer is still going to be free eventually.
+        if any(signal in error for signal in PEER_BUSY_SIGNALS):
+            raise outbox.PeerBusyError(error)
+        raise BridgeError(f'IDE panel relay failed: {error}')
 
     return {
         'session_id': response.get('sessionId') or session_id or '',

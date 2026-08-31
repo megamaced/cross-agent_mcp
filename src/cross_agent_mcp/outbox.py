@@ -119,6 +119,16 @@ def read_records(limit: int = 20) -> List[Dict[str, Any]]:
     return records[:limit]
 
 
+class PeerBusyError(Exception):
+    """The peer could not take the message yet — but it will.
+
+    Both agents already have an answer for concurrent input: Claude waits for the turn to end,
+    Codex queues. They just have a limit, and past it the shim says so. That is a "come back
+    shortly", not a verdict, and turning it into a delivery failure threw away messages the
+    peer would have accepted a minute later.
+    """
+
+
 class Job:
     """One message on its way to a peer session."""
 
@@ -315,19 +325,23 @@ class Outbox:
         if self.deliver is None:
             raise RuntimeError('outbox has no delivery function installed')
 
-        if not job.target_session_id:
-            return self.deliver(job)
-
         deadline = time.time() + job.timeout
         while True:
             try:
+                if not job.target_session_id:
+                    return self.deliver(job)
                 with registry.busy_lock(job.target_agent, job.target_session_id,
                                         job.conversation_id):
                     return self.deliver(job)
-            except registry.SessionBusyError:
+            except (registry.SessionBusyError, PeerBusyError) as e:
+                # Two ways of hearing the same thing: another delivery holds the session, or
+                # the peer itself is mid-turn. Neither says the message cannot be delivered,
+                # only that now is not the moment.
                 if time.time() >= deadline:
                     raise
-                logger.debug(f'_deliver_with_lock [busy]: {job.target_session_id}, retrying')
+                logger.info(f'_deliver_with_lock [busy]: {job.delivery_id} → '
+                            f'{job.target_session_id or "NEW"} not ready ({type(e).__name__}), '
+                            f'retrying in {BUSY_RETRY_SECONDS}s')
                 time.sleep(BUSY_RETRY_SECONDS)
 
     def _recover_with_patience(self, job: Job) -> Optional[str]:
