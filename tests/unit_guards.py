@@ -822,6 +822,12 @@ def test_a_reply_runs_where_the_senders_session_lives() -> None:
                   reply is not None and reply.run_cwd == sender_home, str(reply and reply.run_cwd))
             check('a reply expects no reply of its own',
                   reply is not None and reply.wants_reply is False)
+            # The request carried timeout=5, the sort of value a peer on an older build sends.
+            # Inheriting it let that peer decide how long we may spend delivering our own
+            # answer, and a reply that times out falls back to transcript recovery.
+            check('and waits by our floor, not the timeout the requester happened to send',
+                  reply is not None and reply.timeout == config.SEND_TIMEOUT_SECONDS,
+                  str(reply and reply.timeout))
         finally:
             discovery.find_session = original
 

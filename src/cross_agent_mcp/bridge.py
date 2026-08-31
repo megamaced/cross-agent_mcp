@@ -630,7 +630,11 @@ def _build_reply_job(job: outbox.Job, reply: str) -> Optional[outbox.Job]:
         run_cwd=reply_cwd,
         pin_cwd=reply_cwd,
         env=_child_env(job.conversation_id, hop, job.target_agent, child_busy),
-        timeout=job.timeout,
+        # Our own floor, not the requester's. job.timeout came from whoever sent the request,
+        # so a peer on an older build was deciding how long we may spend delivering the answer
+        # into our own sender's session - two unrelated waits. Too short and the reply fails
+        # into transcript recovery, which is how a half-written turn gets read as an answer.
+        timeout=max(job.timeout, config.SEND_TIMEOUT_SECONDS),
         ui_shim=(panel or {}).get('ui_shim'),
         title=_panel_title(job.target_agent, reply),
         conversation_id=job.conversation_id,
