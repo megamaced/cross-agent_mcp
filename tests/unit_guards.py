@@ -625,6 +625,50 @@ def test_the_envelope_carries_a_return_address() -> None:
           'session_id="' not in anonymous)
 
 
+def test_a_recovered_answer_says_it_may_not_be_finished() -> None:
+    """Recovery reads the peer's last message, which is not always its answer.
+
+    It happened: a relay timed out while the peer was still working, recovery picked up the
+    line it had just written about what it was doing next, and that arrived looking exactly
+    like a finished report.
+    """
+    plain = bridge._build_reply_envelope('codex', 'claude', 'conv_x', 1, 3, '작업 완료', 'sid')
+    check('a received answer is not hedged', 'RECOVERED' not in plain)
+    check('and says plainly where it came from',
+          'This is the answer to a message you relayed earlier.' in plain)
+
+    recovered = bridge._build_reply_envelope(
+        'codex', 'claude', 'conv_x', 1, 3, '확인 중입니다', 'sid', is_recovered=True)
+    check('a recovered answer is marked in the header',
+          'recovered from transcript' in recovered)
+    check('and warns it may be mid-work rather than an answer',
+          'RECOVERED, NOT RECEIVED' in recovered
+          and 'still doing rather than its' in recovered, recovered)
+
+
+def test_the_recovered_flag_reaches_the_envelope() -> None:
+    original = discovery.find_session
+    discovery.find_session = lambda agent, session_id: None
+    try:
+        request = outbox.Job(
+            target_agent=config.AGENT_CODEX, target_session_id='peer-sid', payload='x',
+            run_cwd='/w', pin_cwd='/w', env={}, timeout=5, ui_shim=None, title=None,
+            conversation_id='conv_r', hop=1, sender_agent=config.AGENT_CLAUDE,
+            sender_session_id='sender-sid', wants_reply=True, summary='req')
+        request.is_reply_recovered = True
+
+        reply = bridge._build_reply_job(request, '확인 중입니다')
+        check('a job recovered from a transcript builds a marked envelope',
+              reply is not None and 'RECOVERED, NOT RECEIVED' in reply.payload)
+
+        request.is_reply_recovered = False
+        plain = bridge._build_reply_job(request, '작업 완료')
+        check('and one that arrived normally does not',
+              plain is not None and 'RECOVERED' not in plain.payload)
+    finally:
+        discovery.find_session = original
+
+
 def test_a_reply_runs_where_the_senders_session_lives() -> None:
     """A Claude transcript is filed under its own project dir; resuming elsewhere fails."""
     with tempfile.TemporaryDirectory(prefix='sender-home-') as sender_home:
@@ -947,6 +991,8 @@ if __name__ == '__main__':
     test_the_caller_identifies_its_own_session_exactly()
     test_a_pin_never_answers_who_the_caller_is()
     test_the_envelope_carries_a_return_address()
+    test_a_recovered_answer_says_it_may_not_be_finished()
+    test_the_recovered_flag_reaches_the_envelope()
     test_a_reply_runs_where_the_senders_session_lives()
     test_submit_does_not_block_the_caller()
     test_same_session_deliveries_are_serialised()

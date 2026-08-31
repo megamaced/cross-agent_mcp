@@ -119,8 +119,15 @@ def _build_envelope(sender: str, target: str, conversation_id: str, hop: int, re
 
 
 def _build_reply_envelope(sender: str, target: str, conversation_id: str, hop: int,
-                          remaining: int, reply: str, reply_to: Optional[str] = None) -> str:
-    """Wrap a peer's answer so the original sender reads it as an answer, not a new request."""
+                          remaining: int, reply: str, reply_to: Optional[str] = None,
+                          is_recovered: bool = False) -> str:
+    """Wrap a peer's answer so the original sender reads it as an answer, not a new request.
+
+    A recovered answer says so. Recovery reads the peer's last message at the moment the
+    transport gave up, and a peer that is still working has a last message too - a line about
+    what it is doing next. Delivered unmarked, that reads exactly like a finished answer, and
+    the reader acts on a report that was never made.
+    """
     sender_label = AGENT_LABEL.get(sender, sender)
     reply_tool = PEER_TOOL.get(target, 'the cross-agent tool')
 
@@ -134,16 +141,28 @@ def _build_reply_envelope(sender: str, target: str, conversation_id: str, hop: i
         follow_up = ('- The hop budget for this conversation is exhausted. Do NOT call any '
                      'cross-agent tool.')
 
+    if is_recovered:
+        provenance = (
+            f'- RECOVERED, NOT RECEIVED. Delivery from {sender_label} failed, so this was read\n'
+            f'  out of its transcript: it is whatever {sender_label} had last said at that\n'
+            '  moment, which may be a note about what it was still doing rather than its\n'
+            '  answer. Treat it as finished only if it reads like a finished answer, and check\n'
+            f'  with {sender_label} before acting on it as a report.\n')
+    else:
+        provenance = '- This is the answer to a message you relayed earlier.\n'
+
     return (
         '=== CROSS-AGENT BRIDGE REPLY ===\n'
         f'from: {sender_label} (peer AI agent, not the human user)\n'
         f'{_address_line(sender, reply_to)}'
-        f'conversation: {conversation_id} | answering hop {hop}/{config.MAX_HOPS}\n'
+        f'conversation: {conversation_id} | answering hop {hop}/{config.MAX_HOPS}'
+        f'{" | recovered from transcript" if is_recovered else ""}\n'
         '\n'
         f'{reply}\n'
         '\n'
         '=== NOTE ===\n'
-        '- This is the answer to a message you relayed earlier. Nothing is waiting on you.\n'
+        f'{provenance}'
+        '- Nothing is waiting on you.\n'
         f'{follow_up}\n'
     )
 
@@ -568,7 +587,8 @@ def _build_reply_job(job: outbox.Job, reply: str) -> Optional[outbox.Job]:
     remaining = max(config.MAX_HOPS - hop, 0)
     answering_id = job.resolved_session_id or job.target_session_id
     payload = _build_reply_envelope(job.target_agent, job.sender_agent, job.conversation_id,
-                                    hop, remaining, reply, answering_id)
+                                    hop, remaining, reply, answering_id,
+                                    is_recovered=job.is_reply_recovered)
 
     # resolved fresh: the sender's panel may have opened, closed or moved during the turn
     panel: Optional[Dict[str, Any]] = None
