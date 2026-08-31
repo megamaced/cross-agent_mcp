@@ -60,6 +60,16 @@ RECOVERY_WINDOW_SECONDS = 900
 RECOVERY_POLL_SECONDS = 15
 
 
+def new_request_id() -> str:
+    """`req_<epoch ms>_<6 hex>` — short enough for a peer to copy back without mangling it.
+
+    The millisecond prefix is the useful half: a token read out of a log, a delivery record or
+    the peer's transcript says when its request went out, and sorting the tokens sorts the
+    requests. The random tail only has to survive two requests leaving in the same millisecond.
+    """
+    return f'req_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}'
+
+
 def _write_record(record: Dict[str, Any]) -> None:
     """Keep a finished delivery where the next server process can still read it.
 
@@ -117,8 +127,8 @@ class Job:
                  ui_shim: Optional[Dict[str, Any]], title: Optional[str],
                  conversation_id: str, hop: int, sender_agent: str,
                  sender_session_id: Optional[str], wants_reply: bool,
-                 summary: str) -> None:
-        self.delivery_id = 'dlv_' + uuid.uuid4().hex[:12]
+                 summary: str, delivery_id: Optional[str] = None) -> None:
+        self.delivery_id = delivery_id or new_request_id()
         self.target_agent = target_agent
         self.target_session_id = target_session_id
         self.payload = payload

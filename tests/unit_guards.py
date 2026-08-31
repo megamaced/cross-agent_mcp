@@ -380,7 +380,7 @@ def test_submit_does_not_block_the_caller() -> None:
     elapsed = time.time() - started
 
     check('submit returns without waiting for the turn', elapsed < 0.5, f'{elapsed:.2f}s')
-    check('submit hands back a delivery id', delivery_id.startswith('dlv_'), delivery_id)
+    check('submit hands back a delivery id', delivery_id.startswith('req_'), delivery_id)
     check('the delivery is reported as in flight',
           any(d['delivery_id'] == delivery_id for d in box.snapshot()['pending']))
 
@@ -653,6 +653,60 @@ def test_a_short_timeout_is_raised_to_the_configured_budget() -> None:
     finally:
         (bridge.caller.detect_caller, bridge._own_session_id,
          bridge._resolve_target, outbox.OUTBOX.submit) = originals
+
+
+def test_an_echoed_token_identifies_which_request_was_answered() -> None:
+    """The timestamp rule cannot tell two requests apart, and the panel is the human's session
+    too — anything they type there also postdates our request. An echoed id settles it."""
+    import datetime
+
+    spoke_at = datetime.datetime(2026, 9, 1, 3, 0, 0, tzinfo=datetime.timezone.utc)
+    mine = 'req_1788197970127_ea5c29'
+    other = 'req_1788197970127_bbbbbb'
+
+    def transcript(text: str) -> str:
+        store = tempfile.mkdtemp(prefix='token-')
+        path = store + '/session.jsonl'
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(json.dumps({
+                'type': 'assistant',
+                'timestamp': spoke_at.isoformat().replace('+00:00', 'Z'),
+                'message': {'content': [{'type': 'text', 'text': text}]},
+            }) + '\n')
+        return path
+
+    original = discovery.find_session
+    try:
+        # 토큰이 맞으면 시각이 요청보다 앞서도 답으로 인정한다 — 증거가 추정을 이긴다.
+        discovery.find_session = lambda a, s: {'path': transcript(f'끝났습니다.\n{mine}')}
+        check('a matching token is accepted even against the clock',
+              discovery.last_agent_message(
+                  'claude', 'sid', after=spoke_at.timestamp() + 999, token=mine) is not None)
+
+        discovery.find_session = lambda a, s: {'path': transcript(f'다른 답입니다.\n{other}')}
+        check('a different token is refused even though it is newer',
+              discovery.last_agent_message(
+                  'claude', 'sid', after=spoke_at.timestamp() - 999, token=mine) is None)
+
+        # 상대가 토큰을 안 적으면 기존 시각 규칙으로 되돌아간다 — 협조는 보너스지 조건이 아니다.
+        discovery.find_session = lambda a, s: {'path': transcript('토큰 없이 답합니다.')}
+        check('a peer that ignored the token still falls back to the clock',
+              discovery.last_agent_message(
+                  'claude', 'sid', after=spoke_at.timestamp() - 1, token=mine) is not None)
+        check('and the clock still refuses what predates the request',
+              discovery.last_agent_message(
+                  'claude', 'sid', after=spoke_at.timestamp() + 1, token=mine) is None)
+    finally:
+        discovery.find_session = original
+
+
+def test_a_request_id_is_short_and_carries_its_time() -> None:
+    token = outbox.new_request_id()
+    check('the token is short enough to copy back', len(token) <= 26, token)
+    check('and its millisecond prefix is readable',
+          abs(int(token.split('_')[1]) / 1000 - time.time()) < 5, token)
+    check('two tokens in the same millisecond still differ',
+          outbox.new_request_id() != outbox.new_request_id())
 
 
 def test_recovery_refuses_a_message_older_than_the_question() -> None:
@@ -1131,6 +1185,8 @@ def run_all() -> None:
     test_a_pin_never_answers_who_the_caller_is()
     test_the_envelope_carries_a_return_address()
     test_a_short_timeout_is_raised_to_the_configured_budget()
+    test_an_echoed_token_identifies_which_request_was_answered()
+    test_a_request_id_is_short_and_carries_its_time()
     test_recovery_refuses_a_message_older_than_the_question()
     test_recovery_refuses_a_message_with_no_timestamp_when_asked_for_one()
     test_a_recovered_answer_says_it_may_not_be_finished()

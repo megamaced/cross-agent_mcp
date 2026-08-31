@@ -86,7 +86,8 @@ def _address_line(sender: str, reply_to: Optional[str]) -> str:
 
 
 def _build_envelope(sender: str, target: str, conversation_id: str, hop: int, remaining: int,
-                    message: str, reply_to: Optional[str] = None) -> str:
+                    message: str, reply_to: Optional[str] = None,
+                    request_id: Optional[str] = None) -> str:
     sender_label = AGENT_LABEL.get(sender, sender)
     reply_tool = PEER_TOOL.get(target, 'the cross-agent tool')
 
@@ -106,12 +107,17 @@ def _build_envelope(sender: str, target: str, conversation_id: str, hop: int, re
         f'from: {sender_label} (peer AI agent, not the human user)\n'
         f'{_address_line(sender, reply_to)}'
         f'conversation: {conversation_id} | hop {hop}/{config.MAX_HOPS}\n'
-        '\n'
+        + (f'request: {request_id}\n' if request_id else '')
+        + '\n'
         f'{message}\n'
         '\n'
         '=== HOW TO REPLY ===\n'
         f'- Your final assistant message is relayed back to {sender_label} as a message in its\n'
         '  own session. Take the time the task needs; nothing is parked waiting on you.\n'
+        + (f'- End your final message with the request id on its own line: {request_id}\n'
+           '  If the relay drops, that line is how your answer is matched to this request\n'
+           '  rather than mistaken for a reply to something else.\n' if request_id else '')
+        +
         '- Answer the peer directly; do not wait for the human and do not ask for confirmation.\n'
         '- Keep the answer self-contained: the peer sees only your final message.\n'
         f'{follow_up}\n'
@@ -634,8 +640,9 @@ def _recover_reply(job: outbox.Job) -> Optional[str]:
     session_id = job.resolved_session_id or job.target_session_id
     if not session_id:
         return None
-    # Only what the peer wrote after we reached it can be an answer to what we asked.
-    return discovery.last_agent_message(job.target_agent, session_id, after=job.started_at)
+    # The token is proof; the timestamp is the fallback for a peer that did not echo it.
+    return discovery.last_agent_message(
+        job.target_agent, session_id, after=job.started_at, token=job.delivery_id)
 
 
 outbox.OUTBOX.deliver = _deliver
@@ -733,8 +740,11 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
     hop = int(record.get('hops', 1))
     remaining = max(config.MAX_HOPS - hop, 0)
 
+    # 봉투보다 먼저 발급한다 — 상대가 되돌려줄 토큰이 봉투 안에 있어야 하기 때문이다.
+    request_id = outbox.new_request_id()
     payload = message if is_raw else _build_envelope(
-        sender_agent, target_agent, conversation_id, hop, remaining, message, self_session_id)
+        sender_agent, target_agent, conversation_id, hop, remaining, message, self_session_id,
+        request_id=request_id)
 
     run_cwd = cwd
     if target and target.get('cwd') and os.path.isdir(target['cwd']):
@@ -763,6 +773,7 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         sender_session_id=self_session_id,
         wants_reply=True,
         summary=_summary(message),
+        delivery_id=request_id,
     )
     delivery_id = outbox.OUTBOX.submit(job)
 

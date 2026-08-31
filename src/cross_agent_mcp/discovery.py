@@ -463,8 +463,18 @@ def _entry_epoch(entry: Dict[str, Any]) -> Optional[float]:
         return None
 
 
+REQUEST_TOKEN_PATTERN = re.compile(r'\breq_\d+_[0-9a-f]{6}\b')
+
+
+def request_token_in(text: str) -> Optional[str]:
+    """The request id a peer echoed back, if it echoed one."""
+    match = REQUEST_TOKEN_PATTERN.search(text)
+    return match.group(0) if match else None
+
+
 def last_agent_message(agent: str, session_id: str,
-                       after: Optional[float] = None) -> Optional[str]:
+                       after: Optional[float] = None,
+                       token: Optional[str] = None) -> Optional[str]:
     """The final assistant message a session wrote, read straight from its transcript.
 
     The bridge normally carries an answer back from the process it started. When that process
@@ -504,6 +514,18 @@ def last_agent_message(agent: str, session_id: str,
 
         if text.strip() == '':
             continue
+
+        # An echoed token settles it either way, and better than any timing rule can: a match
+        # is proof, and a different token is proof this answers something else.
+        if token is not None:
+            echoed = request_token_in(text)
+            if echoed == token:
+                return text.strip()
+            if echoed is not None:
+                logger.info(
+                    f'last_agent_message [other request]: {agent} {session_id} last answered '
+                    f'{echoed}, not {token}')
+                return None
 
         if after is not None:
             written = _entry_epoch(entry)
