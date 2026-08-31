@@ -1,9 +1,17 @@
-"""Reach the peer session that is open in *this* editor window.
+"""Reach the peer session that is open in an editor panel.
 
 Each panel shim registers a socket together with the pid chain it was launched from. The
 Codex extension and the Claude Code extension are both children of the same VS Code extension
 host, so the shim whose ancestry shares the nearest pid with this process belongs to the
 window the user is looking at.
+
+That ancestry test decides *which window*, not *what is reachable*. A shim's socket is an
+ordinary AF_UNIX path, so any window's panel can be delivered to once its socket is known.
+The distinction matters in exactly one place: picking a target on the caller's behalf must
+stay inside this window - landing in another window's conversation would be a surprise - but
+a session the caller named explicitly should be found wherever it actually lives, instead of
+falling through to a headless CLI resume that the owning panel then rejects as a second
+writer on the same transcript.
 """
 
 import glob
@@ -143,9 +151,31 @@ def find_live_sessions(agent: str) -> List[Dict[str, Any]]:
     Observed input strictly outranks transcript time, because a bridged turn also touches the
     transcript and must never make the bridge keep picking its own last target.
     """
+    return sessions_of(agent, find_local_shims(agent))
+
+
+def foreign_shims(agent: str) -> List[Dict[str, Any]]:
+    """Registered shims for this agent that belong to some other editor window."""
+    local_pids = {s.get('pid') for s in find_local_shims(agent)}
+    return [s for s in list_shims(agent) if s.get('pid') not in local_pids]
+
+
+def find_foreign_sessions(agent: str) -> List[Dict[str, Any]]:
+    """Panel sessions open in other editor windows.
+
+    Reachable, but never auto-selected: the caller has to name one.
+    """
+    sessions = sessions_of(agent, foreign_shims(agent))
+    for session in sessions:
+        session['is_foreign_window'] = True
+    return sessions
+
+
+def sessions_of(agent: str, shims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Read every conversation the given shims are hosting, best target first."""
     sessions: List[Dict[str, Any]] = []
 
-    for shim in find_local_shims(agent):
+    for shim in shims:
         status = read_status(shim)
         if not status.get('ok'):
             continue
@@ -182,11 +212,26 @@ def _transcript_mtime(agent: str, session_id: str) -> float:
 
 
 def find_live_session(agent: str, session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """The panel session to deliver to: a specific one when asked, else the active one."""
+    """The panel session to deliver to: a specific one when asked, else the active one.
+
+    Without an id the answer is always this window's conversation. With an id, this window is
+    still searched first, and only a session the caller named by hand is chased into another
+    window - where the CLI fallback could not have reached it anyway.
+    """
     sessions = find_live_sessions(agent)
-    if session_id:
-        return next((s for s in sessions if s['session_id'] == session_id), None)
-    return sessions[0] if sessions else None
+    if not session_id:
+        return sessions[0] if sessions else None
+
+    match = next((s for s in sessions if s['session_id'] == session_id), None)
+    if match:
+        return match
+
+    foreign = next((s for s in find_foreign_sessions(agent)
+                    if s['session_id'] == session_id), None)
+    if foreign:
+        logger.info(f'find_live_session [other window]: {agent} {session_id} is hosted by '
+                    f'shim pid={foreign.get("shim_pid")}')
+    return foreign
 
 
 def find_panel_host(agent: str) -> Optional[Dict[str, Any]]:

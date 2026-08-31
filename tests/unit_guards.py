@@ -491,6 +491,60 @@ def test_a_busy_session_is_waited_out_not_refused() -> None:
         keeper.join(timeout=2)
 
 
+def test_another_window_is_reachable_only_when_named() -> None:
+    """Auto-selection stays in this window; an explicitly named session is chased anywhere."""
+    from cross_agent_mcp import uihook
+
+    now = time.time()
+    shims = [
+        # this window: the extension host is pid 99, which our own chain shares
+        {'agent': 'codex', 'pid': 1, 'socket': '/here', 'ancestors': [99], 'started_at': now},
+        # another VS Code window: a different extension host entirely
+        {'agent': 'codex', 'pid': 2, 'socket': '/there', 'ancestors': [77], 'started_at': now},
+    ]
+    statuses = {
+        '/here': {'ok': True, 'last_user_activity': now - 5,
+                  'sessions': [{'session_id': 'this-window', 'cwd': '/w'}]},
+        '/there': {'ok': True, 'last_user_activity': now - 1,
+                   'sessions': [{'session_id': 'other-window', 'cwd': '/w2'}]},
+    }
+
+    originals = (uihook.list_shims, uihook.process_ancestry,
+                 uihook.read_status, uihook._transcript_mtime)
+    uihook.list_shims = lambda agent=None: [s for s in shims if not agent or s['agent'] == agent]
+    uihook.process_ancestry = lambda pid, depth=12: [99]
+    uihook.read_status = lambda shim: statuses[shim['socket']]
+    uihook._transcript_mtime = lambda agent, session_id: 0.0
+
+    try:
+        local_ids = [s['session_id'] for s in uihook.find_live_sessions('codex')]
+        check('this window lists only its own tabs', local_ids == ['this-window'], str(local_ids))
+
+        foreign_ids = [s['session_id'] for s in uihook.find_foreign_sessions('codex')]
+        check('other windows are listed separately', foreign_ids == ['other-window'],
+              str(foreign_ids))
+
+        # the other window's tab was typed into more recently, so a heuristic that ignored
+        # window boundaries would pick it - auto-selection must not
+        check('auto-selection never leaves this window',
+              uihook.find_live_session('codex')['session_id'] == 'this-window')
+
+        named = uihook.find_live_session('codex', 'other-window')
+        check('a named session in another window is found', named is not None)
+        check('it is delivered through that window\'s own shim',
+              named is not None and named['shim']['socket'] == '/there')
+        check('it is marked as belonging to another window',
+              named is not None and named.get('is_foreign_window') is True)
+
+        check('a named session in this window still resolves locally',
+              uihook.find_live_session('codex', 'this-window')['shim']['socket'] == '/here')
+        check('a session open in no window at all is still unmatched',
+              uihook.find_live_session('codex', 'nowhere') is None)
+    finally:
+        (uihook.list_shims, uihook.process_ancestry,
+         uihook.read_status, uihook._transcript_mtime) = originals
+
+
 def test_a_message_queued_in_the_wakeup_gap_is_not_lost() -> None:
     """The lost-wakeup window: a submit that notifies before the worker starts waiting.
 
@@ -539,6 +593,7 @@ if __name__ == '__main__':
     test_subagent_threads_are_rejected()
     test_new_session_is_the_last_resort()
     test_panel_session_selection()
+    test_another_window_is_reachable_only_when_named()
     test_submit_does_not_block_the_caller()
     test_same_session_deliveries_are_serialised()
     test_different_sessions_deliver_in_parallel()
