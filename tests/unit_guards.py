@@ -625,6 +625,36 @@ def test_the_envelope_carries_a_return_address() -> None:
           'session_id="' not in anonymous)
 
 
+def test_a_short_timeout_is_raised_to_the_configured_budget() -> None:
+    """Callers kept passing 30s and 120s from when this blocked. Peer turns run 216s..660s,
+    so the short value did nothing but cut them off."""
+    captured = {}
+    originals = (bridge.caller.detect_caller, bridge._own_session_id,
+                 bridge._resolve_target, outbox.OUTBOX.submit)
+
+    bridge.caller.detect_caller = lambda: {'agent': config.AGENT_CLAUDE, 'chain': []}
+    bridge._own_session_id = lambda agent: 'sender-sid'
+    bridge._resolve_target = lambda *a, **kw: {
+        'agent': config.AGENT_CODEX, 'session_id': 'peer-sid', 'cwd': None,
+        'source': 'name', 'ui_shim': None}
+    outbox.OUTBOX.submit = lambda job: (captured.update(timeout=job.timeout)
+                                        or 'dlv_test')
+
+    try:
+        result = bridge.send_message(config.AGENT_CODEX, 'hello', timeout=30)
+        check('a timeout below the budget is raised to it',
+              captured.get('timeout') == config.SEND_TIMEOUT_SECONDS, str(captured))
+        check('and the caller is told, not silently overridden',
+              'was raised to' in (result.get('warning') or ''), str(result.get('warning')))
+
+        captured.clear()
+        bridge.send_message(config.AGENT_CODEX, 'hello', timeout=1800)
+        check('a longer timeout is honoured', captured.get('timeout') == 1800, str(captured))
+    finally:
+        (bridge.caller.detect_caller, bridge._own_session_id,
+         bridge._resolve_target, outbox.OUTBOX.submit) = originals
+
+
 def test_recovery_refuses_a_message_older_than_the_question() -> None:
     """It happened twice: one paragraph written before either request existed came back as the
     answer to both. A message that predates its own question is not an answer."""
@@ -1039,6 +1069,7 @@ def run_all() -> None:
     test_the_caller_identifies_its_own_session_exactly()
     test_a_pin_never_answers_who_the_caller_is()
     test_the_envelope_carries_a_return_address()
+    test_a_short_timeout_is_raised_to_the_configured_budget()
     test_recovery_refuses_a_message_older_than_the_question()
     test_recovery_refuses_a_message_with_no_timestamp_when_asked_for_one()
     test_a_recovered_answer_says_it_may_not_be_finished()

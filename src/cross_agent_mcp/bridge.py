@@ -687,7 +687,13 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         raise BridgeError(f"scope must be one of {', '.join(discovery.SCOPES)}, got: {scope}")
 
     cwd = os.path.realpath(os.path.expanduser(cwd)) if cwd else os.getcwd()
-    timeout = timeout or config.SEND_TIMEOUT_SECONDS
+
+    # The timeout bounds the peer's turn, not the caller's wait - nobody waits any more. So a
+    # value below the configured budget has no upside and one real effect: it kills work that
+    # would have finished. Callers carried the habit over from when this blocked, and turns
+    # were being cut off at 30s and 120s while peer turns here run 216s..660s.
+    requested_timeout = timeout
+    timeout = max(timeout or config.SEND_TIMEOUT_SECONDS, config.SEND_TIMEOUT_SECONDS)
 
     identity = caller.detect_caller()
     sender_agent = identity['agent']
@@ -776,6 +782,11 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         warnings.append(
             'Your own session could not be identified, so the peer\'s answer cannot be '
             'delivered back here. It will exist only in the peer\'s transcript.')
+    if requested_timeout is not None and requested_timeout < timeout:
+        warnings.append(
+            f'timeout={requested_timeout}s was raised to {timeout}s. It bounds the peer\'s '
+            'turn, not your wait - this call already returned - so a shorter value only '
+            'aborts work that would have finished. Pass a larger one to allow more time.')
 
     return {
         'ok': True,

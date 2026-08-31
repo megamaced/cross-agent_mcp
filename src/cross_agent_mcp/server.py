@@ -117,7 +117,8 @@ async def send_to_codex(
         'any' = every recorded thread.
     cwd: Working directory used for discovery and for a newly created thread.
     timeout: Budget for the Codex turn itself, applied by the background worker. It does not
-        make this call wait, and it does not need to be small.
+        make this call wait, so a small value only aborts work that would have finished -
+        anything below the configured default is raised to it and the result says so.
     conversation_id: Continue an existing bridge conversation (shares the hop budget).
     raw: Send the message verbatim, without the bridge envelope.
     """
@@ -164,7 +165,8 @@ async def send_to_claude(
         'any' = every recorded session.
     cwd: Working directory used for discovery and for a newly created session.
     timeout: Budget for the Claude turn itself, applied by the background worker. It does not
-        make this call wait, and it does not need to be small.
+        make this call wait, so a small value only aborts work that would have finished -
+        anything below the configured default is raised to it and the result says so.
     conversation_id: Continue an existing bridge conversation (shares the hop budget).
     raw: Send the message verbatim, without the bridge envelope.
     allow_same_agent: Allow a Claude session to message another Claude session.
