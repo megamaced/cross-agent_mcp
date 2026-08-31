@@ -16,7 +16,10 @@ fairness - the agent CLIs keep a single writer per transcript, so overlapping tu
 session are rejected by the CLI itself.
 """
 
+import contextlib
+import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -46,6 +49,55 @@ STATE_QUEUED = 'queued'
 STATE_DELIVERING = 'delivering'
 STATE_DELIVERED = 'delivered'
 STATE_FAILED = 'failed'
+
+
+def _write_record(record: Dict[str, Any]) -> None:
+    """Keep a finished delivery where the next server process can still read it.
+
+    Only what `describe()` returns is written - never the payload or the child environment,
+    which carries every variable this process was started with.
+    """
+    try:
+        config.ensure_dirs()
+        path = config.DELIVERY_DIR + f"{record['delivery_id']}.json"
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({**record, 'finished_at': time.time()}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.error(f'_write_record [exception]: {e}')
+
+
+def read_records(limit: int = 20) -> List[Dict[str, Any]]:
+    """Finished deliveries from disk, newest first, pruning what has aged out."""
+    records: List[Dict[str, Any]] = []
+    try:
+        config.ensure_dirs()
+        names = os.listdir(config.DELIVERY_DIR)
+    except OSError:
+        return records
+
+    now = time.time()
+    for name in names:
+        if not name.endswith('.json'):
+            continue
+        path = config.DELIVERY_DIR + name
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                record = json.load(f)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+            continue
+
+        if now - float(record.get('finished_at') or 0) > config.DELIVERY_TTL_SECONDS:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+            continue
+        records.append(record)
+
+    records.sort(key=lambda r: float(r.get('finished_at') or 0), reverse=True)
+    return records[:limit]
 
 
 class Job:
@@ -83,6 +135,7 @@ class Job:
         self.error: Optional[str] = None
         self.reply = ''
         self.reply_length = 0
+        self.is_reply_recovered = False
         self.resolved_session_id: Optional[str] = None
 
     def key(self) -> str:
@@ -105,6 +158,9 @@ class Job:
                                 if self.started_at else None),
             'reply_length': self.reply_length or None,
             'reply_preview': self.reply[:REPLY_PREVIEW_LIMIT] or None,
+            # true when the answer was read out of the peer's transcript instead of being
+            # handed back by the process this server started
+            'is_reply_recovered': self.is_reply_recovered or None,
             'error': self.error,
         }
 
@@ -123,6 +179,7 @@ class Outbox:
         # injected by bridge to avoid an import cycle
         self.deliver: Optional[Callable[[Job], Dict[str, Any]]] = None
         self.build_reply: Optional[Callable[[Job, str], Optional['Job']]] = None
+        self.recover: Optional[Callable[[Job], Optional[str]]] = None
 
     # ------------------------------------------------------------- submission
 
@@ -203,12 +260,26 @@ class Outbox:
             job.reply = reply
             job.reply_length = len(reply)
             job.state = STATE_DELIVERED
-            if reply and job.wants_reply:
-                self._send_reply(job, reply)
         except Exception as e:
             job.state = STATE_FAILED
             job.error = f'{type(e).__name__}: {e}'
             logger.error(f'_run [exception]: {job.delivery_id} {job.error}')
+
+        # The peer may have answered even when we did not receive it - a transport that broke
+        # after the turn, a process that died holding the result. The answer is on disk in the
+        # peer's own transcript either way, so ask there before giving up on it.
+        if not job.reply:
+            recovered = self._recover(job)
+            if recovered:
+                job.reply = recovered
+                job.reply_length = len(recovered)
+                job.is_reply_recovered = True
+                logger.info(f'_run [recovered]: {job.delivery_id} read the answer from the '
+                            f'{job.target_agent} transcript ({len(recovered)} chars)')
+
+        try:
+            if job.reply and job.wants_reply:
+                self._send_reply(job, job.reply)
         finally:
             job.finished_at = time.time()
             self._archive(job)
@@ -240,6 +311,15 @@ class Outbox:
                 logger.debug(f'_deliver_with_lock [busy]: {job.target_session_id}, retrying')
                 time.sleep(BUSY_RETRY_SECONDS)
 
+    def _recover(self, job: Job) -> Optional[str]:
+        if self.recover is None:
+            return None
+        try:
+            return self.recover(job)
+        except Exception as e:
+            logger.error(f'_recover [exception]: {job.delivery_id} {e}')
+            return None
+
     def _send_reply(self, job: Job, reply: str) -> None:
         if self.build_reply is None:
             return
@@ -258,6 +338,7 @@ class Outbox:
             self._pending.pop(job.delivery_id, None)
             self._history.append(job)
             del self._history[:-HISTORY_LIMIT]
+        _write_record(job.describe())
 
     def find(self, delivery_id: str) -> Optional[Job]:
         with self._guard:
@@ -272,7 +353,12 @@ class Outbox:
             pending = [j.describe() for j in self._pending.values()]
             recent = [j.describe() for j in reversed(self._history[-limit:])]
         pending.sort(key=lambda d: d['queued_seconds'], reverse=True)
-        return {'pending': pending, 'recent': recent}
+
+        # Deliveries this process carried are in memory; earlier ones survive on disk, which
+        # is how an answer outlives the server that received it.
+        seen = {d['delivery_id'] for d in recent}
+        earlier = [r for r in read_records(limit) if r['delivery_id'] not in seen]
+        return {'pending': pending, 'recent': recent, 'earlier': earlier}
 
 
 OUTBOX = Outbox()

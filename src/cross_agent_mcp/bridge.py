@@ -537,8 +537,22 @@ def _build_reply_job(job: outbox.Job, reply: str) -> Optional[outbox.Job]:
     )
 
 
+def _recover_reply(job: outbox.Job) -> Optional[str]:
+    """Read the peer's answer out of its own transcript when the transport did not bring it.
+
+    Both agents write every turn to a JSONL transcript, so a delivery that reached the peer
+    has its answer on disk even when the process carrying it died first. Recovery costs one
+    file read and cannot ask the peer to redo the work, which re-sending would.
+    """
+    session_id = job.resolved_session_id or job.target_session_id
+    if not session_id:
+        return None
+    return discovery.last_agent_message(job.target_agent, session_id)
+
+
 outbox.OUTBOX.deliver = _deliver
 outbox.OUTBOX.build_reply = _build_reply_job
+outbox.OUTBOX.recover = _recover_reply
 
 
 def _own_session_id(sender_agent: str) -> Optional[str]:

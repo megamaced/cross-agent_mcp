@@ -689,6 +689,84 @@ def test_a_message_queued_in_the_wakeup_gap_is_not_lost() -> None:
           f'(idle linger is {outbox.IDLE_LINGER_SECONDS}s)')
 
 
+def test_a_finished_delivery_outlives_the_process_that_carried_it() -> None:
+    """The observed loss: the answer arrived, then the editor reloaded and took it away."""
+    original_dir = outbox.config.DELIVERY_DIR
+    with tempfile.TemporaryDirectory(prefix='cross-agent-deliveries-') as store:
+        outbox.config.DELIVERY_DIR = store + '/'
+        try:
+            box = outbox.Outbox()
+            box.deliver = lambda job: {'session_id': job.target_session_id,
+                                       'reply': 'the answer', 'is_new_session': False}
+            delivery_id = box.submit(_job(box, 'sid-persist'))
+            _drain(box)
+
+            # a new Outbox is what the next server process starts with
+            revived = outbox.Outbox().snapshot()
+            kept = next((r for r in revived['earlier']
+                         if r['delivery_id'] == delivery_id), None)
+            check('a finished delivery is readable by the next process', kept is not None)
+            check('and it still carries the answer',
+                  kept is not None and kept.get('reply_preview') == 'the answer',
+                  str(kept))
+
+            raw = open(store + f'/{delivery_id}.json', encoding='utf-8').read()
+            check('the record does not persist the message payload', 'hello' not in raw)
+            check('nor the child environment', 'PATH' not in raw)
+        finally:
+            outbox.config.DELIVERY_DIR = original_dir
+
+
+def test_an_answer_is_recovered_from_the_peer_transcript() -> None:
+    """A delivery that breaks after the peer answered must not throw the answer away."""
+    original_dir = outbox.config.DELIVERY_DIR
+    with tempfile.TemporaryDirectory(prefix='cross-agent-deliveries-') as store:
+        outbox.config.DELIVERY_DIR = store + '/'
+        try:
+            box = outbox.Outbox()
+            asked = []
+
+            def broken_deliver(job):
+                raise RuntimeError('peer agent did not answer within 600s')
+
+            box.deliver = broken_deliver
+            box.recover = lambda job: (asked.append(job.target_session_id)
+                                       or '트랜스크립트에서 회수한 답')
+
+            delivery_id = box.submit(_job(box, 'sid-recover', wants_reply=True))
+            replies = []
+            box.build_reply = lambda job, reply: (replies.append(reply) or None)
+            _drain(box)
+
+            job = box.find(delivery_id)
+            check('the transport failure is still recorded honestly',
+                  job.state == outbox.STATE_FAILED and job.error is not None)
+            check('but the answer is recovered from the peer transcript',
+                  job.reply == '트랜스크립트에서 회수한 답', job.reply)
+            check('and it is marked as recovered, not received',
+                  job.is_reply_recovered is True)
+            check('recovery asks about the target session', asked == ['sid-recover'], str(asked))
+            check('a recovered answer is still relayed to the sender',
+                  replies == ['트랜스크립트에서 회수한 답'], str(replies))
+        finally:
+            outbox.config.DELIVERY_DIR = original_dir
+
+
+def test_recovery_is_skipped_when_the_transport_already_answered() -> None:
+    box = outbox.Outbox()
+    box.deliver = lambda job: {'session_id': job.target_session_id,
+                               'reply': 'received normally', 'is_new_session': False}
+    attempts = []
+    box.recover = lambda job: attempts.append(job.delivery_id)
+
+    delivery_id = box.submit(_job(box, 'sid-normal'))
+    _drain(box)
+
+    job = box.find(delivery_id)
+    check('a delivered answer is not second-guessed', not attempts, str(attempts))
+    check('and is not labelled recovered', job.is_reply_recovered is False)
+
+
 def uuid_hex() -> str:
     import uuid
     return uuid.uuid4().hex[:8]
@@ -716,6 +794,9 @@ if __name__ == '__main__':
     test_a_reply_is_delivered_back_and_stops_there()
     test_a_busy_session_is_waited_out_not_refused()
     test_a_message_queued_in_the_wakeup_gap_is_not_lost()
+    test_a_finished_delivery_outlives_the_process_that_carried_it()
+    test_an_answer_is_recovered_from_the_peer_transcript()
+    test_recovery_is_skipped_when_the_transport_already_answered()
 
     print(f'\n{"ALL UNIT CHECKS PASSED" if not FAILURES else str(len(FAILURES)) + " CHECK(S) FAILED"}')
     sys.exit(1 if FAILURES else 0)

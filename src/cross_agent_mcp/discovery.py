@@ -381,6 +381,61 @@ def find_session_by_name(agent: str, name: str, limit: int = 500) -> Optional[Di
     return best
 
 
+# how much of a transcript's tail is read when recovering an answer from it
+TAIL_BYTES = 2_000_000
+
+
+def _tail_lines(path: str) -> List[str]:
+    """The end of a transcript. A rollout runs to thousands of lines; the answer is at the end."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'rb') as f:
+            if size > TAIL_BYTES:
+                f.seek(size - TAIL_BYTES)
+                f.readline()  # the seek lands mid-line; drop the fragment
+            data = f.read()
+    except OSError:
+        return []
+    return data.decode('utf-8', errors='replace').splitlines()
+
+
+def last_agent_message(agent: str, session_id: str) -> Optional[str]:
+    """The final assistant message a session wrote, read straight from its transcript.
+
+    The bridge normally carries an answer back from the process it started. When that process
+    dies first - the editor window reloaded, the machine slept - the answer is not gone, it is
+    just unread: the peer already wrote it to disk. This reads it from there, so an answer is
+    lost only when the peer never produced one.
+    """
+    session = find_session(agent, session_id)
+    if not session:
+        return None
+
+    for line in reversed(_tail_lines(session['path'])):
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+
+        if agent == config.AGENT_CLAUDE:
+            if entry.get('type') != 'assistant':
+                continue
+            text = _extract_text(entry.get('message'))
+        else:
+            payload = entry.get('payload')
+            if not isinstance(payload, dict) or payload.get('role') != 'assistant':
+                continue
+            if payload.get('type') not in ('message', 'agent_message'):
+                continue
+            text = ' '.join(
+                block.get('text', '') for block in (payload.get('content') or [])
+                if isinstance(block, dict))
+
+        if text.strip():
+            return text.strip()
+    return None
+
+
 def find_active_session(agent: str, scope: str, cwd: str,
                         exclude_ids: Optional[List[str]] = None,
                         use_pin: bool = True) -> Optional[Dict[str, Any]]:

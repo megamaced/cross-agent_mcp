@@ -36,6 +36,14 @@ LOCK_DIR: str = HOME_DIR + 'locks/'
 LOG_DIR: str = HOME_DIR + 'logs/'
 LOG_PATH: str = LOG_DIR + 'bridge.log'
 
+# Finished deliveries, kept so an answer outlives the server process that carried it. Only
+# finished ones: a queue on disk would be re-sent after a restart rather than resumed, which
+# asks the peer to do the same work twice.
+DELIVERY_DIR: str = HOME_DIR + 'deliveries/'
+
+# delivery records older than this are pruned when the directory is read
+DELIVERY_TTL_SECONDS: int = get_env_int('CROSS_AGENT_DELIVERY_TTL', 7 * 24 * 3600)
+
 # agent session stores
 CLAUDE_HOME_DIR: str = os.path.expanduser(get_env_str('CLAUDE_CONFIG_DIR', '~/.claude')) + '/'
 CLAUDE_PROJECTS_DIR: str = CLAUDE_HOME_DIR + 'projects/'
@@ -85,5 +93,5 @@ AGENT_CODEX: str = 'codex'
 
 
 def ensure_dirs() -> None:
-    for path in (HOME_DIR, LOCK_DIR, LOG_DIR):
+    for path in (HOME_DIR, LOCK_DIR, LOG_DIR, DELIVERY_DIR):
         os.makedirs(path, exist_ok=True)
