@@ -1,10 +1,15 @@
-"""Relay a message into the peer agent's live session and bring the reply back.
+"""Relay a message into the peer agent's live session.
 
   Claude Code : claude -p --resume <session-id> --output-format json "<message>"
   Codex       : codex exec resume <thread-id> --json "<message>"
 
 Both commands re-enter an existing transcript, so the peer answers with its whole
 conversation context intact instead of starting from a blank agent.
+
+Handing the message over is not the same as waiting for the answer. `send_message` only
+queues the delivery and returns; `outbox` runs it, and the peer's answer comes back as a
+message into the sender's session rather than as this function's return value. Nothing is
+locked open for the length of a peer turn, so a turn may take as long as it needs.
 """
 
 import contextlib
@@ -17,7 +22,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import caller, config, discovery, registry, uihook
+from . import caller, config, discovery, outbox, registry, uihook
 
 
 logger = logging.getLogger('cross_agent_mcp.bridge')
@@ -84,11 +89,45 @@ def _build_envelope(sender: str, target: str, conversation_id: str,
         f'{message}\n'
         '\n'
         '=== HOW TO REPLY ===\n'
-        f'- Your final assistant message is relayed verbatim back to {sender_label}.\n'
+        f'- Your final assistant message is relayed back to {sender_label} as a message in its\n'
+        '  own session. Take the time the task needs; nothing is parked waiting on you.\n'
         '- Answer the peer directly; do not wait for the human and do not ask for confirmation.\n'
         '- Keep the answer self-contained: the peer sees only your final message.\n'
         f'{follow_up}\n'
     )
+
+
+def _build_reply_envelope(sender: str, target: str, conversation_id: str,
+                          hop: int, remaining: int, reply: str) -> str:
+    """Wrap a peer's answer so the original sender reads it as an answer, not a new request."""
+    sender_label = AGENT_LABEL.get(sender, sender)
+    reply_tool = PEER_TOOL.get(target, 'the cross-agent tool')
+
+    if remaining > 0:
+        follow_up = (f'- Only if you have a NEW request, call `{reply_tool}` '
+                     f'({remaining} bridge hop(s) left).')
+    else:
+        follow_up = ('- The hop budget for this conversation is exhausted. Do NOT call any '
+                     'cross-agent tool.')
+
+    return (
+        '=== CROSS-AGENT BRIDGE REPLY ===\n'
+        f'from: {sender_label} (peer AI agent, not the human user)\n'
+        f'conversation: {conversation_id} | answering hop {hop}/{config.MAX_HOPS}\n'
+        '\n'
+        f'{reply}\n'
+        '\n'
+        '=== NOTE ===\n'
+        '- This is the answer to a message you relayed earlier. Nothing is waiting on you.\n'
+        f'{follow_up}\n'
+    )
+
+
+def _summary(text: str) -> str:
+    """A one-line trace of a message, for delivery listings."""
+    first_line = next((line.strip() for line in text.splitlines()
+                       if line.strip() and not line.startswith('===')), '')
+    return ' '.join(first_line.split())[:PANEL_TITLE_LIMIT * 2]
 
 
 def _child_env(conversation_id: str, hop: int, sender: str, busy: List[str]) -> Dict[str, str]:
@@ -409,12 +448,78 @@ def _resolve_target(target_agent: str, session_id: Optional[str], scope: str, cw
     return _new_panel_conversation(target_agent)
 
 
+# --------------------------------------------------------- outbox delivery
+
+def _deliver(job: outbox.Job) -> Dict[str, Any]:
+    """Run one queued delivery. Called on an outbox worker thread, never on the caller's."""
+    result = CALLERS[job.target_agent](job.payload, job.target_session_id, job.run_cwd,
+                                       job.env, job.timeout, job.ui_shim, job.title)
+
+    if result['is_new_session'] and result['session_id']:
+        registry.set_pin(job.target_agent, job.pin_cwd, result['session_id'], job.run_cwd,
+                         is_sticky=False, is_bridge_created=True)
+    elif job.target_session_id:
+        registry.touch_pin(job.target_agent, job.pin_cwd)
+    return result
+
+
+def _build_reply_job(job: outbox.Job, reply: str) -> Optional[outbox.Job]:
+    """Turn the peer's answer into a delivery aimed back at whoever started the exchange.
+
+    The answer does not spend a hop: it closes the hop the request already paid for. Only a
+    genuinely new request costs budget, which keeps MAX_HOPS meaning what it used to mean.
+    """
+    if not job.sender_session_id:
+        logger.info(f'_build_reply_job [skipped]: {job.delivery_id} has no sender session to '
+                    'answer into; the reply is only in the peer transcript')
+        return None
+
+    hop = int(registry.get_conversation(job.conversation_id).get('hops', job.hop))
+    remaining = max(config.MAX_HOPS - hop, 0)
+    payload = _build_reply_envelope(job.target_agent, job.sender_agent, job.conversation_id,
+                                    hop, remaining, reply)
+
+    # resolved fresh: the sender's panel may have opened, closed or moved during the turn
+    panel: Optional[Dict[str, Any]] = None
+    with contextlib.suppress(Exception):
+        panel = _panel_session(job.sender_agent, job.sender_session_id, [])
+
+    answering_id = job.resolved_session_id or job.target_session_id
+    child_busy = [f'{job.target_agent}:{answering_id}'] if answering_id else []
+
+    return outbox.Job(
+        target_agent=job.sender_agent,
+        target_session_id=job.sender_session_id,
+        payload=payload,
+        run_cwd=job.pin_cwd,
+        pin_cwd=job.pin_cwd,
+        env=_child_env(job.conversation_id, hop, job.target_agent, child_busy),
+        timeout=job.timeout,
+        ui_shim=(panel or {}).get('ui_shim'),
+        title=_panel_title(job.target_agent, reply),
+        conversation_id=job.conversation_id,
+        hop=hop,
+        sender_agent=job.target_agent,
+        sender_session_id=answering_id,
+        wants_reply=False,
+        summary=_summary(reply),
+    )
+
+
+outbox.OUTBOX.deliver = _deliver
+outbox.OUTBOX.build_reply = _build_reply_job
+
+
 def send_message(target_agent: str, message: str, session_id: Optional[str] = None,
                  is_new_session: bool = False, scope: Optional[str] = None,
                  cwd: Optional[str] = None, timeout: Optional[int] = None,
                  conversation_id: Optional[str] = None, is_raw: bool = False,
                  allows_same_agent: bool = False) -> Dict[str, Any]:
-    """Relay `message` to the peer agent's active session and return its reply."""
+    """Queue `message` for the peer agent's active session and return once it is accepted.
+
+    The peer's answer is not this function's return value. It arrives later as a message in
+    the caller's own session, delivered by the outbox.
+    """
     started_at = time.time()
     config.ensure_dirs()
 
@@ -433,7 +538,8 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
 
     # The caller's own session is the freshest transcript on its own side, rooted at the
     # directory this server was launched from - not at the `cwd` argument, which may point
-    # anywhere. Never relay into it, or the agent would end up waiting for itself.
+    # anywhere. This is where the peer's answer will be delivered, and it is never a valid
+    # target for the message itself.
     self_session_id: Optional[str] = None
     if sender_agent in CALLERS:
         own = discovery.find_active_session(sender_agent, discovery.SCOPE_CWD, os.getcwd())
@@ -460,80 +566,78 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
     target = _resolve_target(target_agent, session_id, scope, cwd, is_new_session, exclude_ids)
     target_id = target['session_id'] if target else None
 
-    # The claim comes before the hop is charged, so a relay that loses the race for a busy
-    # session does not consume budget. A brand new session has no transcript to protect yet.
-    with contextlib.ExitStack() as stack:
-        if target_id:
-            try:
-                stack.enter_context(registry.busy_lock(target_agent, target_id, conversation_id))
-            except registry.SessionBusyError as e:
-                raise BridgeError(
-                    f'{target_agent} session {target_id} is already waiting on a bridged reply '
-                    f'(conversation {e.holder.get("conversation_id")}). Answer directly instead '
-                    'of relaying back into it.')
+    record = registry.bump_conversation(conversation_id, sender_agent, target_agent)
+    hop = int(record.get('hops', 1))
+    remaining = max(config.MAX_HOPS - hop, 0)
 
-        # Mark our own session busy too. Panel delivery bypasses the child-process env, so this
-        # file lock is what stops the peer from relaying straight back into a session that is
-        # already blocked waiting for it.
-        if self_session_id:
-            with contextlib.suppress(registry.SessionBusyError):
-                stack.enter_context(
-                    registry.busy_lock(sender_agent, self_session_id, conversation_id))
+    payload = message if is_raw else _build_envelope(
+        sender_agent, target_agent, conversation_id, hop, remaining, message)
 
-        record = registry.bump_conversation(conversation_id, sender_agent, target_agent)
-        hop = int(record.get('hops', 1))
-        remaining = max(config.MAX_HOPS - hop, 0)
+    run_cwd = cwd
+    if target and target.get('cwd') and os.path.isdir(target['cwd']):
+        run_cwd = target['cwd']
 
-        payload = message if is_raw else _build_envelope(
-            sender_agent, target_agent, conversation_id, hop, remaining, message)
+    # Only the session actually being written to is off limits. The sender is deliberately
+    # left out: it is not parked waiting any more, so the peer relaying back into it is a
+    # normal message rather than a deadlock.
+    child_busy = list(busy)
+    if target_id:
+        child_busy.append(f'{target_agent}:{target_id}')
 
-        run_cwd = cwd
-        if target and target.get('cwd') and os.path.isdir(target['cwd']):
-            run_cwd = target['cwd']
+    job = outbox.Job(
+        target_agent=target_agent,
+        target_session_id=target_id,
+        payload=payload,
+        run_cwd=run_cwd,
+        pin_cwd=cwd,
+        env=_child_env(conversation_id, hop, sender_agent, child_busy),
+        timeout=timeout,
+        ui_shim=(target or {}).get('ui_shim'),
+        title=_panel_title(sender_agent, message),
+        conversation_id=conversation_id,
+        hop=hop,
+        sender_agent=sender_agent,
+        sender_session_id=self_session_id,
+        wants_reply=True,
+        summary=_summary(message),
+    )
+    delivery_id = outbox.OUTBOX.submit(job)
 
-        child_busy = list(busy)
-        if self_session_id:
-            child_busy.append(f'{sender_agent}:{self_session_id}')
-        if target_id:
-            child_busy.append(f'{target_agent}:{target_id}')
+    logger.info(f'send_message [accepted]: {sender_agent}->{target_agent} '
+                f'session={target_id or "NEW"} conv={conversation_id} hop={hop} '
+                f'delivery={delivery_id}')
 
-        env = _child_env(conversation_id, hop, sender_agent, child_busy)
-
-        logger.info(f'send_message [BEGIN]: {sender_agent}->{target_agent} '
-                    f'session={target_id or "NEW"} conv={conversation_id} hop={hop}')
-
-        ui_shim = (target or {}).get('ui_shim')
-        result = CALLERS[target_agent](payload, target_id, run_cwd, env, timeout, ui_shim,
-                                       _panel_title(sender_agent, message))
-
-    if result['is_new_session'] and result['session_id']:
-        registry.set_pin(target_agent, cwd, result['session_id'], run_cwd,
-                         is_sticky=False, is_bridge_created=True)
-    elif target_id:
-        registry.touch_pin(target_agent, cwd)
-
-    logger.info(f'send_message [END]: {sender_agent}->{target_agent} '
-                f'session={result["session_id"]} chars={len(result["reply"])}')
-
-    warning = None
-    if result['is_new_session']:
-        warning = (f'No existing {target_agent} session was reachable for {run_cwd}, so a NEW '
-                   'conversation was started. It has none of the earlier context. Tell the user '
-                   'this happened before relying on the reply, and pass session_id (an id or the '
-                   'conversation name) or pin_agent_session to target a specific one.')
-        logger.info(f'send_message [new session]: {target_agent} {result["session_id"]}')
+    is_new_target = target_id is None
+    warnings: List[str] = []
+    if is_new_target:
+        warnings.append(
+            f'No existing {target_agent} session was reachable for {run_cwd}, so a NEW '
+            'conversation will be started. It has none of the earlier context. Tell the user '
+            'this happened, and pass session_id (an id or the conversation name) or '
+            'pin_agent_session to target a specific one.')
+    if not self_session_id:
+        warnings.append(
+            'Your own session could not be identified, so the peer\'s answer cannot be '
+            'delivered back here. It will exist only in the peer\'s transcript.')
 
     return {
         'ok': True,
-        'reply': result['reply'],
-        'warning': warning,
+        'accepted': True,
+        'delivery_id': delivery_id,
+        'note': ('Queued, not answered. This result carries no reply: the peer\'s answer '
+                 'arrives later as a separate message in this session. Do not invent, predict '
+                 'or wait for it - finish what you are doing and report that the message was '
+                 'sent. Check bridge_status for delivery state.'),
+        'warning': ' '.join(warnings) or None,
         'target_agent': target_agent,
-        'target_session_id': result['session_id'],
-        'session_origin': 'created' if result['is_new_session'] else (target or {}).get('source', 'unknown'),
-        'was_session_created': result['is_new_session'],
+        'target_session_id': target_id,
+        'session_origin': 'created' if is_new_target else (target or {}).get('source', 'unknown'),
+        'will_create_session': is_new_target,
         'delivery': 'ide-panel' if (target or {}).get('ui_shim') else 'cli-resume',
         'is_visible_in_panel': bool((target or {}).get('ui_shim')),
+        'queue_depth': outbox.OUTBOX.depth(job.key()),
         'sender_agent': sender_agent,
+        'reply_lands_in_session': self_session_id,
         'conversation_id': conversation_id,
         'is_new_conversation': is_new_conversation,
         'hop': hop,
@@ -541,5 +645,4 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         'scope': scope,
         'cwd': run_cwd,
         'elapsed_seconds': round(time.time() - started_at, 1),
-        'cost_usd': result.get('cost_usd'),
     }

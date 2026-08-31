@@ -12,7 +12,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + '/src')
 
-from cross_agent_mcp import bridge, config, discovery, registry  # noqa: E402
+from cross_agent_mcp import bridge, config, discovery, outbox, registry  # noqa: E402
 
 
 FAILURES = []
@@ -347,6 +347,187 @@ def test_panel_session_selection() -> None:
          uihook.read_status, uihook._transcript_mtime) = originals
 
 
+# ------------------------------------------------------ the outbox never blocks
+
+def _job(box: outbox.Outbox, target_session_id, wants_reply=False, summary='msg'):
+    return outbox.Job(
+        target_agent=config.AGENT_CODEX, target_session_id=target_session_id,
+        payload='hello', run_cwd='/tmp', pin_cwd='/tmp', env={}, timeout=5,
+        ui_shim=None, title=None, conversation_id='conv_outbox', hop=1,
+        sender_agent=config.AGENT_CLAUDE, sender_session_id='sender-sid',
+        wants_reply=wants_reply, summary=summary)
+
+
+def _drain(box: outbox.Outbox, deadline_seconds: float = 5.0) -> None:
+    deadline = time.time() + deadline_seconds
+    while time.time() < deadline and box.snapshot()['pending']:
+        time.sleep(0.02)
+
+
+def test_submit_does_not_block_the_caller() -> None:
+    box = outbox.Outbox()
+    released = threading.Event()
+
+    def slow_deliver(job):
+        released.wait(3)
+        return {'session_id': job.target_session_id, 'reply': '', 'is_new_session': False}
+
+    box.deliver = slow_deliver
+
+    started = time.time()
+    delivery_id = box.submit(_job(box, 'sid-slow'))
+    elapsed = time.time() - started
+
+    check('submit returns without waiting for the turn', elapsed < 0.5, f'{elapsed:.2f}s')
+    check('submit hands back a delivery id', delivery_id.startswith('dlv_'), delivery_id)
+    check('the delivery is reported as in flight',
+          any(d['delivery_id'] == delivery_id for d in box.snapshot()['pending']))
+
+    released.set()
+    _drain(box)
+    check('the delivery finishes on its own',
+          box.find(delivery_id).state == outbox.STATE_DELIVERED)
+
+
+def test_same_session_deliveries_are_serialised() -> None:
+    box = outbox.Outbox()
+    concurrent = []
+    live = []
+    guard = threading.Lock()
+
+    def watching_deliver(job):
+        with guard:
+            live.append(job.delivery_id)
+            concurrent.append(len(live))
+        time.sleep(0.05)
+        with guard:
+            live.remove(job.delivery_id)
+        return {'session_id': job.target_session_id, 'reply': '', 'is_new_session': False}
+
+    box.deliver = watching_deliver
+    for _ in range(4):
+        box.submit(_job(box, 'sid-shared'))
+    _drain(box)
+
+    check('two turns never run on the same session at once',
+          concurrent and max(concurrent) == 1, f'peak={max(concurrent) if concurrent else 0}')
+    check('every queued delivery still ran', len(concurrent) == 4, str(len(concurrent)))
+
+
+def test_different_sessions_deliver_in_parallel() -> None:
+    box = outbox.Outbox()
+    entered = threading.Barrier(2, timeout=3)
+    failures = []
+
+    def blocking_deliver(job):
+        try:
+            entered.wait()
+        except threading.BrokenBarrierError:
+            failures.append(job.delivery_id)
+        return {'session_id': job.target_session_id, 'reply': '', 'is_new_session': False}
+
+    box.deliver = blocking_deliver
+    box.submit(_job(box, 'sid-a'))
+    box.submit(_job(box, 'sid-b'))
+    _drain(box)
+
+    check('deliveries to different sessions are not serialised', not failures,
+          f'barrier broke for {failures}')
+
+
+def test_a_reply_is_delivered_back_and_stops_there() -> None:
+    box = outbox.Outbox()
+    delivered = []
+
+    def echo_deliver(job):
+        delivered.append((job.target_session_id, job.wants_reply))
+        return {'session_id': job.target_session_id, 'reply': 'the answer',
+                'is_new_session': False}
+
+    box.deliver = echo_deliver
+    box.build_reply = lambda job, reply: _job(box, job.sender_session_id, wants_reply=False,
+                                              summary=reply)
+
+    box.submit(_job(box, 'sid-peer', wants_reply=True))
+    _drain(box)
+
+    check('the request is delivered to the peer', ('sid-peer', True) in delivered)
+    check('the answer is delivered back to the sender', ('sender-sid', False) in delivered)
+    check('the answer does not trigger another answer', len(delivered) == 2, str(delivered))
+
+
+def test_a_busy_session_is_waited_out_not_refused() -> None:
+    box = outbox.Outbox()
+    session_id = 'sid-busy-' + uuid_hex()
+    attempts = []
+
+    box.deliver = lambda job: (attempts.append(time.time()) or
+                               {'session_id': job.target_session_id, 'reply': '',
+                                'is_new_session': False})
+
+    original_retry = outbox.BUSY_RETRY_SECONDS
+    outbox.BUSY_RETRY_SECONDS = 0.05
+    holder = threading.Event()
+
+    def hold_the_lock():
+        with registry.busy_lock(config.AGENT_CODEX, session_id, 'conv_other'):
+            holder.set()
+            time.sleep(0.3)
+
+    keeper = threading.Thread(target=hold_the_lock, daemon=True)
+    keeper.start()
+    holder.wait(2)
+
+    try:
+        delivery_id = box.submit(_job(box, session_id))
+        _drain(box)
+        job = box.find(delivery_id)
+        check('a session another process holds is waited out, not refused',
+              job.state == outbox.STATE_DELIVERED, f'state={job.state} error={job.error}')
+        check('the delivery ran only after the lock was released', len(attempts) == 1,
+              str(len(attempts)))
+    finally:
+        outbox.BUSY_RETRY_SECONDS = original_retry
+        keeper.join(timeout=2)
+
+
+def test_a_message_queued_in_the_wakeup_gap_is_not_lost() -> None:
+    """The lost-wakeup window: a submit that notifies before the worker starts waiting.
+
+    Reproduced deterministically by submitting from inside the worker's own empty _next, so
+    the notify provably lands while nobody is waiting on the condition. A worker that then
+    waits unconditionally sleeps out the full idle linger on an already-queued message.
+    """
+    box = outbox.Outbox()
+    box.deliver = lambda job: {'session_id': job.target_session_id, 'reply': '',
+                               'is_new_session': False}
+
+    original_next = box._next
+    injected = {'delivery_id': None}
+
+    def next_with_injection(key):
+        job = original_next(key)
+        if job is None and injected['delivery_id'] is None:
+            injected['delivery_id'] = box.submit(_job(box, 'sid-gap'))
+        return job
+
+    box._next = next_with_injection
+    box.submit(_job(box, 'sid-gap'))
+
+    _drain(box, deadline_seconds=3)
+
+    injected_job = box.find(injected['delivery_id']) if injected['delivery_id'] else None
+    check('a message queued in the wakeup gap is picked up, not slept through',
+          injected_job is not None and injected_job.state == outbox.STATE_DELIVERED,
+          f'state={getattr(injected_job, "state", None)} '
+          f'(idle linger is {outbox.IDLE_LINGER_SECONDS}s)')
+
+
+def uuid_hex() -> str:
+    import uuid
+    return uuid.uuid4().hex[:8]
+
+
 if __name__ == '__main__':
     test_busy_lock_is_exclusive()
     test_busy_lock_release_respects_owner()
@@ -358,6 +539,12 @@ if __name__ == '__main__':
     test_subagent_threads_are_rejected()
     test_new_session_is_the_last_resort()
     test_panel_session_selection()
+    test_submit_does_not_block_the_caller()
+    test_same_session_deliveries_are_serialised()
+    test_different_sessions_deliver_in_parallel()
+    test_a_reply_is_delivered_back_and_stops_there()
+    test_a_busy_session_is_waited_out_not_refused()
+    test_a_message_queued_in_the_wakeup_gap_is_not_lost()
 
     print(f'\n{"ALL UNIT CHECKS PASSED" if not FAILURES else str(len(FAILURES)) + " CHECK(S) FAILED"}')
     sys.exit(1 if FAILURES else 0)

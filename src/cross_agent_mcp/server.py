@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from mcp.server import MCPServer
 
-from . import bridge, caller, config, discovery, registry, uihook
+from . import bridge, caller, config, discovery, outbox, registry, uihook
 
 
 logger = logging.getLogger('cross_agent_mcp')
@@ -25,6 +25,10 @@ SERVER_INSTRUCTIONS = (
     '`send_to_codex` resumes the live Codex thread; `send_to_claude` resumes the live '
     'Claude Code session. Both keep the peer\'s existing conversation context. '
     'When no active peer session exists, a fresh one is created automatically. '
+    'Sending is asynchronous: the tool returns as soon as the message is queued and never '
+    'carries the peer\'s answer. The answer arrives later as a separate message in this '
+    'session, so send it, say you sent it, and carry on - never wait for it or guess what it '
+    'will say. `bridge_status` shows deliveries still in flight. '
     'Calls are capped by a hop budget so the two agents cannot ping-pong forever.'
 )
 
@@ -81,11 +85,17 @@ server: MCPServer = MCPServer(
     name='send_to_codex',
     title='Send a message to the live Codex thread',
     description=(
-        'Relay a message to the Codex session the user is currently working in and return '
-        'its reply. The Codex thread keeps its full conversation context. '
-        'If no active Codex thread exists for this working directory, a new one is created '
-        'and reused for later calls. Use this to ask Codex for a review, a second opinion, '
-        'or a verification pass. Blocking: it waits for the Codex turn to finish.'
+        'Send a message to the Codex session the user is currently working in. The Codex '
+        'thread keeps its full conversation context. If no active Codex thread exists for '
+        'this working directory, a new one is created and reused for later calls. Use this '
+        'to ask Codex for a review, a second opinion, a verification pass, or to hand it a '
+        'long task. '
+        'ASYNCHRONOUS: this returns as soon as the message is queued and NEVER contains '
+        'Codex\'s answer. Codex answers on its own schedule - minutes is normal - and its '
+        'answer is delivered to you as a separate message in this session. So: send, tell '
+        'the user it was sent, and continue. Do not wait for the answer, do not poll for it, '
+        'and never write what you think Codex will say. Use bridge_status to see whether the '
+        'delivery is still in flight.'
     ),
 )
 async def send_to_codex(
@@ -106,7 +116,8 @@ async def send_to_codex(
     scope: 'cwd' (default) = same directory or below, 'tree' = also parent directories,
         'any' = every recorded thread.
     cwd: Working directory used for discovery and for a newly created thread.
-    timeout: Seconds to wait for the Codex turn.
+    timeout: Budget for the Codex turn itself, applied by the background worker. It does not
+        make this call wait, and it does not need to be small.
     conversation_id: Continue an existing bridge conversation (shares the hop budget).
     raw: Send the message verbatim, without the bridge envelope.
     """
@@ -121,11 +132,16 @@ async def send_to_codex(
     name='send_to_claude',
     title='Send a message to the live Claude Code session',
     description=(
-        'Relay a message to the Claude Code session the user is currently working in and '
-        'return its reply. The Claude session keeps its full conversation context. '
-        'If no active Claude session exists for this working directory, a new one is created '
-        'and reused for later calls. Use this to ask Claude to implement, refactor or explain '
-        'something. Blocking: it waits for the Claude turn to finish.'
+        'Send a message to the Claude Code session the user is currently working in. The '
+        'Claude session keeps its full conversation context. If no active Claude session '
+        'exists for this working directory, a new one is created and reused for later calls. '
+        'Use this to ask Claude to implement, refactor or explain something. '
+        'ASYNCHRONOUS: this returns as soon as the message is queued and NEVER contains '
+        'Claude\'s answer. Claude answers on its own schedule - minutes is normal - and its '
+        'answer is delivered to you as a separate message in this session. So: send, tell '
+        'the user it was sent, and continue. Do not wait for the answer, do not poll for it, '
+        'and never write what you think Claude will say. Use bridge_status to see whether the '
+        'delivery is still in flight.'
     ),
 )
 async def send_to_claude(
@@ -147,7 +163,8 @@ async def send_to_claude(
     scope: 'cwd' (default) = same directory or below, 'tree' = also parent directories,
         'any' = every recorded session.
     cwd: Working directory used for discovery and for a newly created session.
-    timeout: Seconds to wait for the Claude turn.
+    timeout: Budget for the Claude turn itself, applied by the background worker. It does not
+        make this call wait, and it does not need to be small.
     conversation_id: Continue an existing bridge conversation (shares the hop budget).
     raw: Send the message verbatim, without the bridge envelope.
     allow_same_agent: Allow a Claude session to message another Claude session.
@@ -205,8 +222,9 @@ async def list_agent_sessions(
     title='Inspect bridge state',
     description=(
         'Report which agent this MCP server is running under, the resolved peer sessions, '
-        'the active hop budget, and any session currently waiting on a bridged reply. '
-        'Use it to diagnose why a relay was refused.'
+        'the active hop budget, the messages this server still has in flight, and any '
+        'session currently held by a delivery. Use it to diagnose why a relay was refused, '
+        'or to see whether a message you sent has been delivered yet.'
     ),
 )
 async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None) -> Dict[str, Any]:
@@ -271,6 +289,13 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None) 
             'hop': os.environ.get(config.ENV_HOP),
             'sender': os.environ.get(config.ENV_SENDER),
             'busy': os.environ.get(config.ENV_BUSY),
+        },
+        'deliveries': {
+            'note': ('Messages this server is carrying. `pending` is still in flight - the '
+                     'peer has not finished answering. A delivery with is_reply=true is a '
+                     'peer answer on its way back into a session. Only this server process '
+                     'is listed; the peer runs its own.'),
+            **await _run_blocking(outbox.OUTBOX.snapshot),
         },
         'busy_locks': await _run_blocking(registry.list_busy_locks),
         'pins': registry.load_registry().get('pins', {}),
