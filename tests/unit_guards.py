@@ -976,7 +976,7 @@ def uuid_hex() -> str:
     return uuid.uuid4().hex[:8]
 
 
-if __name__ == '__main__':
+def run_all() -> None:
     test_busy_lock_is_exclusive()
     test_busy_lock_release_respects_owner()
     test_prune_spares_sticky_pins()
@@ -1008,6 +1008,16 @@ if __name__ == '__main__':
     test_a_named_session_is_never_silently_created()
     test_naming_a_session_and_forcing_a_new_one_is_refused()
     test_a_delivery_does_not_outlive_the_server_that_started_it()
+
+if __name__ == '__main__':
+    # Delivery records are written by any finished job, so a test run left rows like
+    # "sid-normal" in the real ~/.cross-agent/deliveries/ and they sat there among genuine
+    # ones - which cost real time when a lost reply had to be found among them. Redirect the
+    # whole run rather than each test: the next test to submit a job is covered without
+    # anyone remembering to.
+    with tempfile.TemporaryDirectory(prefix='cross-agent-test-deliveries-') as store:
+        outbox.config.DELIVERY_DIR = store + '/'
+        run_all()
 
     print(f'\n{"ALL UNIT CHECKS PASSED" if not FAILURES else str(len(FAILURES)) + " CHECK(S) FAILED"}')
     sys.exit(1 if FAILURES else 0)
