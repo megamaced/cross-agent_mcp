@@ -875,6 +875,67 @@ def test_an_answer_is_recovered_from_the_peer_transcript() -> None:
             outbox.config.DELIVERY_DIR = original_dir
 
 
+def test_a_panel_delivery_keeps_watching_after_the_transport_gives_up() -> None:
+    """Giving up listening is not the peer giving up working.
+
+    On the panel path the peer is a session we neither started nor stopped, so the socket
+    timing out says nothing about its turn — thirteen deliveries were closed as failed today
+    while their answers were being written.
+    """
+    original = (outbox.RECOVERY_POLL_SECONDS, outbox.RECOVERY_WINDOW_SECONDS)
+    outbox.RECOVERY_POLL_SECONDS, outbox.RECOVERY_WINDOW_SECONDS = 0.02, 2
+    try:
+        box = outbox.Outbox()
+        box.deliver = lambda job: (_ for _ in ()).throw(
+            RuntimeError('IDE panel relay failed: turn did not complete within 600s'))
+
+        looks = {'count': 0}
+
+        def answer_on_the_third_look(job):
+            looks['count'] += 1
+            return '늦게 도착한 답' if looks['count'] >= 3 else None
+
+        box.recover = answer_on_the_third_look
+
+        job = _job(box, 'sid-panel')
+        job.ui_shim = {'socket': '/panel'}  # 패널 경로 — 상대는 우리가 죽일 수 없다
+        delivery_id = box.submit(job)
+        _drain(box)
+
+        finished = box.find(delivery_id)
+        check('an answer written after the transport failed is still collected',
+              finished.reply == '늦게 도착한 답', f'{finished.state} {finished.reply!r}')
+        check('and it is marked as recovered', finished.is_reply_recovered is True)
+        check('the transport failure is still recorded', finished.error is not None)
+    finally:
+        outbox.RECOVERY_POLL_SECONDS, outbox.RECOVERY_WINDOW_SECONDS = original
+
+
+def test_a_cli_delivery_does_not_wait_for_a_turn_that_was_killed() -> None:
+    """The CLI turn was our own subprocess and the timeout killed its process group, so
+    nothing more will be written and waiting would only stall the queue behind it."""
+    original = (outbox.RECOVERY_POLL_SECONDS, outbox.RECOVERY_WINDOW_SECONDS)
+    outbox.RECOVERY_POLL_SECONDS, outbox.RECOVERY_WINDOW_SECONDS = 0.02, 5
+    try:
+        box = outbox.Outbox()
+        box.deliver = lambda job: (_ for _ in ()).throw(
+            RuntimeError('peer agent did not answer within 600s'))
+        looks = {'count': 0}
+        box.recover = lambda job: (looks.update(count=looks['count'] + 1) or None)
+
+        started = time.time()
+        delivery_id = box.submit(_job(box, 'sid-cli'))  # ui_shim 없음 = CLI 경로
+        _drain(box)
+        elapsed = time.time() - started
+
+        check('a killed turn is not waited on', looks['count'] == 1, str(looks))
+        check('so the queue is not held open', elapsed < 1.0, f'{elapsed:.2f}s')
+        check('and the delivery closes as failed',
+              box.find(delivery_id).state == outbox.STATE_FAILED)
+    finally:
+        outbox.RECOVERY_POLL_SECONDS, outbox.RECOVERY_WINDOW_SECONDS = original
+
+
 def test_recovery_is_skipped_when_the_transport_already_answered() -> None:
     box = outbox.Outbox()
     box.deliver = lambda job: {'session_id': job.target_session_id,
@@ -1083,6 +1144,8 @@ def run_all() -> None:
     test_a_message_queued_in_the_wakeup_gap_is_not_lost()
     test_a_finished_delivery_outlives_the_process_that_carried_it()
     test_an_answer_is_recovered_from_the_peer_transcript()
+    test_a_panel_delivery_keeps_watching_after_the_transport_gives_up()
+    test_a_cli_delivery_does_not_wait_for_a_turn_that_was_killed()
     test_recovery_is_skipped_when_the_transport_already_answered()
     test_a_conversations_own_name_is_what_it_is_called_by()
     test_a_session_name_matches_exactly_or_not_at_all()

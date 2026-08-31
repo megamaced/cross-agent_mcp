@@ -47,8 +47,17 @@ REPLY_PREVIEW_LIMIT = 2000
 
 STATE_QUEUED = 'queued'
 STATE_DELIVERING = 'delivering'
+STATE_AWAITING = 'awaiting-peer'
 STATE_DELIVERED = 'delivered'
 STATE_FAILED = 'failed'
+
+# How long to keep looking for an answer after the transport gave up, and how often to look.
+#
+# Giving up listening is not the same as the peer giving up working. On the panel path the
+# peer is a session we neither own nor can stop: the socket wait ended, the turn did not.
+# Thirteen deliveries were closed as failed today while their answers were being written.
+RECOVERY_WINDOW_SECONDS = 900
+RECOVERY_POLL_SECONDS = 15
 
 
 def _write_record(record: Dict[str, Any]) -> None:
@@ -269,7 +278,7 @@ class Outbox:
         # after the turn, a process that died holding the result. The answer is on disk in the
         # peer's own transcript either way, so ask there before giving up on it.
         if not job.reply:
-            recovered = self._recover(job)
+            recovered = self._recover_with_patience(job)
             if recovered:
                 job.reply = recovered
                 job.reply_length = len(recovered)
@@ -310,6 +319,34 @@ class Outbox:
                     raise
                 logger.debug(f'_deliver_with_lock [busy]: {job.target_session_id}, retrying')
                 time.sleep(BUSY_RETRY_SECONDS)
+
+    def _recover_with_patience(self, job: Job) -> Optional[str]:
+        """Look once, then keep looking while the peer could still be writing.
+
+        Only the panel path waits. There the peer is a session we neither started nor stopped,
+        so our socket giving up says nothing about its turn. On the CLI path the turn *was*
+        our subprocess and a timeout killed its process group, so nothing further will be
+        written and waiting would only stall the queue behind it.
+        """
+        text = self._recover(job)
+        if text or job.ui_shim is None:
+            return text
+
+        job.state = STATE_AWAITING
+        logger.info(f'_recover_with_patience [waiting]: {job.delivery_id} the transport gave '
+                    f'up but {job.target_agent} may still be working; watching its transcript')
+
+        deadline = time.time() + RECOVERY_WINDOW_SECONDS
+        while time.time() < deadline:
+            time.sleep(RECOVERY_POLL_SECONDS)
+            text = self._recover(job)
+            if text:
+                logger.info(f'_recover_with_patience [answered]: {job.delivery_id} after '
+                            f'{round(time.time() - (job.started_at or time.time()))}s')
+                return text
+        logger.info(f'_recover_with_patience [gave up]: {job.delivery_id} no answer within '
+                    f'{RECOVERY_WINDOW_SECONDS}s of the transport failing')
+        return None
 
     def _recover(self, job: Job) -> Optional[str]:
         if self.recover is None:
