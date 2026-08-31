@@ -12,12 +12,14 @@ message into the sender's session rather than as this function's return value. N
 locked open for the length of a peer turn, so a turn may take as long as it needs.
 """
 
+import atexit
 import contextlib
 import json
 import logging
 import os
 import signal
 import subprocess
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -185,6 +187,65 @@ def _terminate_group(process: subprocess.Popen) -> None:
             os.killpg(group_id, signal.SIGKILL)
 
 
+# Deliveries this process started and has not finished. A CLI runs in its own process group
+# so a timeout can take down the whole tool tree with it - which also means it survives us.
+_LIVE_CHILDREN: List[subprocess.Popen] = []
+_CHILDREN_GUARD = threading.Lock()
+
+
+def _track_child(process: subprocess.Popen) -> None:
+    with _CHILDREN_GUARD:
+        _LIVE_CHILDREN.append(process)
+
+
+def _untrack_child(process: subprocess.Popen) -> None:
+    with _CHILDREN_GUARD:
+        with contextlib.suppress(ValueError):
+            _LIVE_CHILDREN.remove(process)
+
+
+def terminate_live_children() -> None:
+    """Take our deliveries down with us.
+
+    An orphaned delivery is not merely wasted work: it keeps writing to the peer's session
+    and its repository with nobody watching, and the busy lock stops protecting that session
+    the moment this process dies, because staleness is judged by our pid. A re-request then
+    starts a second agent on the same files. That happened - two `claude -p` resumes ran
+    concurrently on one session after the window that started the first was reloaded.
+    """
+    with _CHILDREN_GUARD:
+        children = list(_LIVE_CHILDREN)
+        _LIVE_CHILDREN.clear()
+
+    for process in children:
+        if process.poll() is not None:
+            continue
+        logger.info(f'terminate_live_children [killing]: pid={process.pid}')
+        with contextlib.suppress(Exception):
+            _terminate_group(process)
+
+
+def install_shutdown_guard() -> None:
+    """Arrange for in-flight deliveries to die with this server, however it exits."""
+    atexit.register(terminate_live_children)
+
+    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            previous = signal.getsignal(number)
+        except (OSError, ValueError):
+            continue
+
+        def handler(signum, frame, _previous=previous):
+            terminate_live_children()
+            if callable(_previous):
+                _previous(signum, frame)
+            else:
+                raise SystemExit(128 + signum)
+
+        with contextlib.suppress(OSError, ValueError):
+            signal.signal(number, handler)
+
+
 def _run_cli(command: List[str], cwd: str, env: Dict[str, str], timeout: int) -> subprocess.CompletedProcess:
     logger.debug(f'_run_cli [BEGIN]: cwd={cwd} cmd={command[:4]}')
     try:
@@ -197,6 +258,7 @@ def _run_cli(command: List[str], cwd: str, env: Dict[str, str], timeout: int) ->
     except FileNotFoundError:
         raise BridgeError(f'CLI not found: {command[0]}')
 
+    _track_child(process)
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -206,6 +268,7 @@ def _run_cli(command: List[str], cwd: str, env: Dict[str, str], timeout: int) ->
             process.communicate(timeout=KILL_GRACE_SECONDS)
         raise BridgeError(f'peer agent did not answer within {timeout}s')
     finally:
+        _untrack_child(process)
         logger.debug('_run_cli [END]')
 
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
@@ -417,10 +480,14 @@ def _requested_session_id(target_agent: str, session_id: Optional[str],
             logger.info(f'_requested_session_id [resolved by name]: '
                         f'{session_id!r} -> {named["session_id"]}')
             return named['session_id'], session_id
+        near = discovery.suggest_session_names(target_agent, session_id)
+        hint = (f' Titles containing it: {", ".join(repr(t) for t in near)}. Names match '
+                'exactly, so pass one of these in full or use the session id.'
+                if near else '')
         raise BridgeError(
-            f'no {target_agent} session matches {session_id!r}, by id or by name. '
-            'Use list_agent_sessions to see what exists; nothing was sent and no session '
-            'was created.')
+            f'no {target_agent} session is named {session_id!r}, and no session has that id. '
+            f'Nothing was sent and no session was created.{hint} '
+            'Use list_agent_sessions to see what exists.')
 
     pin = registry.get_pin(target_agent, cwd)
     if pin and pin.get('is_sticky'):
@@ -605,6 +672,14 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
     sender_agent = identity['agent']
 
     self_session_id = _own_session_id(sender_agent)
+
+    # Naming a session and asking for a brand new one are opposite intentions. Honouring both
+    # would open a fresh conversation while the caller believes it reached the one it named.
+    if session_id and is_new_session:
+        raise BridgeError(
+            'session_id and new_session cannot be combined: one targets an existing '
+            f'conversation, the other opens a new one. Nothing was sent. Drop new_session to '
+            f'reach {session_id!r}, or drop session_id to start a new conversation.')
 
     if sender_agent == target_agent and not allows_same_agent and not session_id:
         raise BridgeError(

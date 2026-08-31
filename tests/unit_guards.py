@@ -273,7 +273,8 @@ def test_new_session_is_the_last_resort() -> None:
         except bridge.BridgeError as e:
             raised = str(e)
         check('an unmatched session name fails loudly',
-              'no codex session matches' in raised and 'was created' in raised, raised[:160])
+              'no codex session is named' in raised and 'no session was created' in raised,
+              raised[:160])
 
         # a name that does match is resolved to its id
         discovery.find_session_by_name = lambda agent, name, limit=500: {
@@ -767,6 +768,107 @@ def test_recovery_is_skipped_when_the_transport_already_answered() -> None:
     check('and is not labelled recovered', job.is_reply_recovered is False)
 
 
+def test_a_session_name_matches_exactly_or_not_at_all() -> None:
+    """The incident: 'koppa_studio' matched a path quoted inside an old session's first message.
+
+    A Claude session has no name of its own - its title is whatever the human typed first - so
+    substring matching turned any quoted path into a name and resumed a months-old session
+    headlessly, where nobody was watching it work.
+    """
+    sessions = [
+        {'session_id': 'old-one', 'title': 'K-Oppa Studio 4를 구현하라. 쓰기는 '
+                                            '/Users/x/source_code/koppa_studio 아래', 'mtime': 200.0},
+        {'session_id': 'audit', 'title': 'Codex 감사 — koppa_studio_v4 결함', 'mtime': 100.0},
+        {'session_id': 'named', 'title': 'Studio primer', 'mtime': 50.0},
+    ]
+    original = discovery.list_sessions
+    discovery.list_sessions = lambda agent, scope, cwd, limit=500, **kw: list(sessions)
+
+    try:
+        check('a name that only appears inside a title does not match',
+              discovery.find_session_by_name('claude', 'koppa_studio') is None)
+        check('an exact title still matches',
+              (discovery.find_session_by_name('claude', 'Studio primer') or {})
+              .get('session_id') == 'named')
+        check('matching ignores case and spacing',
+              (discovery.find_session_by_name('claude', '  studio   PRIMER ') or {})
+              .get('session_id') == 'named')
+
+        near = discovery.suggest_session_names('claude', 'koppa_studio')
+        check('the near misses are offered as suggestions instead', len(near) == 2, str(near))
+    finally:
+        discovery.list_sessions = original
+
+
+def test_a_named_session_is_never_silently_created() -> None:
+    originals = (discovery.find_session, discovery.find_session_by_name,
+                 discovery.suggest_session_names)
+    discovery.find_session = lambda agent, session_id: None
+    discovery.find_session_by_name = lambda agent, name: None
+    discovery.suggest_session_names = lambda agent, name, **kw: ['Some other title']
+
+    try:
+        bridge._requested_session_id('codex', 'no-such-name', '/w')
+        check('an unknown session name fails instead of opening a new conversation', False,
+              'no error raised')
+    except bridge.BridgeError as e:
+        message = str(e)
+        check('an unknown session name fails instead of opening a new conversation',
+              'no session was created' in message, message)
+        check('and the error offers the titles it did see',
+              'Some other title' in message, message)
+    finally:
+        (discovery.find_session, discovery.find_session_by_name,
+         discovery.suggest_session_names) = originals
+
+
+def test_naming_a_session_and_forcing_a_new_one_is_refused() -> None:
+    try:
+        bridge.send_message('codex', 'hello', session_id='some-name', is_new_session=True)
+        check('session_id and new_session cannot be combined', False, 'no error raised')
+    except bridge.BridgeError as e:
+        check('session_id and new_session cannot be combined',
+              'cannot be combined' in str(e) and 'Nothing was sent' in str(e), str(e))
+
+
+def test_a_delivery_does_not_outlive_the_server_that_started_it() -> None:
+    """An orphaned delivery keeps working unwatched, and frees the lock guarding its session."""
+    with tempfile.TemporaryDirectory(prefix='orphan-') as work_dir:
+        marker = work_dir + '/child.pid'
+        command = ['/bin/bash', '-c', f'sleep 45 & echo $! > {marker}; wait']
+        started = threading.Event()
+
+        def deliver():
+            started.set()
+            with contextlib_suppress():
+                bridge._run_cli(command, work_dir, dict(os.environ), timeout=40)
+
+        worker = threading.Thread(target=deliver, daemon=True)
+        worker.start()
+        started.wait(5)
+
+        deadline = time.time() + 5
+        while not os.path.exists(marker) and time.time() < deadline:
+            time.sleep(0.05)
+        grandchild = int(open(marker).read().strip())
+        check('the delivery is running before we shut down',
+              registry._is_pid_alive(grandchild))
+
+        bridge.terminate_live_children()
+
+        deadline = time.time() + 10
+        while registry._is_pid_alive(grandchild) and time.time() < deadline:
+            time.sleep(0.1)
+        check('shutting the server down takes its deliveries with it',
+              not registry._is_pid_alive(grandchild), f'pid {grandchild} still alive')
+        worker.join(timeout=5)
+
+
+def contextlib_suppress():
+    import contextlib
+    return contextlib.suppress(Exception)
+
+
 def uuid_hex() -> str:
     import uuid
     return uuid.uuid4().hex[:8]
@@ -797,6 +899,10 @@ if __name__ == '__main__':
     test_a_finished_delivery_outlives_the_process_that_carried_it()
     test_an_answer_is_recovered_from_the_peer_transcript()
     test_recovery_is_skipped_when_the_transport_already_answered()
+    test_a_session_name_matches_exactly_or_not_at_all()
+    test_a_named_session_is_never_silently_created()
+    test_naming_a_session_and_forcing_a_new_one_is_refused()
+    test_a_delivery_does_not_outlive_the_server_that_started_it()
 
     print(f'\n{"ALL UNIT CHECKS PASSED" if not FAILURES else str(len(FAILURES)) + " CHECK(S) FAILED"}')
     sys.exit(1 if FAILURES else 0)

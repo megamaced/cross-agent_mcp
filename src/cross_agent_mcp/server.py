@@ -398,6 +398,8 @@ def main() -> None:
               'Run with --check to inspect the bridge state instead. Waiting on stdin, Ctrl-C to quit.',
               file=sys.stderr)
 
+    bridge.install_shutdown_guard()
+
     logger.info(f'main [BEGIN]: cross-agent MCP server, cwd={os.getcwd()}')
     try:
         server.run('stdio')

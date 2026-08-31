@@ -352,33 +352,52 @@ def find_session(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
 def find_session_by_name(agent: str, name: str, limit: int = 500) -> Optional[Dict[str, Any]]:
     """Look one session up by the title the user sees, not by its uuid.
 
-    People refer to a conversation by its name; only the agents keep the ids. An exact
-    (case-insensitive) title wins over a substring one, and the freshest match wins overall.
+    The match is exact (case- and whitespace-insensitive) and nothing else. Substring matching
+    used to be allowed and it picked the wrong conversation: a Claude session has no name of
+    its own - its title is the first thing the human typed - so a path quoted in that first
+    message made "koppa_studio" match a months-old session and resume it headlessly.
+
+    A name the caller half-remembers must fail loudly. Guessing is how a message ends up in a
+    conversation nobody is watching.
     """
     wanted = ' '.join(name.split()).casefold()
     if not wanted:
         return None
 
-    exact: List[Dict[str, Any]] = []
-    partial: List[Dict[str, Any]] = []
-
-    for candidate in list_sessions(agent, SCOPE_ANY, os.getcwd(), limit=limit):
-        title = ' '.join(str(candidate.get('title') or '').split()).casefold()
-        if not title:
-            continue
-        if title == wanted:
-            exact.append(candidate)
-        elif wanted in title:
-            partial.append(candidate)
-
-    matches = exact or partial
+    matches = [
+        candidate for candidate in list_sessions(agent, SCOPE_ANY, os.getcwd(), limit=limit)
+        if ' '.join(str(candidate.get('title') or '').split()).casefold() == wanted
+    ]
     if not matches:
         return None
 
     best = max(matches, key=lambda s: s['mtime'])
     best['source'] = 'name'
     best['matched_name'] = name
+    if len(matches) > 1:
+        logger.info(f'find_session_by_name [ambiguous]: {len(matches)} sessions are titled '
+                    f'{name!r}; took the freshest ({best["session_id"]})')
     return best
+
+
+def suggest_session_names(agent: str, name: str, limit: int = 500,
+                          suggestions: int = 5) -> List[str]:
+    """Titles that merely contain what was asked for - shown when nothing matched exactly.
+
+    These are suggestions for a human to read, never something to deliver into.
+    """
+    wanted = ' '.join(name.split()).casefold()
+    if not wanted:
+        return []
+
+    seen: List[str] = []
+    for candidate in list_sessions(agent, SCOPE_ANY, os.getcwd(), limit=limit):
+        title = str(candidate.get('title') or '').strip()
+        if title and wanted in ' '.join(title.split()).casefold():
+            seen.append(_shorten(title))
+        if len(seen) >= suggestions:
+            break
+    return seen
 
 
 # how much of a transcript's tail is read when recovering an answer from it
