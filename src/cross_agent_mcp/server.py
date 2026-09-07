@@ -226,14 +226,24 @@ async def list_agent_sessions(
         'Report which agent this MCP server is running under, the resolved peer sessions, '
         'the active hop budget, the messages this server still has in flight, and any '
         'session currently held by a delivery. Use it to diagnose why a relay was refused, '
-        'or to see whether a message you sent has been delivered yet.'
+        'or to see whether a message you sent has been delivered yet. '
+        'With delivery_id it reports that one delivery instead, together with a fresh read '
+        'of the peer\'s transcript: the answer of the last turn the peer finished after the '
+        'request, or that it is still working. Use it when a reply was recovered as a '
+        'fragment, or a DELIVERY FAILED notice said the peer may still be working.'
     ),
 )
-async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None) -> Dict[str, Any]:
+async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
+                        delivery_id: Optional[str] = None) -> Dict[str, Any]:
     """Args:
     cwd: Working directory to resolve sessions against.
     scope: 'cwd' (default), 'tree' or 'any'.
+    delivery_id: Report one delivery (from send_to_* or a bridge notice) and what its target
+        has written since, instead of the overall bridge state.
     """
+    if delivery_id:
+        return await _run_blocking(bridge.delivery_report, delivery_id)
+
     scope = scope or config.DEFAULT_SCOPE
     target_cwd = os.path.realpath(os.path.expanduser(cwd)) if cwd else os.getcwd()
 
@@ -289,6 +299,7 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None) 
             'active_window_minutes': config.ACTIVE_WINDOW_MINUTES,
             'max_hops': config.MAX_HOPS,
             'timeout_seconds': config.SEND_TIMEOUT_SECONDS,
+            'panel_patience_seconds': config.PANEL_PATIENCE_SECONDS,
             'codex_sandbox_for_new_sessions': config.CODEX_SANDBOX,
             'claude_permission_mode': config.CLAUDE_PERMISSION_MODE,
             'claude_bin': config.CLAUDE_BIN,
@@ -302,10 +313,16 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None) 
             'busy': os.environ.get(config.ENV_BUSY),
         },
         'deliveries': {
-            'note': ('Messages this server is carrying. `pending` is still in flight - the '
-                     'peer has not finished answering. A delivery with is_reply=true is a '
-                     'peer answer on its way back into a session. Only this server process '
-                     'is listed; the peer runs its own.'),
+            'note': ('Messages this server is carrying. `pending` is still in flight: '
+                     'state=delivering means the hand-over has not been acknowledged yet, '
+                     'awaiting-peer means the peer has the message (accepted_at) and its turn '
+                     'is running - or, with an error set, that the transport broke and the '
+                     'peer transcript is being watched for the answer. kind=reply is a peer '
+                     'answer on its way back into a session and counts as delivered the '
+                     'moment it lands; kind=failure-notice tells a sender its request produced '
+                     'nothing. is_undelivered=true means the peer never received the message. '
+                     'Pass delivery_id to see one delivery with the peer\'s current progress. '
+                     'Only this server process is listed; the peer runs its own.'),
             **await _run_blocking(outbox.OUTBOX.snapshot),
         },
         'busy_locks': await _run_blocking(registry.list_busy_locks),

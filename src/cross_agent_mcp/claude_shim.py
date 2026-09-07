@@ -28,7 +28,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from . import config
-from .panel import PanelShim, split_wrapper_argv
+from .panel import PanelShim, Turn, split_wrapper_argv
 
 
 # how long an injection waits for a user-initiated turn to finish before giving up
@@ -67,16 +67,6 @@ def session_id_from_args(args: List[str]) -> Optional[str]:
     return None
 
 
-class Injection:
-    """One bridged message waiting for the CLI to finish its turn."""
-
-    def __init__(self) -> None:
-        self.messages: List[str] = []
-        self.result: Optional[str] = None
-        self.error: Optional[str] = None
-        self.done = threading.Event()
-
-
 class ClaudeStreamShim(PanelShim):
 
     agent = config.AGENT_CLAUDE
@@ -87,7 +77,8 @@ class ClaudeStreamShim(PanelShim):
         self.session_id: Optional[str] = session_id_from_args(args)
         self.cwd: str = os.getcwd()
         self.is_turn_active = False
-        self.injection: Optional[Injection] = None
+        # the bridged turn the CLI is running right now; cleared by the CLI's own `result`
+        self.injection: Optional[Turn] = None
         self.last_seen = time.time()
         # only the human typing in the panel updates this; injected turns must not, or the
         # bridge would keep reinforcing whichever tab it last wrote to
@@ -123,11 +114,15 @@ class ClaudeStreamShim(PanelShim):
         elif kind == 'result':
             with self.state_lock:
                 self.is_turn_active = False
+                # the turn is over, so the slot is free whether or not anyone is listening
+                if injection is self.injection:
+                    self.injection = None
             if injection and not injection.done.is_set():
-                if message.get('is_error'):
-                    injection.error = str(message.get('result') or 'claude reported an error')[:500]
+                injection.session_id = self.session_id
                 injection.result = str(message.get('result') or '')
-                injection.done.set()
+                error = (str(message.get('result') or 'claude reported an error')[:500]
+                         if message.get('is_error') else None)
+                injection.finish(error)
 
     # --------------------------------------------------------------- plumbing
 
@@ -181,12 +176,16 @@ class ClaudeStreamShim(PanelShim):
             time.sleep(IDLE_POLL_SECONDS)
         return False
 
+    def reply_of(self, turn: Turn) -> str:
+        return turn.result or (turn.messages[-1] if turn.messages else '')
+
     def inject(self, text: str, session_id: Optional[str], timeout: int,
-               cwd: Optional[str] = None, title: Optional[str] = None) -> Dict[str, Any]:
+               cwd: Optional[str] = None, title: Optional[str] = None,
+               accept_timeout: Optional[int] = None) -> Dict[str, Any]:
         with self.state_lock:
             current = self.session_id
         if session_id and session_id != current:
-            return {'ok': False,
+            return {'ok': False, 'accepted': False,
                     'error': f'this panel drives session {current}, not {session_id}'}
 
         # A panel sitting on its conversation list has a process but no conversation yet.
@@ -194,14 +193,17 @@ class ClaudeStreamShim(PanelShim):
         is_created = current is None
 
         # the CLI serialises turns; injecting mid-turn would make us collect the wrong reply
-        if not self._wait_for_idle(time.time() + min(IDLE_WAIT_SECONDS, timeout)):
-            return {'ok': False, 'error': 'the panel session is busy with another turn'}
+        idle_wait = min(IDLE_WAIT_SECONDS, accept_timeout if accept_timeout is not None else timeout)
+        if not self._wait_for_idle(time.time() + idle_wait):
+            return {'ok': False, 'accepted': False,
+                    'error': 'the panel session is busy with another turn'}
 
-        injection = Injection()
+        turn = Turn(current, is_created)
         with self.state_lock:
             if self.injection is not None:
-                return {'ok': False, 'error': 'another bridged message is already in flight'}
-            self.injection = injection
+                return {'ok': False, 'accepted': False,
+                        'error': 'another bridged message is already in flight'}
+            self.injection = turn
             self.is_turn_active = True
 
         payload = json.dumps({
@@ -215,24 +217,21 @@ class ClaudeStreamShim(PanelShim):
             with self.state_lock:
                 self.injection = None
                 self.is_turn_active = False
-            return {'ok': False, 'error': f'failed to write to the claude process: {e}'}
+            return {'ok': False, 'accepted': False,
+                    'error': f'failed to write to the claude process: {e}'}
 
-        is_finished = injection.done.wait(timeout=timeout)
+        # The CLI reads its stdin as a queue of user turns and never acknowledges one; the
+        # write going through is the moment the message is in the peer's hands.
+        turn.accept()
+
+        # With an acceptance deadline the caller wants the receipt now and the answer later;
+        # without one it is an older caller, waiting for the whole turn as before.
+        if accept_timeout is None:
+            turn.wait(timeout)
         with self.state_lock:
-            self.injection = None
-            session = self.session_id
-
-        if injection.error:
-            return {'ok': False, 'error': injection.error,
-                    'sessionId': session, 'wasCreated': is_created}
-        if not is_finished:
-            return {'ok': False, 'error': f'turn did not complete within {timeout}s',
-                    'sessionId': session, 'wasCreated': is_created,
-                    'partial': '\n'.join(injection.messages)}
-
-        reply = injection.result or (injection.messages[-1] if injection.messages else '')
-        return {'ok': True, 'sessionId': session, 'threadId': session,
-                'wasCreated': is_created, 'reply': reply}
+            if turn.session_id is None:
+                turn.session_id = self.session_id
+        return self.settle(turn)
 
     # -------------------------------------------------------------------- run
 

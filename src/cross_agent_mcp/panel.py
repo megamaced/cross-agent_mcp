@@ -16,6 +16,7 @@ import socket
 import subprocess
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from . import config
@@ -28,6 +29,14 @@ REGISTRY_DIR: str = config.HOME_DIR + 'panels/'
 SOCKET_BACKLOG = 4
 MAX_REQUEST_BYTES = 4_000_000
 DEFAULT_INJECT_TIMEOUT = 600
+
+# A turn that ended while nobody was connected is kept this long for the bridge to collect. The
+# bridge reconnects within seconds; an hour covers a bridge that was itself restarted meanwhile.
+RETAIN_FINISHED_SECONDS = 3600
+
+# our injected requests use string ids in a private namespace, so they can never collide with
+# the integer ids the extension hands out
+INJECT_ID_PREFIX = 'xagent-'
 
 
 def process_ancestry(pid: int, depth: int = 12) -> List[int]:
@@ -65,6 +74,76 @@ def split_wrapper_argv(argv: List[str]) -> tuple:
     return [], argv
 
 
+def new_inject_id() -> str:
+    return INJECT_ID_PREFIX + uuid.uuid4().hex[:12]
+
+
+class Turn:
+    """One bridged message and the turn it started, from hand-over to the peer's last word.
+
+    The turn outlives the socket request that started it. A request used to wait for the whole
+    turn and give up at a deadline, and giving up was final: the shim dropped its record while
+    the peer kept working, so the answer, when it came, had nowhere to go but the transcript.
+    Now the record stays until the bridge collects it, and the bridge may come back for it as
+    often as it likes.
+
+    Three moments matter to a caller and are kept apart:
+      accepted - the peer's process took the message; it will be answered, or at least seen
+      done     - the turn ended, with a reply or an error
+      neither  - the message may not have landed at all
+    """
+
+    def __init__(self, session_id: Optional[str], is_created: bool) -> None:
+        self.injection_id = new_inject_id()
+        self.session_id = session_id
+        self.is_created = is_created
+        self.turn_id: Optional[str] = None
+        self.messages: List[str] = []
+        self.result: Optional[str] = None
+        self.error: Optional[str] = None
+        self.is_accepted = False
+        self.started_at = time.time()
+        self.finished_at: Optional[float] = None
+        # `progress` fires on acceptance and on completion; `done` only on completion
+        self.progress = threading.Event()
+        self.done = threading.Event()
+
+    def accept(self) -> None:
+        self.is_accepted = True
+        self.progress.set()
+
+    def finish(self, error: Optional[str] = None) -> None:
+        if error:
+            self.error = error
+        self.finished_at = time.time()
+        self.done.set()
+        self.progress.set()
+
+    def wait(self, timeout: float, until_accepted: bool = False) -> None:
+        """Block until the turn ends - or, if asked, until it is merely accepted."""
+        if until_accepted:
+            self.progress.wait(timeout)
+        else:
+            self.done.wait(timeout)
+
+    def describe(self, reply: str, waited: float) -> Dict[str, Any]:
+        base: Dict[str, Any] = {
+            'injectionId': self.injection_id,
+            'sessionId': self.session_id,
+            'threadId': self.session_id,
+            'turnId': self.turn_id,
+            'wasCreated': self.is_created,
+            'accepted': self.is_accepted,
+        }
+        if self.error:
+            return {**base, 'ok': False, 'error': self.error}
+        if not self.done.is_set():
+            return {**base, 'ok': False, 'pending': True,
+                    'error': f'turn still running after {round(waited)}s',
+                    'partial': '\n'.join(self.messages)}
+        return {**base, 'ok': True, 'reply': reply}
+
+
 class PanelShim:
     """Base for a shim that wraps one live agent process."""
 
@@ -78,6 +157,8 @@ class PanelShim:
         self.state_lock = threading.Lock()
         self.socket_path = REGISTRY_DIR + f'{self.agent}-{os.getpid()}.sock'
         self.registry_path = REGISTRY_DIR + f'{self.agent}-{os.getpid()}.json'
+        # turns the bridge has not collected yet, by injection id
+        self.turns: Dict[str, Turn] = {}
 
     # ------------------------------------------------------------- subclasses
 
@@ -85,9 +166,58 @@ class PanelShim:
         raise NotImplementedError
 
     def inject(self, text: str, session_id: Optional[str], timeout: int,
-               cwd: Optional[str] = None, title: Optional[str] = None) -> Dict[str, Any]:
-        """Deliver a message into the panel, opening a conversation if none is running."""
+               cwd: Optional[str] = None, title: Optional[str] = None,
+               accept_timeout: Optional[int] = None) -> Dict[str, Any]:
+        """Deliver a message into the panel, opening a conversation if none is running.
+
+        With `accept_timeout` the call returns as soon as the peer has taken the message, and
+        the turn is left for `await_turn` to collect. Without it the call waits `timeout` for
+        the turn to end, as it always did.
+        """
         raise NotImplementedError
+
+    def reply_of(self, turn: Turn) -> str:
+        """The text a finished turn is answered with."""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------ turn ledger
+
+    def _keep(self, turn: Turn) -> None:
+        with self.state_lock:
+            self.turns[turn.injection_id] = turn
+
+    def _forget_turn(self, injection_id: str) -> None:
+        with self.state_lock:
+            self.turns.pop(injection_id, None)
+
+    def _prune_turns(self) -> None:
+        cutoff = time.time() - RETAIN_FINISHED_SECONDS
+        with self.state_lock:
+            for injection_id in [i for i, t in self.turns.items()
+                                 if t.finished_at is not None and t.finished_at < cutoff]:
+                self.turns.pop(injection_id, None)
+
+    def settle(self, turn: Turn) -> Dict[str, Any]:
+        """Report a turn as it stands, keeping it collectable while it is still running."""
+        result = turn.describe(self.reply_of(turn) if turn.done.is_set() else '',
+                               time.time() - turn.started_at)
+        if result.get('pending'):
+            self._keep(turn)
+        else:
+            self._forget_turn(turn.injection_id)
+        return result
+
+    def await_turn(self, injection_id: Optional[str], timeout: int) -> Dict[str, Any]:
+        """Wait for a turn a previous `send` left running, and hand back what it produced."""
+        with self.state_lock:
+            turn = self.turns.get(injection_id or '')
+        if turn is None:
+            return {'ok': False, 'accepted': None,
+                    'error': f'no turn {injection_id} is pending in this panel process: it was '
+                             'never started here, was already collected, or this panel process '
+                             'restarted since'}
+        turn.wait(timeout)
+        return self.settle(turn)
 
     # --------------------------------------------------------------- registry
 
@@ -118,16 +248,24 @@ class PanelShim:
             self.process.stdin.flush()
 
     def _handle_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        self._prune_turns()
         operation = request.get('op')
         if operation == 'status':
             return self.status()
         if operation == 'send':
+            accept_timeout = request.get('acceptTimeout')
             return self.inject(
                 str(request.get('text') or ''),
                 request.get('sessionId') or request.get('threadId'),
                 int(request.get('timeout') or DEFAULT_INJECT_TIMEOUT),
                 request.get('cwd'),
                 request.get('title'),
+                int(accept_timeout) if accept_timeout is not None else None,
+            )
+        if operation == 'await':
+            return self.await_turn(
+                request.get('injectionId'),
+                int(request.get('timeout') or DEFAULT_INJECT_TIMEOUT),
             )
         return {'ok': False, 'error': f'unknown op: {operation}'}
 

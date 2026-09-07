@@ -14,7 +14,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from . import config, registry
 
@@ -472,10 +472,161 @@ def request_token_in(text: str) -> Optional[str]:
     return match.group(0) if match else None
 
 
-def last_agent_message(agent: str, session_id: str,
-                       after: Optional[float] = None,
-                       token: Optional[str] = None) -> Optional[str]:
-    """The final assistant message a session wrote, read straight from its transcript.
+def _parsed(lines: List[str]) -> Iterator[Dict[str, Any]]:
+    """Transcript entries newest first; lines that are not JSON objects are skipped."""
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(entry, dict):
+            yield entry
+
+
+def _claude_turns(lines: List[str]) -> Tuple[List[Dict[str, Any]], bool]:
+    """Completed turns in a Claude transcript tail, newest first, and whether one is still open.
+
+    Every API response is stored as one entry per content block, all sharing a requestId and a
+    stop_reason. `tool_use` means the model paused to run a tool and will speak again; anything
+    else ends the turn. The text a model writes between tool calls is real narration - "reverting
+    provenance now" - and it is exactly what reading "the last message" used to hand back as
+    the answer.
+    """
+    turns: List[Dict[str, Any]] = []
+    is_working = False
+    is_newest_group = True
+    group_id: Any = None
+    group_texts: List[str] = []
+    group_stop: Optional[str] = None
+    group_at: Optional[float] = None
+
+    def flush() -> None:
+        nonlocal is_newest_group, is_working
+        if group_id is None:
+            return
+        if group_stop == 'tool_use':
+            if is_newest_group:
+                is_working = True
+        else:
+            text = ' '.join(t for t in reversed(group_texts) if t).strip()
+            turns.append({'text': text, 'written_at': group_at})
+        is_newest_group = False
+
+    saw_speech = False
+    for entry in _parsed(lines):
+        kind = entry.get('type')
+        if kind not in ('user', 'assistant') or entry.get('isSidechain'):
+            continue
+
+        if kind == 'user':
+            # A question the human just asked, still unanswered, is also a turn in progress.
+            content = (entry.get('message') or {}).get('content')
+            is_tool_result = isinstance(content, list) and any(
+                isinstance(b, dict) and b.get('type') == 'tool_result' for b in content)
+            if not saw_speech and not is_tool_result:
+                is_working = True
+            continue
+
+        saw_speech = True
+        message = entry.get('message') if isinstance(entry.get('message'), dict) else {}
+        this_id = entry.get('requestId') or entry.get('uuid') or id(entry)
+        if this_id != group_id:
+            flush()
+            group_id, group_texts, group_stop, group_at = this_id, [], message.get('stop_reason'), None
+        group_texts.append(_extract_text(message))
+        written = _entry_epoch(entry)
+        if written is not None and (group_at is None or written > group_at):
+            group_at = written
+    flush()
+    return turns, is_working
+
+
+def _codex_turns(lines: List[str]) -> Tuple[List[Dict[str, Any]], bool]:
+    """Completed turns in a Codex rollout tail, newest first, and whether one is still open.
+
+    The rollout brackets every turn with `task_started` and `task_complete` events, and the
+    completion carries `last_agent_message` - the app-server's own idea of the answer. The
+    assistant messages in between are narration between tool calls, the same trap as Claude's.
+    A rollout old enough to have no task events falls back to its last message.
+    """
+    turns: List[Dict[str, Any]] = []
+    is_working = False
+    saw_boundary = False
+    unfinished_turn_id: Optional[str] = None
+    latest_messages: List[Dict[str, Any]] = []
+
+    for entry in _parsed(lines):
+        payload = entry.get('payload') if isinstance(entry.get('payload'), dict) else {}
+        kind = entry.get('type')
+
+        if kind == 'event_msg':
+            event = payload.get('type')
+            if event == 'task_complete':
+                saw_boundary = True
+                text = str(payload.get('last_agent_message') or '').strip()
+                turns.append({'text': text, 'written_at': _entry_epoch(entry)})
+                unfinished_turn_id = None if text else payload.get('turn_id')
+            elif event == 'task_started' and not turns:
+                saw_boundary = True
+                is_working = True
+            elif (event == 'item_completed' and unfinished_turn_id
+                  and payload.get('turn_id') == unfinished_turn_id):
+                # a completion that named no message: take the turn's last spoken item
+                item = payload.get('item') if isinstance(payload.get('item'), dict) else {}
+                if item.get('type') == 'AgentMessage' and item.get('text'):
+                    turns[-1]['text'] = str(item['text']).strip()
+                    unfinished_turn_id = None
+            continue
+
+        if kind != 'response_item' or payload.get('role') != 'assistant':
+            continue
+        if payload.get('type') not in ('message', 'agent_message'):
+            continue
+        text = ' '.join(block.get('text', '') for block in (payload.get('content') or [])
+                        if isinstance(block, dict)).strip()
+        if text and not turns:
+            latest_messages.append({'text': text, 'written_at': _entry_epoch(entry)})
+
+    if not saw_boundary and latest_messages:
+        turns = latest_messages[:1]
+    return turns, is_working
+
+
+def _pick_answer(turns: List[Dict[str, Any]], after: Optional[float], token: Optional[str],
+                 label: str) -> Optional[Dict[str, Any]]:
+    """The turn that answers the request, out of the completed ones (newest first).
+
+    An echoed token settles it either way, and better than any timing rule can: a match is
+    proof, wherever it sits, and a different token is proof that turn answers something else.
+    Only when the peer echoed nothing does timing decide, and then a turn written before the
+    request cannot be its answer.
+    """
+    spoken = [t for t in turns if t.get('text')]
+    if token is not None:
+        for turn in spoken:
+            if request_token_in(turn['text']) == token:
+                return turn
+
+    fresh = [t for t in spoken
+             if after is None or (t['written_at'] is not None and t['written_at'] > after)]
+    if not fresh:
+        if spoken:
+            logger.info(f'_pick_answer [stale]: {label} last finished a turn before the request '
+                        'was delivered, so there is no answer to recover yet')
+        return None
+
+    if token is not None:
+        echoed = [request_token_in(t['text']) for t in fresh]
+        if any(echoed):
+            logger.info(f'_pick_answer [other request]: {label} answered '
+                        f'{[e for e in echoed if e]}, not {token}')
+            return None
+    return fresh[0]
+
+
+def peer_progress(agent: str, session_id: str, after: Optional[float] = None,
+                  token: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """What a session's transcript says about a request: the answer, or that it is still working.
 
     The bridge normally carries an answer back from the process it started. When that process
     dies first - the editor window reloaded, the machine slept - the answer is not gone, it is
@@ -483,59 +634,38 @@ def last_agent_message(agent: str, session_id: str,
     lost only when the peer never produced one.
 
     `after` is the instant the request was delivered, and without it this reads the peer's last
-    message whether or not it has anything to do with the question. That is not a hypothetical:
+    answer whether or not it has anything to do with the question. That is not a hypothetical:
     the same paragraph, written nine minutes before the request existed, came back as the
     answer to two different questions. A message that predates its own question is not an
     answer, and saying nothing is the honest result.
+
+    Only *finished* turns count. A peer mid-task also has a last message - a line about what it
+    is doing next - and a delivery that timed out at 600s used to come back with that line as
+    its answer. Here that peer is reported as working, and the answer is read once it ends.
     """
     session = find_session(agent, session_id)
     if not session:
         return None
 
-    for line in reversed(_tail_lines(session['path'])):
-        try:
-            entry = json.loads(line)
-        except Exception:
-            continue
+    lines = _tail_lines(session['path'])
+    turns, is_working = (_claude_turns(lines) if agent == config.AGENT_CLAUDE
+                         else _codex_turns(lines))
+    answer = _pick_answer(turns, after, token, f'{agent} {session_id}')
+    return {
+        'answer': answer['text'] if answer else None,
+        'answered_at': answer['written_at'] if answer else None,
+        'is_working': is_working,
+        'last_turn_finished_at': turns[0]['written_at'] if turns else None,
+        'transcript_mtime': _safe_mtime(session['path']),
+    }
 
-        if agent == config.AGENT_CLAUDE:
-            if entry.get('type') != 'assistant':
-                continue
-            text = _extract_text(entry.get('message'))
-        else:
-            payload = entry.get('payload')
-            if not isinstance(payload, dict) or payload.get('role') != 'assistant':
-                continue
-            if payload.get('type') not in ('message', 'agent_message'):
-                continue
-            text = ' '.join(
-                block.get('text', '') for block in (payload.get('content') or [])
-                if isinstance(block, dict))
 
-        if text.strip() == '':
-            continue
-
-        # An echoed token settles it either way, and better than any timing rule can: a match
-        # is proof, and a different token is proof this answers something else.
-        if token is not None:
-            echoed = request_token_in(text)
-            if echoed == token:
-                return text.strip()
-            if echoed is not None:
-                logger.info(
-                    f'last_agent_message [other request]: {agent} {session_id} last answered '
-                    f'{echoed}, not {token}')
-                return None
-
-        if after is not None:
-            written = _entry_epoch(entry)
-            if written is None or written <= after:
-                logger.info(
-                    f'last_agent_message [stale]: {agent} {session_id} last spoke before the '
-                    'request was delivered, so there is no answer to recover')
-                return None
-        return text.strip()
-    return None
+def last_agent_message(agent: str, session_id: str,
+                       after: Optional[float] = None,
+                       token: Optional[str] = None) -> Optional[str]:
+    """The answer a session's finished turn produced, or None while there is none to read."""
+    progress = peer_progress(agent, session_id, after, token)
+    return progress['answer'] if progress else None
 
 
 def find_active_session(agent: str, scope: str, cwd: str,

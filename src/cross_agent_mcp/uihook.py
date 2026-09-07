@@ -106,11 +106,22 @@ def find_local_shim(agent: str) -> Optional[Dict[str, Any]]:
     return shims[0] if shims else None
 
 
+class PanelUnreachable(Exception):
+    """The shim's socket could not be connected to, so nothing was sent through it.
+
+    Kept apart from every later failure because it is the one case where the message is
+    known not to have left: a read that times out after the write may still have landed.
+    """
+
+
 def _request(socket_path: str, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     connection.settimeout(CONNECT_TIMEOUT_SECONDS)
     try:
-        connection.connect(socket_path)
+        try:
+            connection.connect(socket_path)
+        except (OSError, socket.timeout) as e:
+            raise PanelUnreachable(f'{type(e).__name__}: {e} ({socket_path})') from e
         connection.sendall((json.dumps(payload, ensure_ascii=False) + '\n').encode('utf-8'))
 
         connection.settimeout(timeout)
@@ -272,8 +283,15 @@ def find_panel_host(agent: str) -> Optional[Dict[str, Any]]:
 
 
 def send(text: str, shim: Dict[str, Any], session_id: Optional[str], timeout: int,
-         cwd: Optional[str] = None, title: Optional[str] = None) -> Dict[str, Any]:
-    """Hand a message to the panel and wait for the turn to finish."""
+         cwd: Optional[str] = None, title: Optional[str] = None,
+         accept_timeout: Optional[int] = None) -> Dict[str, Any]:
+    """Hand a message to the panel.
+
+    With `accept_timeout` the shim answers as soon as the peer has taken the message, with
+    `pending: true` and an `injectionId` for `await_turn`. Without it - or on a shim from before
+    this existed, which ignores the field - the shim answers when the turn ends, so the socket
+    is allowed the whole turn budget either way.
+    """
     payload: Dict[str, Any] = {'op': 'send', 'text': text, 'timeout': timeout}
     if session_id:
         payload['sessionId'] = session_id
@@ -281,17 +299,36 @@ def send(text: str, shim: Dict[str, Any], session_id: Optional[str], timeout: in
         payload['cwd'] = cwd
     if title:
         payload['title'] = title
+    if accept_timeout is not None:
+        payload['acceptTimeout'] = accept_timeout
 
     logger.info(f'send [BEGIN]: via {shim.get("agent")} panel shim '
                 f'pid={shim.get("pid")} session={session_id}')
     try:
-        # the shim answers only once the turn completes, so allow the full turn budget
         return _request(shim['socket'], payload, timeout + CONNECT_TIMEOUT_SECONDS)
+    except PanelUnreachable as e:
+        logger.error(f'send [unreachable]: {e}')
+        return {'ok': False, 'accepted': False, 'error': f'panel shim unreachable: {e}'}
     except Exception as e:
         logger.error(f'send [exception]: {e}')
         return {'ok': False, 'error': f'{type(e).__name__}: {e}'}
     finally:
         logger.info('send [END]')
+
+
+def await_turn(shim: Dict[str, Any], injection_id: str, timeout: int) -> Dict[str, Any]:
+    """Wait for a turn that `send` left running in the panel, up to `timeout` seconds.
+
+    The answer has the same shape as `send`'s: `pending: true` while the turn goes on, `ok`
+    with the reply once it ends. Asking again is always allowed; the shim keeps the turn until
+    it has been collected.
+    """
+    payload = {'op': 'await', 'injectionId': injection_id, 'timeout': timeout}
+    try:
+        return _request(shim['socket'], payload, timeout + CONNECT_TIMEOUT_SECONDS)
+    except Exception as e:
+        logger.error(f'await_turn [exception]: {injection_id} {e}')
+        return {'ok': False, 'error': f'{type(e).__name__}: {e}', 'is_transport_error': True}
 
 
 def is_enabled() -> bool:

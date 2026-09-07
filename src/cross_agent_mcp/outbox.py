@@ -59,6 +59,24 @@ STATE_FAILED = 'failed'
 RECOVERY_WINDOW_SECONDS = 900
 RECOVERY_POLL_SECONDS = 15
 
+# A reply or a notice that could not be handed over is tried again, from a freshly resolved
+# route: the sender's panel may have closed, moved or reopened under a new process since the
+# request left. Only a message that provably never landed is retried - re-sending one that did
+# would have the sender read the same answer twice.
+UNDELIVERED_RETRY_ATTEMPTS = 3
+UNDELIVERED_RETRY_SECONDS = 20
+
+# How long `send_message` stays on the line after queuing, to hand back a failure the worker
+# hits straight away - a thread the app server no longer has, a session the panel does not
+# drive. Those come back within a second; a healthy hand-over is acknowledged in about that
+# time too, so the wait ends as soon as either happens. Only a peer that is busy, or a queue
+# with something ahead, makes the caller sit out the whole window.
+EARLY_FAILURE_WINDOW_SECONDS = 8
+
+KIND_REQUEST = 'request'
+KIND_REPLY = 'reply'
+KIND_NOTICE = 'failure-notice'
+
 
 def new_request_id() -> str:
     """`req_<epoch ms>_<6 hex>` — short enough for a peer to copy back without mangling it.
@@ -129,6 +147,17 @@ class PeerBusyError(Exception):
     """
 
 
+class NotDeliveredError(Exception):
+    """The message never reached the peer, and this is known for certain.
+
+    Different from a transport that broke *after* the hand-over: there the peer is working and
+    an answer will appear in its transcript, so waiting for one is right. Here nothing was
+    handed over - the app server had no such thread, the panel drives another session, the
+    pipe was closed - and waiting fifteen minutes for an answer that cannot come is exactly
+    how three requests sat in `awaiting-peer` while nobody was told.
+    """
+
+
 class Job:
     """One message on its way to a peer session."""
 
@@ -137,7 +166,8 @@ class Job:
                  ui_shim: Optional[Dict[str, Any]], title: Optional[str],
                  conversation_id: str, hop: int, sender_agent: str,
                  sender_session_id: Optional[str], wants_reply: bool,
-                 summary: str, delivery_id: Optional[str] = None) -> None:
+                 summary: str, delivery_id: Optional[str] = None,
+                 kind: Optional[str] = None) -> None:
         self.delivery_id = delivery_id or new_request_id()
         self.target_agent = target_agent
         self.target_session_id = target_session_id
@@ -156,40 +186,71 @@ class Job:
         # A reply carries no reply of its own: that is what terminates the exchange.
         self.wants_reply = wants_reply
         self.summary = summary
+        self.kind = kind or (KIND_REQUEST if wants_reply else KIND_REPLY)
 
         self.state = STATE_QUEUED
         self.created_at = time.time()
         self.started_at: Optional[float] = None
+        # the moment the peer's process took the message; None while that is not known
+        self.accepted_at: Optional[float] = None
         self.finished_at: Optional[float] = None
         self.error: Optional[str] = None
         self.reply = ''
         self.reply_length = 0
         self.is_reply_recovered = False
+        # the message never landed - set only when the transport says so, never inferred
+        self.is_undelivered = False
+        self.attempts = 0
         self.resolved_session_id: Optional[str] = None
+        # Until this instant the caller of send_message is still on the line and will be handed
+        # a failure directly. After it, a failure is announced into the sender's session.
+        self.report_failures_until = 0.0
 
     def key(self) -> str:
         """Deliveries sharing this key are serialised."""
         return f'{self.target_agent}:{self.target_session_id or "new"}'
 
+    def mark_accepted(self, session_id: Optional[str] = None) -> None:
+        """The peer has the message. From here on its turn is running and we are listening."""
+        if self.accepted_at is None:
+            self.accepted_at = time.time()
+        if session_id:
+            self.resolved_session_id = session_id
+        if self.state == STATE_DELIVERING:
+            self.state = STATE_AWAITING
+
+    def is_failure_reportable_synchronously(self) -> bool:
+        """Whether the send_message caller, not a notice, is the one to hear about a failure."""
+        return (self.finished_at is not None and self.accepted_at is None
+                and self.finished_at < self.report_failures_until)
+
     def describe(self) -> Dict[str, Any]:
         return {
             'delivery_id': self.delivery_id,
             'state': self.state,
+            'kind': self.kind,
             'target_agent': self.target_agent,
             'target_session_id': self.resolved_session_id or self.target_session_id,
             'sender_agent': self.sender_agent,
+            'sender_session_id': self.sender_session_id,
             'conversation_id': self.conversation_id,
             'hop': self.hop,
             'is_reply': not self.wants_reply,
             'summary': self.summary,
+            'started_at': self.started_at,
+            'accepted_at': self.accepted_at,
+            'finished_at': self.finished_at,
             'queued_seconds': round((self.started_at or time.time()) - self.created_at, 1),
             'elapsed_seconds': (round((self.finished_at or time.time()) - self.started_at, 1)
                                 if self.started_at else None),
+            'attempts': self.attempts or None,
             'reply_length': self.reply_length or None,
             'reply_preview': self.reply[:REPLY_PREVIEW_LIMIT] or None,
             # true when the answer was read out of the peer's transcript instead of being
             # handed back by the process this server started
             'is_reply_recovered': self.is_reply_recovered or None,
+            # true when the peer provably never received the message
+            'is_undelivered': self.is_undelivered or None,
             'error': self.error,
         }
 
@@ -208,7 +269,9 @@ class Outbox:
         # injected by bridge to avoid an import cycle
         self.deliver: Optional[Callable[[Job], Dict[str, Any]]] = None
         self.build_reply: Optional[Callable[[Job, str], Optional['Job']]] = None
+        self.build_notice: Optional[Callable[[Job], Optional['Job']]] = None
         self.recover: Optional[Callable[[Job], Optional[str]]] = None
+        self.reroute: Optional[Callable[[Job], None]] = None
 
     # ------------------------------------------------------------- submission
 
@@ -235,6 +298,20 @@ class Outbox:
     def depth(self, key: str) -> int:
         with self._guard:
             return len(self._queues.get(key, []))
+
+    def await_outcome(self, job: Job) -> None:
+        """Stay with a just-queued job until the peer takes it, it fails, or the window passes.
+
+        The point is the failure case: a message the worker cannot hand over at all is known
+        within a second, and the caller is still here to be told. `job.report_failures_until`
+        must be set before the job is submitted - the worker reads it to decide whether the
+        caller is hearing about a failure directly, or a notice has to carry it into the
+        sender's session. Set afterwards, a fast failure would be reported both ways.
+        """
+        while time.time() < job.report_failures_until:
+            if job.accepted_at is not None or job.finished_at is not None:
+                return
+            time.sleep(0.05)
 
     # ---------------------------------------------------------------- workers
 
@@ -283,12 +360,17 @@ class Outbox:
                     f'session={job.target_session_id or "NEW"} conv={job.conversation_id}')
 
         try:
-            result = self._deliver_with_lock(job)
+            result = self._deliver_with_retries(job)
             job.resolved_session_id = result.get('session_id') or job.target_session_id
             reply = str(result.get('reply') or '').strip()
             job.reply = reply
             job.reply_length = len(reply)
             job.state = STATE_DELIVERED
+        except NotDeliveredError as e:
+            job.state = STATE_FAILED
+            job.is_undelivered = True
+            job.error = f'{type(e).__name__}: {e}'
+            logger.error(f'_run [not delivered]: {job.delivery_id} {job.error}')
         except Exception as e:
             job.state = STATE_FAILED
             job.error = f'{type(e).__name__}: {e}'
@@ -296,8 +378,11 @@ class Outbox:
 
         # The peer may have answered even when we did not receive it - a transport that broke
         # after the turn, a process that died holding the result. The answer is on disk in the
-        # peer's own transcript either way, so ask there before giving up on it.
-        if not job.reply:
+        # peer's own transcript either way, so ask there before giving up on it. Only a request
+        # has an answer to look for: a reply is complete the moment it lands, and reading the
+        # sender's transcript after one would only pull its own words back as a "reply".
+        if (job.wants_reply and not job.reply and job.state == STATE_FAILED
+                and not job.is_undelivered):
             recovered = self._recover_with_patience(job)
             if recovered:
                 job.reply = recovered
@@ -306,14 +391,53 @@ class Outbox:
                 logger.info(f'_run [recovered]: {job.delivery_id} read the answer from the '
                             f'{job.target_agent} transcript ({len(recovered)} chars)')
 
+        # the outcome is settled here; what follows only tells people about it
+        job.finished_at = time.time()
         try:
-            if job.reply and job.wants_reply:
+            if job.wants_reply and job.reply:
                 self._send_reply(job, job.reply)
+            elif job.wants_reply:
+                self._send_notice(job)
         finally:
-            job.finished_at = time.time()
             self._archive(job)
             logger.info(f'_run [END]: {job.delivery_id} state={job.state} '
                         f'reply_chars={job.reply_length}')
+
+    def _deliver_with_retries(self, job: Job) -> Dict[str, Any]:
+        """A reply that never landed is re-aimed and tried again; a request is not.
+
+        The sender's panel process may have gone away between the request and its answer - a
+        reopened tab is a new process with a new socket. Re-resolving the route finds it. A
+        request gets no such retry: its failure is reported to the caller, who knows better
+        than a blind retry whether it should go out again.
+        """
+        attempts = 1 if job.wants_reply else UNDELIVERED_RETRY_ATTEMPTS
+        for attempt in range(1, attempts + 1):
+            job.attempts = attempt
+            try:
+                return self._deliver_with_lock(job)
+            except NotDeliveredError as e:
+                if attempt >= attempts:
+                    raise
+                logger.info(f'_deliver_with_retries [rerouting]: {job.delivery_id} attempt '
+                            f'{attempt} did not land ({e}); trying again in '
+                            f'{UNDELIVERED_RETRY_SECONDS}s')
+                if self.reroute is not None:
+                    with contextlib.suppress(Exception):
+                        self.reroute(job)
+                time.sleep(UNDELIVERED_RETRY_SECONDS)
+        raise RuntimeError('unreachable')
+
+    def _patience(self, job: Job) -> float:
+        """How long a delivery may take before we stop holding on to it.
+
+        On the panel path the peer's turn runs as long as it runs, whatever we do, so the only
+        question is how long we keep listening; the configured patience answers it. On the CLI
+        path the turn is our subprocess and the budget is enforced by killing it.
+        """
+        if job.ui_shim is not None:
+            return max(job.timeout, config.PANEL_PATIENCE_SECONDS)
+        return job.timeout
 
     def _deliver_with_lock(self, job: Job) -> Dict[str, Any]:
         """Hold the cross-process busy lock only while the turn actually runs.
@@ -325,13 +449,14 @@ class Outbox:
         if self.deliver is None:
             raise RuntimeError('outbox has no delivery function installed')
 
-        deadline = time.time() + job.timeout
+        patience = self._patience(job)
+        deadline = time.time() + patience
         while True:
             try:
                 if not job.target_session_id:
                     return self.deliver(job)
                 with registry.busy_lock(job.target_agent, job.target_session_id,
-                                        job.conversation_id):
+                                        job.conversation_id, ttl_seconds=patience + 60):
                     return self.deliver(job)
             except (registry.SessionBusyError, PeerBusyError) as e:
                 # Two ways of hearing the same thing: another delivery holds the session, or
@@ -361,16 +486,23 @@ class Outbox:
                     f'up but {job.target_agent} may still be working; watching its transcript')
 
         deadline = time.time() + RECOVERY_WINDOW_SECONDS
-        while time.time() < deadline:
-            time.sleep(RECOVERY_POLL_SECONDS)
-            text = self._recover(job)
-            if text:
-                logger.info(f'_recover_with_patience [answered]: {job.delivery_id} after '
-                            f'{round(time.time() - (job.started_at or time.time()))}s')
-                return text
-        logger.info(f'_recover_with_patience [gave up]: {job.delivery_id} no answer within '
-                    f'{RECOVERY_WINDOW_SECONDS}s of the transport failing')
-        return None
+        try:
+            while time.time() < deadline:
+                time.sleep(RECOVERY_POLL_SECONDS)
+                text = self._recover(job)
+                if text:
+                    logger.info(f'_recover_with_patience [answered]: {job.delivery_id} after '
+                                f'{round(time.time() - (job.started_at or time.time()))}s')
+                    return text
+            logger.info(f'_recover_with_patience [gave up]: {job.delivery_id} no answer within '
+                        f'{RECOVERY_WINDOW_SECONDS}s of the transport failing')
+            return None
+        finally:
+            # The wait is over either way, and "awaiting-peer" was only true while it lasted.
+            # Left standing, twenty-six finished records read as still in flight. The transport
+            # did fail; whether an answer was then read from the transcript is recorded on
+            # the side (is_reply_recovered), not by rewriting what happened.
+            job.state = STATE_FAILED
 
     def _recover(self, job: Job) -> Optional[str]:
         if self.recover is None:
@@ -391,6 +523,28 @@ class Outbox:
             return
         if reply_job is not None:
             self.submit(reply_job)
+
+    def _send_notice(self, job: Job) -> None:
+        """Tell the sender a request produced no answer - unless the caller was told directly.
+
+        A request that fails silently is the worst outcome the bridge has: the sender believes
+        the work is under way and finds out hours later, by asking. So a request that ends
+        without an answer is announced into the sender's session, whether it never landed or
+        landed and went unanswered - the wording differs, the announcement does not.
+        """
+        if job.is_failure_reportable_synchronously():
+            logger.info(f'_send_notice [skipped]: {job.delivery_id} the caller is being told '
+                        'directly')
+            return
+        if self.build_notice is None:
+            return
+        try:
+            notice = self.build_notice(job)
+        except Exception as e:
+            logger.error(f'_send_notice [exception]: {job.delivery_id} {e}')
+            return
+        if notice is not None:
+            self.submit(notice)
 
     # --------------------------------------------------------------- reporting
 

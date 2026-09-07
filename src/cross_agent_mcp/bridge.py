@@ -42,6 +42,29 @@ PEER_BUSY_SIGNALS = (
     'already in flight',
 )
 
+# Shim answers from before the shim said `accepted` explicitly, that meant the message never
+# left. A current shim states it; these keep a panel process that has not been restarted since
+# from turning a plain refusal into fifteen minutes of watching for an answer.
+NEVER_LANDED_SIGNALS = (
+    'thread not found',
+    'is not open in this panel',
+    'drives session',
+    'failed to write to',
+    'could not open a new thread',
+    'failed to open a panel thread',
+    'panel shim unreachable',
+)
+
+# How long a panel hand-over may take to be acknowledged. Acceptance itself is a matter of
+# milliseconds; the allowance is for opening a fresh thread first, which the app server is
+# given THREAD_OPEN_TIMEOUT_SECONDS (30s) for.
+PANEL_ACCEPT_SECONDS = 45
+
+# One `await` call to the shim covers this much of the peer's turn; the bridge then asks again
+# until the turn ends or patience runs out. Shorter than a turn on purpose: a socket that dies
+# mid-turn is noticed within this, not at the end of the whole budget.
+PANEL_AWAIT_CHUNK_SECONDS = 120
+
 AGENT_LABEL: Dict[str, str] = {
     config.AGENT_CLAUDE: 'Claude Code',
     config.AGENT_CODEX: 'Codex',
@@ -180,6 +203,61 @@ def _build_reply_envelope(sender: str, target: str, conversation_id: str, hop: i
     )
 
 
+def _build_notice_envelope(job: outbox.Job, remaining: int) -> str:
+    """Tell the sender that a request of theirs produced nothing.
+
+    Two different failures, told apart by the first line. A message that never landed is safe
+    to send again; the peer has no idea it existed. A message that landed and went unanswered
+    is a peer still working, or a peer that stopped - and resending it would set the same work
+    going twice, so the reader is pointed at the transcript instead.
+    """
+    target_label = AGENT_LABEL.get(job.target_agent, job.target_agent)
+    reply_tool = PEER_TOOL.get(job.sender_agent, 'the cross-agent tool')
+    session = job.resolved_session_id or job.target_session_id or '(none)'
+
+    if job.is_undelivered:
+        headline = f'Your message was NOT delivered to {target_label} (session {session}).'
+        standing = f'- {target_label} never saw it. Nothing is waiting on you.\n'
+        if 'thread not found' in (job.error or ''):
+            advice = (f'- The Codex panel had unloaded that thread and the bridge could not load '
+                      'it back. Ask the human to open that conversation in the Codex panel, '
+                      'then send again.\n')
+        else:
+            advice = ('- If the request still matters, send it again; check `bridge_status` '
+                      f'(delivery_id="{job.delivery_id}") first if the reason is unclear.\n')
+    else:
+        headline = (f'Your message reached {target_label} (session {session}), but no answer '
+                    f'came back in {round((job.finished_at or time.time()) - (job.started_at or time.time()))}s.')
+        standing = (f'- {target_label} may still be working on it, or may have stopped without '
+                    'answering. Do NOT resend blindly: that starts the same work twice.\n')
+        advice = (f'- Call `bridge_status` with delivery_id="{job.delivery_id}" to read the '
+                  f'{target_label} transcript: peer_transcript.answer is filled in once its '
+                  'turn ends, and is_working says whether it is still going.\n')
+
+    if remaining > 0:
+        budget = (f'- Sending again costs a hop ({remaining} left); use `{reply_tool}` with '
+                  f'session_id="{session}" to reach the same conversation.\n')
+    else:
+        budget = ('- The hop budget for this conversation is exhausted; a new request would '
+                  'need a new conversation.\n')
+
+    return (
+        '=== CROSS-AGENT BRIDGE DELIVERY FAILED ===\n'
+        'from: the bridge itself (not the peer agent, not the human user)\n'
+        f'conversation: {job.conversation_id} | hop {job.hop}/{config.MAX_HOPS}\n'
+        f'request: {job.delivery_id}\n'
+        '\n'
+        f'{headline}\n'
+        f'reason: {job.error or "unknown"}\n'
+        f'message: {job.summary}\n'
+        '\n'
+        '=== NOTE ===\n'
+        f'{standing}'
+        f'{advice}'
+        f'{budget}'
+    )
+
+
 def _summary(text: str) -> str:
     """A one-line trace of a message, for delivery listings."""
     first_line = next((line.strip() for line in text.splitlines()
@@ -288,7 +366,7 @@ def _run_cli(command: List[str], cwd: str, env: Dict[str, str], timeout: int) ->
             start_new_session=True,
         )
     except FileNotFoundError:
-        raise BridgeError(f'CLI not found: {command[0]}')
+        raise outbox.NotDeliveredError(f'CLI not found: {command[0]}')
 
     _track_child(process)
     try:
@@ -313,17 +391,68 @@ def _panel_title(sender_agent: str, message: str) -> str:
     return f'{label}: {" ".join(first_line.split())[:PANEL_TITLE_LIMIT]}'
 
 
+def _raise_for_panel_failure(response: Dict[str, Any]) -> None:
+    """Turn a shim's `ok: false` into the exception that says what it means for the message.
+
+    Three answers, three different next steps. Busy: the peer will take it later, retry. Never
+    landed: nothing to wait for, tell the sender. Anything else: the peer has the message and
+    something broke on the way back, so its transcript is where the answer will be.
+    """
+    if response.get('ok') or response.get('pending'):
+        return
+    error = str(response.get('error') or '')
+    # The shim waits for the peer to be free and gives up after a while. That deadline is its
+    # own, not ours: the peer is still going to be free eventually.
+    if any(signal in error for signal in PEER_BUSY_SIGNALS):
+        raise outbox.PeerBusyError(error)
+
+    accepted = response.get('accepted')
+    is_never_landed = (accepted is False if 'accepted' in response
+                       else any(signal in error for signal in NEVER_LANDED_SIGNALS))
+    if is_never_landed:
+        raise outbox.NotDeliveredError(f'IDE panel relay refused: {error}')
+    raise BridgeError(f'IDE panel relay failed: {error}')
+
+
 def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, Any],
-                    timeout: int, cwd: str, title: Optional[str] = None) -> Dict[str, Any]:
-    """Deliver through the editor panel shim, so the exchange shows up in the panel."""
-    response = uihook.send(message, ui_shim, session_id, timeout, cwd, title)
-    if not response.get('ok'):
-        error = str(response.get('error') or '')
-        # The shim waits for the peer to be free and gives up after a while. That deadline is
-        # its own, not ours: the peer is still going to be free eventually.
-        if any(signal in error for signal in PEER_BUSY_SIGNALS):
-            raise outbox.PeerBusyError(error)
-        raise BridgeError(f'IDE panel relay failed: {error}')
+                    timeout: int, cwd: str, title: Optional[str] = None,
+                    on_accepted: Optional[Any] = None, wants_result: bool = True,
+                    patience: Optional[float] = None) -> Dict[str, Any]:
+    """Deliver through the editor panel shim, so the exchange shows up in the panel.
+
+    The hand-over and the answer are two waits, not one. The shim answers the first as soon as
+    the peer has the message; the answer is then collected with as many `await` calls as the
+    turn takes, up to `patience`. A single socket wait for the whole turn was how a 600s
+    deadline cut off turns that ran 500..820s, and the peer kept working after each cut.
+
+    A shim from before this protocol ignores the acceptance deadline and answers when the turn
+    ends, exactly as before; nothing here depends on the new fields being present.
+    """
+    started = time.time()
+    budget = patience if patience is not None else timeout
+    response = uihook.send(message, ui_shim, session_id, timeout, cwd, title,
+                           accept_timeout=PANEL_ACCEPT_SECONDS)
+    _raise_for_panel_failure(response)
+
+    is_accepted_reported = False
+    while response.get('pending'):
+        if response.get('accepted') and not is_accepted_reported:
+            is_accepted_reported = True
+            if on_accepted is not None:
+                on_accepted(response)
+            if not wants_result:
+                # a reply is complete the moment it lands; nobody reads what the peer says next
+                break
+
+        remaining = started + budget - time.time()
+        if remaining <= 0:
+            raise BridgeError(
+                f'IDE panel relay failed: the peer turn is still running after '
+                f'{round(time.time() - started)}s; its answer will be read from the transcript '
+                'when it ends')
+        response = uihook.await_turn(ui_shim, str(response.get('injectionId')),
+                                     int(min(PANEL_AWAIT_CHUNK_SECONDS, max(remaining, 1))))
+        _raise_for_panel_failure(response)
 
     return {
         'session_id': response.get('sessionId') or session_id or '',
@@ -336,10 +465,10 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
 
 def _call_claude(message: str, session_id: Optional[str], cwd: str, env: Dict[str, str],
                  timeout: int, ui_shim: Optional[Dict[str, Any]] = None,
-                 title: Optional[str] = None) -> Dict[str, Any]:
+                 title: Optional[str] = None, **panel: Any) -> Dict[str, Any]:
     """Resume (or create) a Claude Code session and return its final message."""
     if ui_shim:
-        return _call_via_panel(message, session_id, ui_shim, timeout, cwd, title)
+        return _call_via_panel(message, session_id, ui_shim, timeout, cwd, title, **panel)
 
     is_new = session_id is None
     target_id = session_id or str(uuid.uuid4())
@@ -384,7 +513,7 @@ def _call_claude(message: str, session_id: Optional[str], cwd: str, env: Dict[st
 
 def _call_codex(message: str, session_id: Optional[str], cwd: str, env: Dict[str, str],
                 timeout: int, ui_shim: Optional[Dict[str, Any]] = None,
-                title: Optional[str] = None) -> Dict[str, Any]:
+                title: Optional[str] = None, **panel: Any) -> Dict[str, Any]:
     """Deliver to a Codex thread and return its final message.
 
     With a shim available the turn is started on the app-server the editor panel is attached
@@ -392,7 +521,7 @@ def _call_codex(message: str, session_id: Optional[str], cwd: str, env: Dict[str
     which keeps the context but stays invisible to the panel until it is reopened.
     """
     if ui_shim:
-        return _call_via_panel(message, session_id, ui_shim, timeout, cwd, title)
+        return _call_via_panel(message, session_id, ui_shim, timeout, cwd, title, **panel)
 
     is_new = session_id is None
 
@@ -579,8 +708,13 @@ def _resolve_target(target_agent: str, session_id: Optional[str], scope: str, cw
 
 def _deliver(job: outbox.Job) -> Dict[str, Any]:
     """Run one queued delivery. Called on an outbox worker thread, never on the caller's."""
-    result = CALLERS[job.target_agent](job.payload, job.target_session_id, job.run_cwd,
-                                       job.env, job.timeout, job.ui_shim, job.title)
+    result = CALLERS[job.target_agent](
+        job.payload, job.target_session_id, job.run_cwd, job.env, job.timeout, job.ui_shim,
+        job.title,
+        on_accepted=lambda response: job.mark_accepted(response.get('sessionId')),
+        wants_result=job.wants_reply,
+        patience=max(job.timeout, config.PANEL_PATIENCE_SECONDS),
+    )
 
     if result['is_new_session'] and result['session_id']:
         registry.set_pin(job.target_agent, job.pin_cwd, result['session_id'], job.run_cwd,
@@ -588,6 +722,23 @@ def _deliver(job: outbox.Job) -> Dict[str, Any]:
     elif job.target_session_id:
         registry.touch_pin(job.target_agent, job.pin_cwd)
     return result
+
+
+def _reroute(job: outbox.Job) -> None:
+    """Point a delivery at wherever its target session lives *now*.
+
+    Used before retrying a reply that did not land. The route was resolved when the answer
+    came in; a tab closed and reopened since is a new panel process behind a new socket, and
+    the old one refuses the connection. Without a panel the CLI resume remains.
+    """
+    if not job.target_session_id:
+        return
+    panel: Optional[Dict[str, Any]] = None
+    with contextlib.suppress(Exception):
+        panel = _panel_session(job.target_agent, job.target_session_id, [])
+    job.ui_shim = (panel or {}).get('ui_shim')
+    logger.info(f'_reroute [resolved]: {job.delivery_id} -> '
+                f'{"panel pid=" + str(job.ui_shim.get("pid")) if job.ui_shim else "cli resume"}')
 
 
 def _build_reply_job(job: outbox.Job, reply: str) -> Optional[outbox.Job]:
@@ -643,6 +794,51 @@ def _build_reply_job(job: outbox.Job, reply: str) -> Optional[outbox.Job]:
         sender_session_id=answering_id,
         wants_reply=False,
         summary=_summary(reply),
+        kind=outbox.KIND_REPLY,
+    )
+
+
+def _build_notice_job(job: outbox.Job) -> Optional[outbox.Job]:
+    """Turn a request that produced no answer into a notice aimed back at its sender.
+
+    A notice travels like a reply - into the sender's session, spending no hop, expecting no
+    answer - and says what a reply would have been standing in for.
+    """
+    if not job.sender_session_id:
+        logger.info(f'_build_notice_job [skipped]: {job.delivery_id} has no sender session to '
+                    'tell')
+        return None
+
+    hop = int(registry.get_conversation(job.conversation_id).get('hops', job.hop))
+    remaining = max(config.MAX_HOPS - hop, 0)
+    payload = _build_notice_envelope(job, remaining)
+
+    panel: Optional[Dict[str, Any]] = None
+    with contextlib.suppress(Exception):
+        panel = _panel_session(job.sender_agent, job.sender_session_id, [])
+
+    notice_cwd = job.pin_cwd
+    known = discovery.find_session(job.sender_agent, job.sender_session_id)
+    if known and known.get('cwd') and os.path.isdir(known['cwd']):
+        notice_cwd = known['cwd']
+
+    return outbox.Job(
+        target_agent=job.sender_agent,
+        target_session_id=job.sender_session_id,
+        payload=payload,
+        run_cwd=notice_cwd,
+        pin_cwd=notice_cwd,
+        env=_child_env(job.conversation_id, hop, job.target_agent, []),
+        timeout=config.SEND_TIMEOUT_SECONDS,
+        ui_shim=(panel or {}).get('ui_shim'),
+        title=f'bridge: delivery {job.delivery_id} failed',
+        conversation_id=job.conversation_id,
+        hop=hop,
+        sender_agent=job.target_agent,
+        sender_session_id=job.resolved_session_id or job.target_session_id,
+        wants_reply=False,
+        summary=f'delivery failed: {(job.error or "")[:PANEL_TITLE_LIMIT * 2]}',
+        kind=outbox.KIND_NOTICE,
     )
 
 
@@ -663,7 +859,52 @@ def _recover_reply(job: outbox.Job) -> Optional[str]:
 
 outbox.OUTBOX.deliver = _deliver
 outbox.OUTBOX.build_reply = _build_reply_job
+outbox.OUTBOX.build_notice = _build_notice_job
 outbox.OUTBOX.recover = _recover_reply
+outbox.OUTBOX.reroute = _reroute
+
+
+def delivery_report(delivery_id: str) -> Dict[str, Any]:
+    """One delivery in full, with a fresh look at what its target has written since.
+
+    The delivery record is what the bridge saw. The transcript is what the peer did, and the
+    two part ways exactly when it matters: a delivery closed while the peer was mid-task has a
+    fragment, or nothing, where the answer belongs. Reading the transcript again later - after
+    the peer has finished - is how that answer is found, and this is where to ask for it.
+    """
+    job = outbox.OUTBOX.find(delivery_id)
+    if job is not None:
+        record = job.describe()
+    else:
+        record = next((r for r in outbox.read_records(limit=1000)
+                       if r.get('delivery_id') == delivery_id), None)
+    if record is None:
+        return {'ok': False,
+                'error': f'no delivery {delivery_id} is known to this server or kept on disk'}
+
+    report: Dict[str, Any] = {'ok': True, 'delivery': record}
+
+    target_agent = record.get('target_agent')
+    target_session = record.get('target_session_id')
+    if target_agent in CALLERS and target_session:
+        after = record.get('started_at')
+        progress = discovery.peer_progress(target_agent, target_session, after=after,
+                                           token=delivery_id)
+        if progress is None:
+            report['peer_transcript'] = {'error': f'no {target_agent} transcript found for '
+                                                  f'session {target_session}'}
+        else:
+            report['peer_transcript'] = {
+                **progress,
+                'note': ('Read from the peer transcript just now. `answer` is the text of the '
+                         'last turn the peer FINISHED after this request went out (matched by '
+                         'the echoed request id when there is one); null while it has not '
+                         'finished one. `is_working` is true while a turn is open. '
+                         + ('' if after else 'This record predates the request time being '
+                                             'kept, so the answer is not filtered by time; check '
+                                             'it against the request yourself.')),
+            }
+    return report
 
 
 def _own_session_id(sender_agent: str) -> Optional[str]:
@@ -790,12 +1031,39 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         wants_reply=True,
         summary=_summary(message),
         delivery_id=request_id,
+        kind=outbox.KIND_REQUEST,
     )
+    # Stay on the line for a moment. A message the worker cannot hand over at all fails within
+    # a second, and the caller who is still here is the right one to hear it - three requests
+    # were queued as "accepted" today and refused a second later, and nobody was told until
+    # bridge_status was asked. Set before submitting, so the worker knows the caller is here.
+    job.report_failures_until = time.time() + outbox.EARLY_FAILURE_WINDOW_SECONDS
     delivery_id = outbox.OUTBOX.submit(job)
+    outbox.OUTBOX.await_outcome(job)
+
+    if job.is_failure_reportable_synchronously():
+        logger.info(f'send_message [refused]: {sender_agent}->{target_agent} '
+                    f'delivery={delivery_id} {job.error}')
+        return {
+            'ok': False,
+            'accepted': False,
+            'delivery_id': delivery_id,
+            'error': job.error,
+            'note': ('NOT delivered: the peer never received this message, so nothing is in '
+                     'flight and no answer will come. Fix the cause and send again if it still '
+                     'matters; this attempt spent a hop.'),
+            'target_agent': target_agent,
+            'target_session_id': target_id,
+            'is_undelivered': job.is_undelivered,
+            'conversation_id': conversation_id,
+            'hop': hop,
+            'hops_remaining': remaining,
+            'elapsed_seconds': round(time.time() - started_at, 1),
+        }
 
     logger.info(f'send_message [accepted]: {sender_agent}->{target_agent} '
                 f'session={target_id or "NEW"} conv={conversation_id} hop={hop} '
-                f'delivery={delivery_id}')
+                f'delivery={delivery_id} state={job.state}')
 
     is_new_target = target_id is None
     warnings: List[str] = []
@@ -819,10 +1087,16 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         'ok': True,
         'accepted': True,
         'delivery_id': delivery_id,
+        # whether the peer's process has already taken the message, as opposed to it waiting
+        # in the queue or for the peer to finish another turn
+        'is_in_peer_hands': job.accepted_at is not None,
+        'state': job.state,
         'note': ('Queued, not answered. This result carries no reply: the peer\'s answer '
                  'arrives later as a separate message in this session. Do not invent, predict '
                  'or wait for it - finish what you are doing and report that the message was '
-                 'sent. Check bridge_status for delivery state.'),
+                 'sent. If the delivery fails later, a DELIVERY FAILED notice arrives here the '
+                 'same way. Check bridge_status(delivery_id=...) for delivery state and the '
+                 'peer\'s progress.'),
         'warning': ' '.join(warnings) or None,
         'target_agent': target_agent,
         'target_session_id': target_id,

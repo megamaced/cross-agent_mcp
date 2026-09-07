@@ -22,16 +22,11 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
 from typing import Any, Dict, List, Optional
 
 from . import config
-from .panel import PanelShim
+from .panel import INJECT_ID_PREFIX, PanelShim, Turn, new_inject_id
 
-
-# our injected requests use string ids in a private namespace, so they can never collide
-# with the integer ids the extension hands out
-INJECT_ID_PREFIX = 'xagent-'
 
 # `codex app-server` has sub-subcommands that are not the stdio server; leave those alone
 APP_SERVER_SUBCOMMANDS = {'daemon', 'proxy', 'generate-ts', 'generate-json-schema', 'help'}
@@ -44,6 +39,10 @@ THREAD_NAME_LIMIT = 60
 
 # the app server's wording when a thread belongs to a multi-agent run and cannot be driven
 REJECTS_DIRECT_INPUT = 'direct app-server input is not allowed'
+
+# The app server's wording when a thread it once ran is no longer in memory. It shares its
+# error code (-32600) with malformed requests, so the message is the only thing to match on.
+THREAD_NOT_LOADED = 'thread not found'
 
 
 def find_real_codex() -> Optional[str]:
@@ -75,20 +74,8 @@ def is_app_server_invocation(argv: List[str]) -> bool:
     return True
 
 
-class Injection:
-    """One bridged message waiting for the app-server to finish its turn."""
-
-    def __init__(self, thread_id: str, request_id: str) -> None:
-        self.thread_id = thread_id
-        self.request_id = request_id
-        self.turn_id: Optional[str] = None
-        self.messages: List[str] = []
-        self.error: Optional[str] = None
-        self.done = threading.Event()
-
-
 class ThreadOpen:
-    """A `thread/start` the shim issued so a bridged message has somewhere visible to land."""
+    """A `thread/start` or `thread/resume` the shim issued so a message has a thread to land in."""
 
     def __init__(self) -> None:
         self.thread_id: Optional[str] = None
@@ -104,7 +91,8 @@ class CodexAppServerShim(PanelShim):
         super().__init__([real_codex] + argv, argv)
         self.real_codex = real_codex
         self.threads: Dict[str, Dict[str, Any]] = {}
-        self.injections: Dict[str, Injection] = {}
+        # turns we started, by the JSON-RPC id of their `turn/start`, until they end
+        self.injections: Dict[str, Turn] = {}
         self.opens: Dict[str, ThreadOpen] = {}
         # only turns the extension itself starts count as the human being here; injected
         # turns are written straight to the child and never pass through the observer
@@ -130,6 +118,7 @@ class CodexAppServerShim(PanelShim):
         with self.state_lock:
             record = self.threads.setdefault(thread_id, {'thread_id': thread_id, 'cwd': None})
             record['last_seen'] = time.time()
+            record['is_loaded'] = True
             if cwd:
                 record['cwd'] = cwd
 
@@ -139,6 +128,23 @@ class CodexAppServerShim(PanelShim):
             record = self.threads.get(thread_id)
             if record:
                 record['last_seen'] = time.time()
+
+    def _mark_unloaded(self, thread_id: str) -> None:
+        """The app server let go of a thread it was running.
+
+        The conversation is not gone - it is on disk and the user still calls it theirs - but a
+        `turn/start` aimed at it now fails with "thread not found" until somebody resumes it.
+        Remembering this lets the next delivery resume first instead of failing first.
+        """
+        with self.state_lock:
+            record = self.threads.get(thread_id)
+            if record:
+                record['is_loaded'] = False
+
+    def _is_loaded(self, thread_id: str) -> bool:
+        with self.state_lock:
+            record = self.threads.get(thread_id)
+        return record is None or record.get('is_loaded', True) is not False
 
     def _forget_thread(self, thread_id: str) -> None:
         with self.state_lock:
@@ -192,11 +198,17 @@ class CodexAppServerShim(PanelShim):
 
             if injection:
                 if 'error' in message:
-                    injection.error = json.dumps(message['error'], ensure_ascii=False)[:500]
-                    injection.done.set()
-                result = message.get('result')
-                if isinstance(result, dict) and isinstance(result.get('turnId'), str):
-                    injection.turn_id = result['turnId']
+                    # refused outright: the message never reached the thread
+                    injection.finish(json.dumps(message['error'], ensure_ascii=False)[:500])
+                else:
+                    result = message.get('result')
+                    turn = result.get('turn') if isinstance(result, dict) else None
+                    if isinstance(result, dict) and isinstance(result.get('turnId'), str):
+                        injection.turn_id = result['turnId']
+                    elif isinstance(turn, dict) and isinstance(turn.get('id'), str):
+                        injection.turn_id = turn['id']
+                    # the response to `turn/start` is the app server taking the message
+                    injection.accept()
             # never hand the extension a response to a request it never sent
             return True
 
@@ -207,6 +219,14 @@ class CodexAppServerShim(PanelShim):
             thread = params.get('thread')
             if isinstance(thread, dict) and self._accepts_direct_input(thread):
                 self._note_thread(thread.get('id'), thread.get('cwd'))
+        elif method == 'thread/closed' and isinstance(params.get('threadId'), str):
+            self._mark_unloaded(params['threadId'])
+        elif method == 'thread/status/changed' and isinstance(params.get('threadId'), str):
+            status = params.get('status') if isinstance(params.get('status'), dict) else {}
+            if status.get('type') == 'notLoaded':
+                self._mark_unloaded(params['threadId'])
+            else:
+                self._touch_thread(params['threadId'])
         elif isinstance(params.get('threadId'), str):
             self._touch_thread(params['threadId'])
 
@@ -216,13 +236,14 @@ class CodexAppServerShim(PanelShim):
             self._apply_to_injection(injection, method, params)
         return False
 
-    def _apply_to_injection(self, injection: Injection, method: Optional[str],
+    def _apply_to_injection(self, injection: Turn, method: Optional[str],
                             params: Dict[str, Any]) -> None:
         turn = params.get('turn') if isinstance(params.get('turn'), dict) else {}
 
         if method == 'turn/started' and injection.turn_id is None:
-            if params.get('threadId') == injection.thread_id and isinstance(turn.get('id'), str):
+            if params.get('threadId') == injection.session_id and isinstance(turn.get('id'), str):
                 injection.turn_id = turn['id']
+                injection.accept()
             return
 
         if not injection.turn_id:
@@ -233,9 +254,12 @@ class CodexAppServerShim(PanelShim):
             if isinstance(item, dict) and item.get('type') == 'agentMessage' and item.get('text'):
                 injection.messages.append(str(item['text']))
         elif method == 'turn/completed' and turn.get('id') == injection.turn_id:
+            error = None
             if turn.get('status') == 'failed' and turn.get('error'):
-                injection.error = json.dumps(turn['error'], ensure_ascii=False)[:500]
-            injection.done.set()
+                error = json.dumps(turn['error'], ensure_ascii=False)[:500]
+            injection.finish(error)
+            with self.state_lock:
+                self.injections = {k: v for k, v in self.injections.items() if v is not injection}
 
     # --------------------------------------------------------------- plumbing
 
@@ -294,43 +318,65 @@ class CodexAppServerShim(PanelShim):
             newest = max(self.threads.values(), key=lambda t: t.get('last_seen', 0))
         return newest['thread_id']
 
-    def _open_thread(self, cwd: Optional[str], timeout: int) -> ThreadOpen:
-        """Start a conversation in the panel so the relay has somewhere visible to land.
-
-        The app-server answers `thread/start` with the new thread *and* broadcasts a
-        `thread/started` notification, which is what tells the extension to render it.
-        """
-        request_id = INJECT_ID_PREFIX + uuid.uuid4().hex[:12]
+    def _ask_for_thread(self, method: str, params: Dict[str, Any], timeout: int) -> ThreadOpen:
+        """Issue a thread-producing request (`thread/start`, `thread/resume`) and wait for it."""
+        request_id = new_inject_id()
         opening = ThreadOpen()
         with self.state_lock:
             self.opens[request_id] = opening
 
-        params: Dict[str, Any] = {'cwd': cwd} if cwd else {}
         try:
             self.write_to_child(json.dumps(
-                {'id': request_id, 'method': 'thread/start', 'params': params},
+                {'id': request_id, 'method': method, 'params': params},
                 ensure_ascii=False) + '\n')
-            opening.done.wait(timeout=min(THREAD_OPEN_TIMEOUT_SECONDS, timeout))
+            if not opening.done.wait(timeout=min(THREAD_OPEN_TIMEOUT_SECONDS, timeout)):
+                opening.error = opening.error or f'{method} did not answer within {timeout}s'
         except Exception as e:
-            opening.error = f'failed to open a panel thread: {e}'
+            opening.error = f'{method} failed: {e}'
         finally:
             with self.state_lock:
                 self.opens.pop(request_id, None)
 
         return opening
 
+    def _open_thread(self, cwd: Optional[str], timeout: int) -> ThreadOpen:
+        """Start a conversation in the panel so the relay has somewhere visible to land.
+
+        The app-server answers `thread/start` with the new thread *and* broadcasts a
+        `thread/started` notification, which is what tells the extension to render it.
+        """
+        return self._ask_for_thread('thread/start', {'cwd': cwd} if cwd else {}, timeout)
+
+    def _resume_thread(self, thread_id: str, timeout: int) -> ThreadOpen:
+        """Load a thread the app server has let go of, so a turn can be started on it again.
+
+        This is what the extension itself sends when the human reopens a conversation - and
+        typing anything into the panel was, until now, the only way to bring a thread back
+        after the bridge had been told "thread not found". `thread/resume` is documented to
+        rejoin a thread that is already running, so asking is safe even when the thread was
+        never unloaded; only `threadId` is passed, because a `path` would be checked against
+        the live rollout and a mismatch there would turn a harmless call into a failure.
+        """
+        opening = self._ask_for_thread('thread/resume', {'threadId': thread_id}, timeout)
+        if opening.thread_id:
+            self._note_thread(opening.thread_id)
+        return opening
+
     def _name_thread(self, thread_id: str, name: str) -> None:
         """Give a bridge-opened thread a title, so the panel list is not just "New chat"."""
-        request_id = INJECT_ID_PREFIX + uuid.uuid4().hex[:12]
         with contextlib.suppress(Exception):
             self.write_to_child(json.dumps(
-                {'id': request_id, 'method': 'thread/name/set',
+                {'id': new_inject_id(), 'method': 'thread/name/set',
                  'params': {'threadId': thread_id, 'name': name[:THREAD_NAME_LIMIT]}},
                 ensure_ascii=False) + '\n')
 
+    def reply_of(self, turn: Turn) -> str:
+        return turn.messages[-1] if turn.messages else ''
+
     def inject(self, text: str, session_id: Optional[str], timeout: int,
-               cwd: Optional[str] = None, title: Optional[str] = None) -> Dict[str, Any]:
-        result = self._inject_once(text, session_id, timeout, cwd, title)
+               cwd: Optional[str] = None, title: Optional[str] = None,
+               accept_timeout: Optional[int] = None) -> Dict[str, Any]:
+        result = self._inject_once(text, session_id, timeout, cwd, title, accept_timeout)
 
         # A thread can stop accepting direct input after we learned about it - the panel may
         # have handed it to a multi-agent run. Drop it and try once on a fresh conversation.
@@ -339,38 +385,60 @@ class CodexAppServerShim(PanelShim):
             stale = result.get('sessionId')
             if stale:
                 self._forget_thread(stale)
-            return self._inject_once(text, None, timeout, cwd, title)
+            return self._inject_once(text, None, timeout, cwd, title, accept_timeout)
 
         return result
 
     def _inject_once(self, text: str, session_id: Optional[str], timeout: int,
-                     cwd: Optional[str], title: Optional[str]) -> Dict[str, Any]:
+                     cwd: Optional[str], title: Optional[str],
+                     accept_timeout: Optional[int]) -> Dict[str, Any]:
         target = self._pick_thread(session_id)
         is_created = False
 
         if not target:
             if session_id:
-                return {'ok': False, 'error': f'thread {session_id} is not open in this panel'}
+                return {'ok': False, 'accepted': False,
+                        'error': f'thread {session_id} is not open in this panel'}
             opening = self._open_thread(cwd, timeout)
             if not opening.thread_id:
-                return {'ok': False,
+                return {'ok': False, 'accepted': False,
                         'error': opening.error or 'could not open a new thread in the panel'}
             target = opening.thread_id
             is_created = True
             self._note_thread(target, cwd)
             if title:
                 self._name_thread(target, title)
+        elif not self._is_loaded(target):
+            # we watched the app server drop this thread; bring it back before asking
+            self._resume_thread(target, timeout)
 
-        request_id = INJECT_ID_PREFIX + uuid.uuid4().hex[:12]
-        injection = Injection(target, request_id)
+        turn = self._start_turn(target, text, is_created, timeout, accept_timeout)
+
+        # The app server forgot the thread without telling us (or told us and the resume above
+        # did not take). The thread is still on disk; resume it and ask once more.
+        if turn.error and THREAD_NOT_LOADED in turn.error:
+            resumed = self._resume_thread(target, timeout)
+            if resumed.thread_id:
+                turn = self._start_turn(target, text, is_created, timeout, accept_timeout)
+            else:
+                turn.error = (f'{turn.error}; thread/resume did not bring it back: '
+                              f'{resumed.error or "no thread in the response"}')
+
+        return self.settle(turn)
+
+    def _start_turn(self, thread_id: str, text: str, is_created: bool, timeout: int,
+                    accept_timeout: Optional[int]) -> Turn:
+        """Write a `turn/start` and wait for it to be taken - or, for older callers, to end."""
+        turn = Turn(thread_id, is_created)
+        request_id = new_inject_id()
         with self.state_lock:
-            self.injections[request_id] = injection
+            self.injections[request_id] = turn
 
         payload = json.dumps({
             'id': request_id,
             'method': 'turn/start',
             'params': {
-                'threadId': target,
+                'threadId': thread_id,
                 'input': [{'type': 'text', 'text': text}],
                 'clientUserMessageId': request_id,
             },
@@ -381,28 +449,18 @@ class CodexAppServerShim(PanelShim):
         except Exception as e:
             with self.state_lock:
                 self.injections.pop(request_id, None)
-            return {'ok': False, 'error': f'failed to write to app-server: {e}'}
+            turn.finish(f'failed to write to app-server: {e}')
+            return turn
 
-        is_finished = injection.done.wait(timeout=timeout)
-        with self.state_lock:
-            self.injections.pop(request_id, None)
+        if accept_timeout is None:
+            turn.wait(timeout)
+        else:
+            turn.wait(accept_timeout, until_accepted=True)
 
-        if injection.error:
-            return {'ok': False, 'error': injection.error,
-                    'sessionId': target, 'wasCreated': is_created}
-        if not is_finished:
-            return {'ok': False, 'error': f'turn did not complete within {timeout}s',
-                    'sessionId': target, 'turnId': injection.turn_id,
-                    'wasCreated': is_created, 'partial': '\n'.join(injection.messages)}
-
-        return {
-            'ok': True,
-            'sessionId': target,
-            'threadId': target,
-            'turnId': injection.turn_id,
-            'wasCreated': is_created,
-            'reply': injection.messages[-1] if injection.messages else '',
-        }
+        if turn.done.is_set():
+            with self.state_lock:
+                self.injections.pop(request_id, None)
+        return turn
 
     # -------------------------------------------------------------------- run
 

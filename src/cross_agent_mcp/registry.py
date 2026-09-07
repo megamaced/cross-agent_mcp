@@ -192,8 +192,11 @@ def read_busy_lock(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
             os.remove(path)
         return None
 
+    # The holder says how long it may legitimately hold on; a lock without that field was
+    # written by an older build that never held one past two turn budgets.
+    ttl = float(record.get('ttl_seconds') or config.SEND_TIMEOUT_SECONDS * 2)
     is_stale = (not _is_pid_alive(int(record.get('pid', -1)))
-                or time.time() - float(record.get('started_at', 0)) > config.SEND_TIMEOUT_SECONDS * 2)
+                or time.time() - float(record.get('started_at', 0)) > ttl)
     if is_stale:
         with contextlib.suppress(OSError):
             os.remove(path)
@@ -230,11 +233,17 @@ def _release_lock_file(path: str, token: str) -> None:
 
 
 @contextlib.contextmanager
-def busy_lock(agent: str, session_id: str, conversation_id: str) -> Iterator[None]:
+def busy_lock(agent: str, session_id: str, conversation_id: str,
+              ttl_seconds: Optional[float] = None) -> Iterator[None]:
     """Claim a session for the duration of the block.
 
     The claim is an atomic O_EXCL create, so checking whether a session is busy and marking
     it busy are one step: two relays racing for the same session cannot both win.
+
+    `ttl_seconds` is how long the claim stays believable to other processes. A panel delivery
+    now listens for as long as the peer's turn takes, which is longer than two turn budgets;
+    without saying so, another server would judge the lock abandoned and start a second turn
+    on the same session.
     """
     config.ensure_dirs()
     path = _lock_path(agent, session_id)
@@ -246,6 +255,7 @@ def busy_lock(agent: str, session_id: str, conversation_id: str) -> Iterator[Non
         'session_id': session_id,
         'conversation_id': conversation_id,
         'started_at': time.time(),
+        'ttl_seconds': ttl_seconds or config.SEND_TIMEOUT_SECONDS * 2,
     })
 
     is_claimed = False
