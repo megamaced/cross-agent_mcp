@@ -25,11 +25,28 @@ import time
 from typing import Any, Dict, List, Optional
 
 from . import config
-from .panel import INJECT_ID_PREFIX, PanelShim, Turn, new_inject_id
+from .panel import INJECT_ID_PREFIX, PanelShim, Turn, new_inject_id, request_token_in, shim_logger
 
 
 # `codex app-server` has sub-subcommands that are not the stdio server; leave those alone
 APP_SERVER_SUBCOMMANDS = {'daemon', 'proxy', 'generate-ts', 'generate-json-schema', 'help'}
+
+# Requests the app server sends *to* the extension that stop a turn until a human answers.
+# They travel through this pipe as JSON-RPC requests (an id and a method), and the answer
+# comes back the other way with the same id. Between the two the thread is not working; it is
+# waiting for a click, and nothing in its transcript says so.
+APPROVAL_METHODS = (
+    'item/commandExecution/requestApproval',
+    'item/fileChange/requestApproval',
+    'item/permissions/requestApproval',
+    'item/tool/requestUserInput',
+    'mcpServer/elicitation/request',
+    'execCommandApproval',
+    'applyPatchApproval',
+)
+
+# item ids remembered for mapping an approval request (which names only the item) to its thread
+ITEM_MEMORY = 500
 
 # opening a thread is a local operation; it should answer well within this
 THREAD_OPEN_TIMEOUT_SECONDS = 30
@@ -97,6 +114,13 @@ class CodexAppServerShim(PanelShim):
         # only turns the extension itself starts count as the human being here; injected
         # turns are written straight to the child and never pass through the observer
         self.last_user_activity = 0.0
+        # approval prompts the app server has raised and the human has not answered, by the
+        # JSON-RPC id of the request; the item -> thread map resolves the ones that name only
+        # an item; open_turns is which turn each thread is running right now
+        self.approvals: Dict[Any, Dict[str, Any]] = {}
+        self.item_threads: Dict[str, str] = {}
+        self.open_turns: Dict[str, str] = {}
+        self.log = shim_logger(self.agent)
 
     # ------------------------------------------------------------ observation
 
@@ -157,6 +181,12 @@ class CodexAppServerShim(PanelShim):
         through this connection, and targeting one of those is exactly what the app server
         rejects.
         """
+        # the extension answering an approval prompt: a response (an id, no method) whose id
+        # is one the app server asked with
+        if 'method' not in message and message.get('id') is not None:
+            self._settle_approval(message.get('id'), 'answered')
+            return
+
         params = message.get('params')
         if not isinstance(params, dict):
             return
@@ -179,6 +209,50 @@ class CodexAppServerShim(PanelShim):
         if isinstance(thread, dict):
             self._note_thread(thread.get('id'), cwd)
 
+    # ------------------------------------------------------- approval tracking
+
+    def _note_approval(self, request_id: Any, method: str, params: Dict[str, Any]) -> None:
+        thread_id = params.get('threadId') or params.get('conversationId')
+        if not isinstance(thread_id, str):
+            with self.state_lock:
+                thread_id = self.item_threads.get(str(params.get('itemId') or ''))
+        record = {
+            'request_id': request_id,
+            'kind': method,
+            'thread_id': thread_id,
+            'since': time.time(),
+            'detail': str(params.get('command') or params.get('reason') or '')[:120] or None,
+        }
+        with self.state_lock:
+            self.approvals[request_id] = record
+        self.log.info(f'approval requested: id={request_id} kind={method} thread={thread_id}')
+
+    def _settle_approval(self, request_id: Any, how: str) -> None:
+        with self.state_lock:
+            record = self.approvals.pop(request_id, None)
+        if record:
+            self.log.info(f'approval {how}: id={request_id} kind={record.get("kind")} '
+                          f'thread={record.get("thread_id")} after '
+                          f'{round(time.time() - record.get("since", 0))}s')
+
+    def _approval_for(self, thread_id: str) -> Optional[Dict[str, Any]]:
+        with self.state_lock:
+            pending = [a for a in self.approvals.values() if a.get('thread_id') == thread_id]
+        if not pending:
+            return None
+        oldest = min(pending, key=lambda a: a.get('since', 0))
+        return {**oldest, 'waiting_seconds': round(time.time() - oldest.get('since', 0))}
+
+    def _remember_item(self, item: Dict[str, Any], thread_id: Optional[str]) -> None:
+        item_id = item.get('id')
+        if not (isinstance(item_id, str) and isinstance(thread_id, str)):
+            return
+        with self.state_lock:
+            self.item_threads[item_id] = thread_id
+            if len(self.item_threads) > ITEM_MEMORY:
+                for stale in list(self.item_threads)[:len(self.item_threads) - ITEM_MEMORY]:
+                    self.item_threads.pop(stale, None)
+
     def _observe_from_server(self, message: Dict[str, Any]) -> bool:
         """Feed a server message to any waiting injection. Returns True to swallow it."""
         message_id = message.get('id')
@@ -200,6 +274,8 @@ class CodexAppServerShim(PanelShim):
                 if 'error' in message:
                     # refused outright: the message never reached the thread
                     injection.finish(json.dumps(message['error'], ensure_ascii=False)[:500])
+                    self.log.info(f'turn/start refused: injection={injection.injection_id} '
+                                  f'{injection.error}')
                 else:
                     result = message.get('result')
                     turn = result.get('turn') if isinstance(result, dict) else None
@@ -209,26 +285,50 @@ class CodexAppServerShim(PanelShim):
                         injection.turn_id = turn['id']
                     # the response to `turn/start` is the app server taking the message
                     injection.accept()
+                    self.log.info(f'turn/start accepted: injection={injection.injection_id} '
+                                  f'thread={injection.session_id} turn={injection.turn_id}')
             # never hand the extension a response to a request it never sent
             return True
 
         method = message.get('method')
         params = message.get('params') if isinstance(message.get('params'), dict) else {}
 
+        # a request from the app server to the extension: forwarded untouched, but if it is a
+        # prompt for the human, the thread it belongs to is now waiting rather than working
+        if method and message_id is not None:
+            if method in APPROVAL_METHODS:
+                self._note_approval(message_id, method, params)
+            return False
+
+        thread_of_event = params.get('threadId') if isinstance(params.get('threadId'), str) else None
+        turn = params.get('turn') if isinstance(params.get('turn'), dict) else {}
+
         if method == 'thread/started':
             thread = params.get('thread')
             if isinstance(thread, dict) and self._accepts_direct_input(thread):
                 self._note_thread(thread.get('id'), thread.get('cwd'))
-        elif method == 'thread/closed' and isinstance(params.get('threadId'), str):
-            self._mark_unloaded(params['threadId'])
-        elif method == 'thread/status/changed' and isinstance(params.get('threadId'), str):
+        elif method == 'thread/closed' and thread_of_event:
+            self._mark_unloaded(thread_of_event)
+        elif method == 'thread/status/changed' and thread_of_event:
             status = params.get('status') if isinstance(params.get('status'), dict) else {}
             if status.get('type') == 'notLoaded':
-                self._mark_unloaded(params['threadId'])
+                self._mark_unloaded(thread_of_event)
             else:
-                self._touch_thread(params['threadId'])
-        elif isinstance(params.get('threadId'), str):
-            self._touch_thread(params['threadId'])
+                self._touch_thread(thread_of_event)
+        elif thread_of_event:
+            self._touch_thread(thread_of_event)
+
+        if method == 'item/started' and isinstance(params.get('item'), dict):
+            self._remember_item(params['item'], thread_of_event)
+        elif method == 'turn/started' and thread_of_event and isinstance(turn.get('id'), str):
+            with self.state_lock:
+                self.open_turns[thread_of_event] = turn['id']
+        elif method == 'turn/completed' and thread_of_event:
+            with self.state_lock:
+                self.open_turns.pop(thread_of_event, None)
+                stale = [k for k, a in self.approvals.items() if a.get('thread_id') == thread_of_event]
+            for key in stale:
+                self._settle_approval(key, 'closed with the turn')
 
         with self.state_lock:
             waiting = [i for i in self.injections.values() if not i.done.is_set()]
@@ -239,25 +339,52 @@ class CodexAppServerShim(PanelShim):
     def _apply_to_injection(self, injection: Turn, method: Optional[str],
                             params: Dict[str, Any]) -> None:
         turn = params.get('turn') if isinstance(params.get('turn'), dict) else {}
+        is_our_thread = params.get('threadId') == injection.session_id
 
         if method == 'turn/started' and injection.turn_id is None:
-            if params.get('threadId') == injection.session_id and isinstance(turn.get('id'), str):
+            if is_our_thread and isinstance(turn.get('id'), str):
                 injection.turn_id = turn['id']
                 injection.accept()
+                self.log.info(f'turn/started matched: injection={injection.injection_id} '
+                              f'turn={injection.turn_id}')
             return
 
-        if not injection.turn_id:
-            return
+        # The peer's own words are evidence that does not depend on turn ids lining up: a
+        # message on our thread that carries our request token is the answer to our request,
+        # whichever turn the app server filed it under.
+        if (method == 'item/completed' and is_our_thread and injection.token
+                and isinstance(params.get('item'), dict)):
+            item = params['item']
+            if item.get('type') == 'agentMessage' and injection.token in str(item.get('text') or ''):
+                injection.echo = str(item['text'])
+                self.log.info(f'token echoed: injection={injection.injection_id} '
+                              f'turn={params.get("turnId")} (expected {injection.turn_id})')
 
-        if method == 'item/completed' and params.get('turnId') == injection.turn_id:
+        if method == 'item/completed' and injection.turn_id and params.get('turnId') == injection.turn_id:
             item = params.get('item')
             if isinstance(item, dict) and item.get('type') == 'agentMessage' and item.get('text'):
                 injection.messages.append(str(item['text']))
-        elif method == 'turn/completed' and turn.get('id') == injection.turn_id:
+        elif method == 'turn/completed' and is_our_thread:
+            is_matched = bool(injection.turn_id) and turn.get('id') == injection.turn_id
+            if not is_matched and not injection.echo:
+                # some other turn on this thread ended; ours, by the ids, is still running
+                self.log.info(f'turn/completed on our thread but not ours: '
+                              f'injection={injection.injection_id} ended={turn.get("id")} '
+                              f'ours={injection.turn_id} echo=no')
+                return
+            if not is_matched:
+                # the ids never lined up, but the peer answered us in this turn: that is the end
+                injection.messages.append(injection.echo)
+                self.log.info(f'turn/completed settled by token echo: '
+                              f'injection={injection.injection_id} ended={turn.get("id")} '
+                              f'ours={injection.turn_id}')
             error = None
             if turn.get('status') == 'failed' and turn.get('error'):
                 error = json.dumps(turn['error'], ensure_ascii=False)[:500]
             injection.finish(error)
+            self.log.info(f'turn finished: injection={injection.injection_id} '
+                          f'turn={turn.get("id")} messages={len(injection.messages)} '
+                          f'error={bool(error)}')
             with self.state_lock:
                 self.injections = {k: v for k, v in self.injections.items() if v is not injection}
 
@@ -299,12 +426,15 @@ class CodexAppServerShim(PanelShim):
 
     def status(self) -> Dict[str, Any]:
         with self.state_lock:
-            threads = sorted(self.threads.values(),
+            threads = sorted((dict(t) for t in self.threads.values()),
                              key=lambda t: t.get('last_user_activity', t.get('last_seen', 0)),
                              reverse=True)
-            for thread in threads:
-                thread.setdefault('session_id', thread['thread_id'])
+            open_turns = dict(self.open_turns)
             activity = self.last_user_activity
+        for thread in threads:
+            thread.setdefault('session_id', thread['thread_id'])
+            thread['is_turn_active'] = thread['thread_id'] in open_turns
+            thread['awaiting_approval'] = self._approval_for(thread['thread_id'])
         return {'ok': True, 'agent': self.agent, 'pid': os.getpid(), 'threads': threads,
                 'sessions': threads, 'last_user_activity': activity,
                 'argv': self.argv, 'real_binary': self.real_codex}
@@ -429,10 +559,12 @@ class CodexAppServerShim(PanelShim):
     def _start_turn(self, thread_id: str, text: str, is_created: bool, timeout: int,
                     accept_timeout: Optional[int]) -> Turn:
         """Write a `turn/start` and wait for it to be taken - or, for older callers, to end."""
-        turn = Turn(thread_id, is_created)
+        turn = Turn(thread_id, is_created, token=request_token_in(text))
         request_id = new_inject_id()
         with self.state_lock:
             self.injections[request_id] = turn
+        self.log.info(f'turn/start sent: injection={turn.injection_id} request={request_id} '
+                      f'thread={thread_id} token={turn.token} chars={len(text)}')
 
         payload = json.dumps({
             'id': request_id,
@@ -469,6 +601,7 @@ class CodexAppServerShim(PanelShim):
             self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
             text=True, bufsize=1,
         )
+        self.log.info(f'shim started: child pid={self.process.pid} argv={self.argv}')
         self.start_side_channel()
 
         reader = threading.Thread(target=self._pump_server_to_client, daemon=True)
@@ -478,6 +611,7 @@ class CodexAppServerShim(PanelShim):
         code = self.process.wait()
         reader.join(timeout=2)
         self.unregister()
+        self.log.info(f'shim exiting: child exit={code}')
         return code
 
 

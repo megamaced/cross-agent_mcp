@@ -28,12 +28,15 @@ import time
 from typing import Any, Dict, List, Optional
 
 from . import config
-from .panel import PanelShim, Turn, split_wrapper_argv
+from .panel import PanelShim, Turn, shim_logger, split_wrapper_argv
 
 
 # how long an injection waits for a user-initiated turn to finish before giving up
 IDLE_WAIT_SECONDS = 120
 IDLE_POLL_SECONDS = 0.2
+
+# control requests the CLI raises over stdout that stop the turn until a human answers
+APPROVAL_SUBTYPES = ('can_use_tool', 'request_user_dialog')
 
 
 def find_real_claude() -> Optional[str]:
@@ -83,16 +86,33 @@ class ClaudeStreamShim(PanelShim):
         # only the human typing in the panel updates this; injected turns must not, or the
         # bridge would keep reinforcing whichever tab it last wrote to
         self.last_user_activity = 0.0
+        # A permission prompt the CLI has raised and the human has not answered. While it is
+        # up the turn is not working; it is waiting for a click, and from the transcript the
+        # two look the same. The CLI asks over stdout and the extension answers over stdin,
+        # and both pass through here.
+        self.awaiting_approval: Optional[Dict[str, Any]] = None
+        self.log = shim_logger(self.agent)
 
     # ------------------------------------------------------------ observation
 
     def _observe_from_client(self, message: Dict[str, Any]) -> None:
         """A user turn from the panel: nothing may be injected until it finishes."""
-        if message.get('type') == 'user':
+        kind = message.get('type')
+        if kind == 'user':
             with self.state_lock:
                 self.is_turn_active = True
                 self.last_seen = time.time()
                 self.last_user_activity = self.last_seen
+        elif kind in ('control_response', 'control_cancel_request'):
+            # the human answered (or the extension withdrew) the prompt
+            response = message.get('response') if isinstance(message.get('response'), dict) else {}
+            request_id = response.get('request_id') or message.get('request_id')
+            with self.state_lock:
+                pending = self.awaiting_approval
+                if pending and (request_id is None or pending.get('request_id') == request_id):
+                    self.awaiting_approval = None
+            if pending:
+                self.log.info(f'approval answered: request_id={request_id} kind={pending.get("kind")}')
 
     def _observe_from_agent(self, message: Dict[str, Any]) -> None:
         kind = message.get('type')
@@ -104,6 +124,21 @@ class ClaudeStreamShim(PanelShim):
         if isinstance(message.get('cwd'), str):
             self.cwd = message['cwd']
 
+        if kind == 'control_request':
+            request = message.get('request') if isinstance(message.get('request'), dict) else {}
+            subtype = request.get('subtype')
+            if subtype in APPROVAL_SUBTYPES:
+                with self.state_lock:
+                    self.awaiting_approval = {
+                        'request_id': message.get('request_id'),
+                        'kind': subtype,
+                        'tool': request.get('tool_name'),
+                        'since': time.time(),
+                    }
+                self.log.info(f'approval requested: request_id={message.get("request_id")} '
+                              f'kind={subtype} tool={request.get("tool_name")}')
+            return
+
         with self.state_lock:
             injection = self.injection
 
@@ -114,6 +149,7 @@ class ClaudeStreamShim(PanelShim):
         elif kind == 'result':
             with self.state_lock:
                 self.is_turn_active = False
+                self.awaiting_approval = None
                 # the turn is over, so the slot is free whether or not anyone is listening
                 if injection is self.injection:
                     self.injection = None
@@ -123,6 +159,8 @@ class ClaudeStreamShim(PanelShim):
                 error = (str(message.get('result') or 'claude reported an error')[:500]
                          if message.get('is_error') else None)
                 injection.finish(error)
+                self.log.info(f'turn finished: injection={injection.injection_id} '
+                              f'chars={len(injection.result)} error={bool(error)}')
 
     # --------------------------------------------------------------- plumbing
 
@@ -158,10 +196,14 @@ class ClaudeStreamShim(PanelShim):
 
     def status(self) -> Dict[str, Any]:
         with self.state_lock:
+            approval = dict(self.awaiting_approval) if self.awaiting_approval else None
+            if approval:
+                approval['waiting_seconds'] = round(time.time() - approval.get('since', 0))
             sessions = ([{'session_id': self.session_id, 'thread_id': self.session_id,
                           'cwd': self.cwd, 'last_seen': self.last_seen,
                           'last_user_activity': self.last_user_activity,
-                          'is_turn_active': self.is_turn_active}]
+                          'is_turn_active': self.is_turn_active,
+                          'awaiting_approval': approval}]
                         if self.session_id else [])
             activity = self.last_user_activity
         return {'ok': True, 'agent': self.agent, 'pid': os.getpid(), 'sessions': sessions,

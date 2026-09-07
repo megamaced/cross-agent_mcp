@@ -50,6 +50,13 @@ pin으로 이걸 대신하면 안 된다. pin은 "어디로 **보낼**까"를 �
 아니다. 실제로 그렇게 동작하던 시절, 오래된 pin이 회신 주소로 쓰여 답장이 엉뚱한 세션으로
 갔다.
 
+Codex는 한 단계 더 정확하다. 한 창의 Codex 스레드들은 app-server 하나와 MCP 서버 하나를
+**공유**하므로 프로세스 트리는 "이 창"까지만 말해 주고, 그 안의 어느 스레드인지는 못 가른다
+(가장 최근에 활동한 스레드를 고르던 시절, 회신 4통이 묻지도 않은 스레드로 갔다). 대신 Codex는
+MCP 호출마다 `x-codex-turn-metadata`(thread id, turn id)를 실어 보내므로, 브리지는 **호출한
+스레드가 스스로 밝힌 id**를 회신 주소로 쓴다. 이 값이 있으면 추론보다 우선한다. Claude Code는
+대화마다 프로세스가 따로라 트리만으로 충분하다.
+
 주소는 봉투에도 적힌다 — 이메일의 From과 같다.
 
 ```
@@ -337,7 +344,7 @@ app-server 프로토콜에는 클라이언트를 특정 대화로 이동시키�
 | `send_to_codex(message, ...)` | 활성 Codex 스레드에 메시지를 보낸다. **비동기 — 응답은 담기지 않는다** |
 | `send_to_claude(message, ...)` | 활성 Claude 세션에 메시지를 보낸다. **비동기 — 응답은 담기지 않는다** |
 | `list_agent_sessions(agent, scope, cwd, limit)` | 브리지가 찾을 수 있는 세션 목록 (최신순, 활성 여부 포함) |
-| `bridge_status(cwd, scope)` | 실행 주체·해석된 세션·설정·잠금 상태와 **진행 중인 배달** 진단 |
+| `bridge_status(cwd, scope, delivery_id)` | 실행 주체·해석된 세션·설정·잠금 상태와 **진행 중인 배달** 진단. `delivery_id`를 주면 그 배달 하나를 상대 트랜스크립트(`peer_transcript`)와 패널 상태(`peer_panel`: 턴 진행 중인지, **승인 프롬프트에 멈춰 있는지**)까지 다시 읽어 보고한다 |
 | `pin_agent_session(agent, session_id, cwd)` | 특정 세션을 고정(id 또는 대화 이름). 고정해 두면 새 대화가 열리지 않는다. 비우면 해제 |
 
 `send_to_*` 공통 파라미터:
@@ -466,7 +473,9 @@ PYTHONPATH=src .venv/bin/python tests/smoke_mcp.py
 PYTHONPATH=src .venv/bin/python tests/live_roundtrip.py
 ```
 
-로그는 `~/.cross-agent/logs/bridge.log`.
+로그는 `~/.cross-agent/logs/bridge.log`. 패널 셰임은 확장의 stdio 안에서 돌아 터미널이 없으므로
+따로 `~/.cross-agent/logs/shim-claude.log` / `shim-codex.log`에 쓴다 — 주입한 턴이 언제 접수되고
+어느 turn id로 끝났는지, 승인 프롬프트가 언제 떠서 언제 답해졌는지가 여기 남는다.
 
 ## 9. 알려진 제약
 
@@ -500,7 +509,9 @@ PYTHONPATH=src .venv/bin/python tests/live_roundtrip.py
 - **배달 큐는 서버 프로세스 안에만 있다** — 의도적이다. 살아 있는 큐를 디스크에 두면
   재시작 후 **재개가 아니라 재발송**이 된다(워커의 배달은 블로킹 자식 프로세스라 프로세스가
   죽는 순간 상대 턴의 결과가 소실된다). 상대가 같은 작업을 두 번 하게 되므로 유실보다 나쁘다.
-  대신 아래 두 가지로 "답이 있는데 못 읽는" 경우를 없앤다.
+  따라서 **서버를 재시작하면 아직 배달되지 않은 큐는 사라진다** — MCP 서버는 세션(Claude 대화,
+  Codex 창)마다 따로 뜨므로, 재시작 전에 그 세션에서 `bridge_status`로 `deliveries.pending`이
+  비었는지 확인한다. 대신 아래 두 가지로 "답이 있는데 못 읽는" 경우를 없앤다.
   - **완료된 배달 기록은 디스크에 남는다**(`~/.cross-agent/deliveries/`). 서버가 죽어도
     `bridge_status`의 `deliveries.earlier`에서 `reply_preview`로 읽을 수 있다.
     payload와 자식 환경변수는 **저장하지 않는다** — env에는 이 프로세스의 모든 변수가 들어 있다.
@@ -518,6 +529,20 @@ PYTHONPATH=src .venv/bin/python tests/live_roundtrip.py
     초과되면 실패로 닫지 않고 **상대 트랜스크립트를 주기적으로 다시 본다**(기본 15초 간격,
     최대 15분). 상대가 답을 쓰는 순간 수거된다. CLI 경로는 그 턴이 우리 자식 프로세스였고
     타임아웃이 프로세스 그룹을 죽였으므로 더 쓰일 것이 없다 — 기다리지 않고 바로 닫는다.
+  - **셰임이 턴을 놓쳐도 답은 30초 안에 수거된다.** 셰임은 app-server의 완료 이벤트가 자기가
+    시작한 turn id와 맞을 때 턴이 끝났다고 보고하는데, 그 id가 끝내 안 맞는 경우가 있다
+    (다른 턴 뒤에 줄 선 턴, `turn/start` 응답과 실제 실행의 id가 다른 경우). 그러면 셰임은
+    답이 디스크에 완성돼 있는데도 한 시간 내내 "still running"이라 답하고, 그 뒤로 같은 세션행
+    배달이 잠금에 줄을 선다 — 실제로 5통이 그렇게 밀렸다. 그래서 워커는 소켓 대기를 30초
+    단위로 끊고 **그 사이마다 상대 트랜스크립트를 읽어, 요청 토큰을 되돌려 적은 완성 턴이
+    있으면 그 자리에서 답으로 확정한다**(`is_reply_confirmed_by_transcript`). 토큰이 없는
+    완성 턴은 남의 턴일 수 있어 인정하지 않는다. 셰임 자신도 자기 스레드의 메시지에 토큰이
+    되돌아오면 turn id와 무관하게 그 턴의 끝을 자기 턴의 끝으로 잡는다.
+  - **승인 프롬프트에 멈춘 턴은 트랜스크립트로는 안 보인다.** 사람의 클릭을 기다리는 턴은
+    아무것도 쓰지 않으므로, 기록만 보면 일하는 중과 구분되지 않는다. 승인 요청과 그 답은 둘 다
+    셰임을 지나가므로(Claude: `control_request`/`control_response`, Codex:
+    `item/*/requestApproval`류) 셰임이 그걸 세고, `bridge_status(delivery_id=...)`의
+    `peer_panel.awaiting_approval`로 "몇 초째 어떤 프롬프트에 멈춰 있는지"를 보고한다.
   - **요청마다 고유 토큰을 실어 보내고, 되돌아오면 그것으로 짝을 짓는다.** 봉투에
     `request: req_<epoch ms>_<난수 6자>`가 실리고, 회신 지침이 마지막 줄에 그대로 적어 달라고
     요청한다. 토큰이 일치하면 **시각과 무관하게** 그 요청의 답이고, 다른 토큰이면 다른 질문의
@@ -531,7 +556,9 @@ PYTHONPATH=src .venv/bin/python tests/live_roundtrip.py
     아직 일하는 중인 상대에게도 마지막 발화는 있다 — 다음에 뭘 할지 적은 한 줄이다.
     표시 없이 배달하면 완성된 보고와 구분되지 않아 하지도 않은 보고를 근거로 행동하게 된다.
     실제로 그런 일이 있었고, 그래서 회수된 회신에는 `RECOVERED, NOT RECEIVED` 경고와
-    헤더의 `| recovered from transcript` 표시가 붙는다.
+    헤더의 `| recovered from transcript` 표시가 붙는다. **왜 전송이 실패했는지도 같이 적는다**
+    (`transport failure:` 줄) — 패널이 메시지를 거절한 것과 소켓이 인내 시한을 넘긴 것은
+    다음에 할 일이 다른데, 사유 없는 경고만으로는 둘을 가를 수 없었다.
 
   남는 한계는 **상대가 답을 아예 만들지 않은 경우**뿐이며, 그건 어떤 설계로도 복구할 수 없다.
 - **다른 VS Code 창의 세션은 지목해야 닿는다** — `session_id`로 명시하면 다른 창의

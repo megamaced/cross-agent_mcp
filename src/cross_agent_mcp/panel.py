@@ -11,7 +11,9 @@ that lets the bridge find the shim belonging to its own editor window, and the s
 import contextlib
 import json
 import logging
+import logging.handlers
 import os
+import re
 import socket
 import subprocess
 import threading
@@ -78,6 +80,41 @@ def new_inject_id() -> str:
     return INJECT_ID_PREFIX + uuid.uuid4().hex[:12]
 
 
+# The request id the bridge puts in every envelope and asks the peer to echo. A message that
+# carries it back is the answer to that request, whatever else the shim's bookkeeping says.
+REQUEST_TOKEN_PATTERN = re.compile(r'\breq_\d+_[0-9a-f]{6}\b')
+
+
+def request_token_in(text: Optional[str]) -> Optional[str]:
+    match = REQUEST_TOKEN_PATTERN.search(text or '')
+    return match.group(0) if match else None
+
+
+def shim_logger(agent: str) -> logging.Logger:
+    """A per-process log for the shim, so a turn it lost track of can be reconstructed later.
+
+    The shim runs inside the editor's process tree with no terminal; without this, "the shim
+    never reported the turn over" is a dead end. Stdout is the extension's channel and must
+    stay clean, so only a file is used.
+    """
+    log = logging.getLogger(f'cross_agent_mcp.shim.{agent}')
+    if log.handlers:
+        return log
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    try:
+        os.makedirs(config.LOG_DIR, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            config.LOG_DIR + f'shim-{agent}.log', maxBytes=1_000_000, backupCount=2,
+            encoding='utf-8')
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s - pid %(process)d - %(levelname)s - %(message)s'))
+        log.addHandler(handler)
+    except Exception:
+        log.addHandler(logging.NullHandler())
+    return log
+
+
 class Turn:
     """One bridged message and the turn it started, from hand-over to the peer's last word.
 
@@ -93,7 +130,8 @@ class Turn:
       neither  - the message may not have landed at all
     """
 
-    def __init__(self, session_id: Optional[str], is_created: bool) -> None:
+    def __init__(self, session_id: Optional[str], is_created: bool,
+                 token: Optional[str] = None) -> None:
         self.injection_id = new_inject_id()
         self.session_id = session_id
         self.is_created = is_created
@@ -102,6 +140,10 @@ class Turn:
         self.result: Optional[str] = None
         self.error: Optional[str] = None
         self.is_accepted = False
+        # the request id inside the message, and the peer's message that echoed it back - the
+        # one piece of evidence that does not depend on matching the app server's turn ids
+        self.token = token
+        self.echo: Optional[str] = None
         self.started_at = time.time()
         self.finished_at: Optional[float] = None
         # `progress` fires on acceptance and on completion; `done` only on completion

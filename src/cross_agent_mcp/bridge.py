@@ -62,8 +62,12 @@ PANEL_ACCEPT_SECONDS = 45
 
 # One `await` call to the shim covers this much of the peer's turn; the bridge then asks again
 # until the turn ends or patience runs out. Shorter than a turn on purpose: a socket that dies
-# mid-turn is noticed within this, not at the end of the whole budget.
-PANEL_AWAIT_CHUNK_SECONDS = 120
+# mid-turn is noticed within this, not at the end of the whole budget - and between two calls
+# the peer's transcript is read, so a turn the shim failed to see end is noticed within this
+# too, instead of at the end of the whole budget. That happened: a peer answered eight seconds
+# after taking the message, the shim never reported the turn over, and the delivery - and the
+# lock, and five messages queued behind it - sat for the full hour.
+PANEL_AWAIT_CHUNK_SECONDS = 30
 
 AGENT_LABEL: Dict[str, str] = {
     config.AGENT_CLAUDE: 'Claude Code',
@@ -156,13 +160,16 @@ def _build_envelope(sender: str, target: str, conversation_id: str, hop: int, re
 
 def _build_reply_envelope(sender: str, target: str, conversation_id: str, hop: int,
                           remaining: int, reply: str, reply_to: Optional[str] = None,
-                          is_recovered: bool = False) -> str:
+                          is_recovered: bool = False,
+                          failure_reason: Optional[str] = None) -> str:
     """Wrap a peer's answer so the original sender reads it as an answer, not a new request.
 
-    A recovered answer says so. Recovery reads the peer's last message at the moment the
-    transport gave up, and a peer that is still working has a last message too - a line about
-    what it is doing next. Delivered unmarked, that reads exactly like a finished answer, and
-    the reader acts on a report that was never made.
+    A recovered answer says so, and says why the transport failed. Recovery reads the peer's
+    last message at the moment the transport gave up, and a peer that is still working has a
+    last message too - a line about what it is doing next. Delivered unmarked, that reads
+    exactly like a finished answer, and the reader acts on a report that was never made. And
+    delivered without the reason, the reader cannot tell a panel that refused the message from
+    a socket that merely ran out of patience, which are different things to do next.
     """
     sender_label = AGENT_LABEL.get(sender, sender)
     reply_tool = PEER_TOOL.get(target, 'the cross-agent tool')
@@ -183,7 +190,8 @@ def _build_reply_envelope(sender: str, target: str, conversation_id: str, hop: i
             f'  out of its transcript: it is whatever {sender_label} had last said at that\n'
             '  moment, which may be a note about what it was still doing rather than its\n'
             '  answer. Treat it as finished only if it reads like a finished answer, and check\n'
-            f'  with {sender_label} before acting on it as a report.\n')
+            f'  with {sender_label} before acting on it as a report.\n'
+            f'- Why the transport failed: {failure_reason or "not recorded"}\n')
     else:
         provenance = '- This is the answer to a message you relayed earlier.\n'
 
@@ -193,7 +201,8 @@ def _build_reply_envelope(sender: str, target: str, conversation_id: str, hop: i
         f'{_address_line(sender, reply_to)}'
         f'conversation: {conversation_id} | answering hop {hop}/{config.MAX_HOPS}'
         f'{" | recovered from transcript" if is_recovered else ""}\n'
-        '\n'
+        + (f'transport failure: {failure_reason}\n' if is_recovered and failure_reason else '')
+        + '\n'
         f'{reply}\n'
         '\n'
         '=== NOTE ===\n'
@@ -414,16 +423,45 @@ def _raise_for_panel_failure(response: Dict[str, Any]) -> None:
     raise BridgeError(f'IDE panel relay failed: {error}')
 
 
+def _transcript_answer(target_agent: Optional[str], session_id: Optional[str],
+                       after: float, token: Optional[str]) -> Optional[str]:
+    """The peer's finished answer to *this* request, read from its transcript - or None.
+
+    Only a turn that echoes the request token counts here. While the transport is still
+    alive, a merely fresh finished turn is not proof: the thread may just have finished
+    somebody else's turn. The token is proof, wherever the shim's own bookkeeping got to.
+    """
+    if not (target_agent and session_id and token):
+        return None
+    try:
+        progress = discovery.peer_progress(target_agent, session_id, after=after, token=token)
+    except Exception as e:
+        logger.debug(f'_transcript_answer [exception]: {session_id} {e}')
+        return None
+
+    answer = (progress or {}).get('answer')
+    if answer and discovery.request_token_in(answer) == token:
+        return answer
+    return None
+
+
 def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, Any],
                     timeout: int, cwd: str, title: Optional[str] = None,
                     on_accepted: Optional[Any] = None, wants_result: bool = True,
-                    patience: Optional[float] = None) -> Dict[str, Any]:
+                    patience: Optional[float] = None, target_agent: Optional[str] = None,
+                    request_token: Optional[str] = None) -> Dict[str, Any]:
     """Deliver through the editor panel shim, so the exchange shows up in the panel.
 
     The hand-over and the answer are two waits, not one. The shim answers the first as soon as
     the peer has the message; the answer is then collected with as many `await` calls as the
     turn takes, up to `patience`. A single socket wait for the whole turn was how a 600s
     deadline cut off turns that ran 500..820s, and the peer kept working after each cut.
+
+    Between two awaits the peer's transcript is read as well. The shim reports the turn over
+    when it sees the app server's completion event for the turn it started; when that event
+    does not match - a turn queued behind another, an id the shim never learned - the shim
+    keeps saying "still running" while the answer sits finished on disk. A finished turn that
+    echoes the request token is that answer, and ends the wait right there.
 
     A shim from before this protocol ignores the acceptance deadline and answers when the turn
     ends, exactly as before; nothing here depends on the new fields being present.
@@ -444,6 +482,22 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
                 # a reply is complete the moment it lands; nobody reads what the peer says next
                 break
 
+        if response.get('accepted'):
+            confirmed = _transcript_answer(
+                target_agent, response.get('sessionId') or session_id, started, request_token)
+            if confirmed is not None:
+                logger.info(f'_call_via_panel [confirmed by transcript]: {request_token} - the '
+                            'peer finished and echoed the request while the shim still reported '
+                            'the turn as running')
+                return {
+                    'session_id': response.get('sessionId') or session_id or '',
+                    'reply': confirmed.strip(),
+                    'is_new_session': bool(response.get('wasCreated')),
+                    'is_reply_confirmed_by_transcript': True,
+                    'usage': None,
+                    'cost_usd': None,
+                }
+
         remaining = started + budget - time.time()
         if remaining <= 0:
             raise BridgeError(
@@ -458,6 +512,7 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
         'session_id': response.get('sessionId') or session_id or '',
         'reply': str(response.get('reply') or '').strip(),
         'is_new_session': bool(response.get('wasCreated')),
+        'is_reply_confirmed_by_transcript': False,
         'usage': None,
         'cost_usd': None,
     }
@@ -714,6 +769,10 @@ def _deliver(job: outbox.Job) -> Dict[str, Any]:
         on_accepted=lambda response: job.mark_accepted(response.get('sessionId')),
         wants_result=job.wants_reply,
         patience=max(job.timeout, config.PANEL_PATIENCE_SECONDS),
+        # a request carries a token the peer echoes; that is what lets the transcript settle a
+        # turn the shim lost track of. A reply carries none, and wants no answer anyway.
+        target_agent=job.target_agent,
+        request_token=job.delivery_id if job.wants_reply else None,
     )
 
     if result['is_new_session'] and result['session_id']:
@@ -757,7 +816,8 @@ def _build_reply_job(job: outbox.Job, reply: str) -> Optional[outbox.Job]:
     answering_id = job.resolved_session_id or job.target_session_id
     payload = _build_reply_envelope(job.target_agent, job.sender_agent, job.conversation_id,
                                     hop, remaining, reply, answering_id,
-                                    is_recovered=job.is_reply_recovered)
+                                    is_recovered=job.is_reply_recovered,
+                                    failure_reason=job.error if job.is_reply_recovered else None)
 
     # resolved fresh: the sender's panel may have opened, closed or moved during the turn
     panel: Optional[Dict[str, Any]] = None
@@ -904,7 +964,41 @@ def delivery_report(delivery_id: str) -> Dict[str, Any]:
                                              'kept, so the answer is not filtered by time; check '
                                              'it against the request yourself.')),
             }
+        report['peer_panel'] = panel_state(target_agent, target_session)
     return report
+
+
+def panel_state(agent: str, session_id: str) -> Dict[str, Any]:
+    """What the panel hosting a session knows that its transcript cannot say.
+
+    A turn waiting on a human - a command to approve, a question to answer - writes nothing to
+    the transcript while it waits, so from the transcript it is indistinguishable from a turn
+    that is working. The shim sees the approval request go out and the answer come back, and
+    that is the difference between "still going" and "stuck until somebody clicks".
+    """
+    if not uihook.is_enabled():
+        return {'note': 'panel integration is off'}
+    try:
+        live = uihook.find_live_session(agent, session_id)
+    except Exception as e:
+        return {'error': f'{type(e).__name__}: {e}'}
+    if not live:
+        return {'is_open_in_a_panel': False,
+                'note': 'not open in any panel this bridge can see; only the transcript speaks '
+                        'for it'}
+
+    approval = live.get('awaiting_approval')
+    return {
+        'is_open_in_a_panel': True,
+        'shim_pid': live.get('shim_pid'),
+        'is_turn_active': live.get('is_turn_active'),
+        'is_awaiting_approval': bool(approval),
+        'awaiting_approval': approval,
+        'note': ('AWAITING APPROVAL: the peer\'s turn is paused on a prompt only the human can '
+                 'answer. It is not working and will not finish until someone approves it in '
+                 'the panel.' if approval else
+                 'the panel reports no pending approval prompt for this session'),
+    }
 
 
 def _own_session_id(sender_agent: str) -> Optional[str]:
@@ -934,11 +1028,18 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
                  is_new_session: bool = False, scope: Optional[str] = None,
                  cwd: Optional[str] = None, timeout: Optional[int] = None,
                  conversation_id: Optional[str] = None, is_raw: bool = False,
-                 allows_same_agent: bool = False) -> Dict[str, Any]:
+                 allows_same_agent: bool = False,
+                 caller_session_id: Optional[str] = None) -> Dict[str, Any]:
     """Queue `message` for the peer agent's active session and return once it is accepted.
 
     The peer's answer is not this function's return value. It arrives later as a message in
     the caller's own session, delivered by the outbox.
+
+    `caller_session_id` is the session the calling agent *says* it is in - Codex names its
+    thread on every tool call. It outranks anything inferred: every Codex thread of a window
+    shares one app server and one MCP server, so "the session hosting this process" is a
+    whole window's worth of threads, and picking the busiest of them addressed four replies
+    to a thread that had not asked.
     """
     started_at = time.time()
     config.ensure_dirs()
@@ -962,7 +1063,9 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
     identity = caller.detect_caller()
     sender_agent = identity['agent']
 
-    self_session_id = _own_session_id(sender_agent)
+    self_session_id = caller_session_id or _own_session_id(sender_agent)
+    if caller_session_id:
+        logger.info(f'send_message [caller named itself]: {sender_agent} {caller_session_id}')
 
     # Naming a session and asking for a brand new one are opposite intentions. Honouring both
     # would open a fresh conversation while the caller believes it reached the one it named.

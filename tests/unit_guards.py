@@ -26,6 +26,16 @@ def check(label: str, condition: bool, detail: str = '') -> None:
         FAILURES.append(label)
 
 
+def _quiet_log():
+    """A logger for shims built without __init__; keeps test runs out of the real shim log."""
+    import logging
+    log = logging.getLogger('cross_agent_mcp.test.shim')
+    log.propagate = False
+    if not log.handlers:
+        log.addHandler(logging.NullHandler())
+    return log
+
+
 # ------------------------------------------------- busy lock is really exclusive
 
 def test_busy_lock_is_exclusive() -> None:
@@ -204,8 +214,13 @@ def test_subagent_threads_are_rejected() -> None:
     shim = CodexAppServerShim.__new__(CodexAppServerShim)
     shim.threads = {}
     shim.injections = {}
+    shim.opens = {}
+    shim.approvals = {}
+    shim.item_threads = {}
+    shim.open_turns = {}
     shim.state_lock = threading.Lock()
     shim.last_user_activity = 0.0
+    shim.log = _quiet_log()
 
     shim._observe_from_server({'method': 'item/started',
                                'params': {'threadId': 'sub-agent-thread'}})
@@ -1667,9 +1682,34 @@ def _codex_shim():
     shim.injections = {}
     shim.opens = {}
     shim.turns = {}
+    shim.approvals = {}
+    shim.item_threads = {}
+    shim.open_turns = {}
     shim.state_lock = threading.Lock()
     shim.stdin_lock = threading.Lock()
     shim.last_user_activity = 0.0
+    shim.argv = []
+    shim.real_codex = ''
+    shim.log = _quiet_log()
+    return shim
+
+
+def _claude_shim(session_id: str = 'sess-1'):
+    from cross_agent_mcp.claude_shim import ClaudeStreamShim
+    shim = ClaudeStreamShim.__new__(ClaudeStreamShim)
+    shim.session_id = session_id
+    shim.cwd = '/w'
+    shim.is_turn_active = False
+    shim.injection = None
+    shim.turns = {}
+    shim.awaiting_approval = None
+    shim.state_lock = threading.Lock()
+    shim.stdin_lock = threading.Lock()
+    shim.last_seen = time.time()
+    shim.last_user_activity = 0.0
+    shim.argv = []
+    shim.real_binary = ''
+    shim.log = _quiet_log()
     return shim
 
 
@@ -1771,10 +1811,12 @@ def test_the_claude_shim_hands_over_and_reports_later() -> None:
     shim.is_turn_active = False
     shim.injection = None
     shim.turns = {}
+    shim.awaiting_approval = None
     shim.state_lock = threading.Lock()
     shim.stdin_lock = threading.Lock()
     shim.last_seen = time.time()
     shim.last_user_activity = 0.0
+    shim.log = _quiet_log()
     writes = []
     shim.write_to_child = lambda payload: writes.append(json.loads(payload))
 
@@ -1863,6 +1905,274 @@ def test_delivery_report_rereads_the_peer_transcript() -> None:
             bridge.discovery.peer_progress = original_progress
 
 
+# ------------------------------------- the koppa report: four defects seen from the other side
+
+def test_a_finished_turn_that_echoes_the_request_ends_the_wait() -> None:
+    """Defect 1: the shim said "still running" for an hour while the answer - request id and
+    all - sat finished in the transcript, and five messages queued up behind the lock."""
+    original = (bridge.uihook.send, bridge.uihook.await_turn, bridge.discovery.peer_progress)
+    awaits = []
+    asked = []
+    bridge.uihook.send = lambda *a, **kw: {
+        'ok': False, 'pending': True, 'accepted': True, 'injectionId': 'inj-1',
+        'sessionId': 'peer-sid'}
+
+    def never_ends(shim, injection_id, timeout):
+        awaits.append(timeout)
+        time.sleep(0.01)
+        return {'ok': False, 'pending': True, 'accepted': True, 'injectionId': injection_id,
+                'sessionId': 'peer-sid'}
+
+    def progress(agent, session_id, after=None, token=None):
+        asked.append((agent, session_id, token))
+        return {'answer': f'{token} 등록 완료' if token else '등록 완료',
+                'answered_at': (after or 0) + 1, 'is_working': False}
+
+    bridge.uihook.await_turn = never_ends
+    bridge.discovery.peer_progress = progress
+    try:
+        result = bridge._call_via_panel('do it', 'peer-sid', {'socket': '/s'}, 600, '/w',
+                                        wants_result=True, patience=5, target_agent='codex',
+                                        request_token='req_1_abcdef')
+        check('a finished turn that echoes the request id is the answer',
+              result['reply'] == 'req_1_abcdef 등록 완료'
+              and result['is_reply_confirmed_by_transcript'] is True, str(result)[:200])
+        check('found without waiting for the shim to say so', not awaits, str(awaits))
+        check('and looked up by the request id',
+              asked and asked[0] == ('codex', 'peer-sid', 'req_1_abcdef'), str(asked))
+
+        # a finished turn that does not echo the request is somebody else's turn
+        bridge.discovery.peer_progress = lambda agent, session_id, after=None, token=None: {
+            'answer': '다른 턴의 답', 'answered_at': 1.0, 'is_working': False}
+        try:
+            bridge._call_via_panel('do it', 'peer-sid', {'socket': '/s'}, 600, '/w',
+                                   wants_result=True, patience=0.05, target_agent='codex',
+                                   request_token='req_1_abcdef')
+            check('a finished turn without the echo does not end the wait', False, 'nothing raised')
+        except bridge.BridgeError as e:
+            check('a finished turn without the echo does not end the wait',
+                  'still running' in str(e), str(e))
+
+        # with no request id there is nothing to match, so the transcript is not consulted
+        asked.clear()
+        bridge.discovery.peer_progress = lambda *a, **kw: asked.append(kw) or {'answer': 'x'}
+        try:
+            bridge._call_via_panel('do it', 'peer-sid', {'socket': '/s'}, 600, '/w',
+                                   wants_result=True, patience=0.05, target_agent='codex',
+                                   request_token=None)
+        except bridge.BridgeError:
+            pass
+        check('without a request id the transcript is not consulted', not asked, str(asked))
+        check('and a shim that lost the turn is asked again within half a minute',
+              bridge.PANEL_AWAIT_CHUNK_SECONDS <= 30, str(bridge.PANEL_AWAIT_CHUNK_SECONDS))
+    finally:
+        bridge.uihook.send, bridge.uihook.await_turn, bridge.discovery.peer_progress = original
+
+
+def test_the_caller_named_by_its_metadata_is_the_return_address() -> None:
+    """Defect 2: four replies went to the busiest thread of the window instead of the thread
+    that asked. Codex names its thread on every tool call; that name outranks the guess."""
+    from cross_agent_mcp import server
+    check('codex names its thread on every tool call',
+          server.caller_session_from_meta(
+              {'x-codex-turn-metadata': {'thread_id': 'thr-9', 'turn_id': 't-1'}}) == 'thr-9')
+    check('claude attaches nothing of the kind, and that is fine',
+          server.caller_session_from_meta({'progressToken': 3}) is None
+          and server.caller_session_from_meta(None) is None)
+
+    captured = []
+    originals = (bridge.caller.detect_caller, bridge._own_session_id, bridge._resolve_target,
+                 outbox.OUTBOX.submit, outbox.OUTBOX.await_outcome, bridge.registry.touch_pin)
+    bridge.caller.detect_caller = lambda: {'agent': config.AGENT_CODEX, 'chain': []}
+    bridge._own_session_id = lambda agent: 'busiest-thread'
+    bridge._resolve_target = lambda *a, **kw: {
+        'agent': config.AGENT_CLAUDE, 'session_id': 'peer-sid', 'cwd': None,
+        'source': 'ide-panel', 'ui_shim': {'socket': '/s', 'pid': 1}}
+    outbox.OUTBOX.submit = lambda job: captured.append(job) or job.delivery_id
+    outbox.OUTBOX.await_outcome = lambda job: None
+    bridge.registry.touch_pin = lambda agent, cwd: None
+    try:
+        bridge.send_message(config.AGENT_CLAUDE, 'question', caller_session_id='thr-9')
+        check('the thread that called is the return address',
+              captured[-1].sender_session_id == 'thr-9', str(captured[-1].sender_session_id))
+        check('and is what the envelope tells the peer to answer',
+              'thr-9' in captured[-1].payload and 'busiest-thread' not in captured[-1].payload)
+
+        bridge.send_message(config.AGENT_CLAUDE, 'question')
+        check('a caller that does not name itself is placed by the process tree, as before',
+              captured[-1].sender_session_id == 'busiest-thread',
+              str(captured[-1].sender_session_id))
+    finally:
+        (bridge.caller.detect_caller, bridge._own_session_id, bridge._resolve_target,
+         outbox.OUTBOX.submit, outbox.OUTBOX.await_outcome, bridge.registry.touch_pin) = originals
+
+
+def test_a_recovered_reply_says_why_the_transport_failed() -> None:
+    """Defect 3: "RECOVERED, NOT RECEIVED" with no reason left the reader unable to tell a panel
+    that refused the message from a socket that ran out of patience."""
+    reason = 'IDE panel relay failed: the peer turn is still running after 3600s'
+    told = bridge._build_reply_envelope('codex', 'claude', 'conv_x', 1, 3, '답', 'sid',
+                                        is_recovered=True, failure_reason=reason)
+    check('a recovered reply names the transport failure in its header',
+          f'transport failure: {reason}' in told, told)
+    check('and again in the note', f'Why the transport failed: {reason}' in told)
+
+    untold = bridge._build_reply_envelope('codex', 'claude', 'conv_x', 1, 3, '답', 'sid',
+                                          is_recovered=True)
+    check('a reason that was not recorded says so rather than nothing',
+          'Why the transport failed: not recorded' in untold)
+    plain = bridge._build_reply_envelope('codex', 'claude', 'conv_x', 1, 3, '답', 'sid')
+    check('a reply that arrived normally carries no failure talk',
+          'transport failure' not in plain and 'Why the transport failed' not in plain)
+
+    original = discovery.find_session
+    discovery.find_session = lambda agent, session_id: None
+    try:
+        request = outbox.Job(
+            target_agent=config.AGENT_CODEX, target_session_id='peer-sid', payload='x',
+            run_cwd='/w', pin_cwd='/w', env={}, timeout=5, ui_shim=None, title=None,
+            conversation_id='conv_r', hop=1, sender_agent=config.AGENT_CLAUDE,
+            sender_session_id='sender-sid', wants_reply=True, summary='req')
+        request.is_reply_recovered = True
+        request.error = 'BridgeError: ' + reason
+        reply = bridge._build_reply_job(request, '확인 중입니다')
+        check('the job\'s recorded error is the reason the reader gets',
+              reply is not None and f'Why the transport failed: BridgeError: {reason}' in reply.payload,
+              str(reply and reply.payload)[:300])
+    finally:
+        discovery.find_session = original
+
+
+def test_the_claude_shim_sees_a_turn_waiting_on_a_human() -> None:
+    """Defect 4: a turn paused on a permission prompt writes nothing, so from the transcript
+    it looks exactly like a turn that is working. The shim sees the prompt go by."""
+    shim = _claude_shim()
+    shim._observe_from_client({'type': 'user', 'message': {'role': 'user', 'content': 'go'}})
+    shim._observe_from_agent({'type': 'control_request', 'request_id': 'r1',
+                              'request': {'subtype': 'can_use_tool', 'tool_name': 'Bash'}})
+    session = shim.status()['sessions'][0]
+    check('a permission prompt marks the session as waiting on a human',
+          (session.get('awaiting_approval') or {}).get('kind') == 'can_use_tool'
+          and session['awaiting_approval'].get('tool') == 'Bash'
+          and session.get('is_turn_active') is True, str(session)[:200])
+    check('and says how long it has waited',
+          'waiting_seconds' in (session.get('awaiting_approval') or {}), str(session)[:200])
+
+    shim._observe_from_client({'type': 'control_response',
+                               'response': {'request_id': 'r1', 'subtype': 'success'}})
+    check('the human answering clears it',
+          shim.status()['sessions'][0].get('awaiting_approval') is None)
+
+    shim._observe_from_agent({'type': 'control_request', 'request_id': 'r2',
+                              'request': {'subtype': 'request_user_dialog'}})
+    check('a dialog counts too',
+          (shim.status()['sessions'][0].get('awaiting_approval') or {}).get('kind')
+          == 'request_user_dialog')
+    shim._observe_from_agent({'type': 'result', 'session_id': 'sess-1', 'result': 'done'})
+    session = shim.status()['sessions'][0]
+    check('the turn ending clears it whatever happened to the prompt',
+          session.get('awaiting_approval') is None and session.get('is_turn_active') is False,
+          str(session)[:200])
+
+    shim._observe_from_agent({'type': 'control_request', 'request_id': 'r3',
+                              'request': {'subtype': 'initialize'}})
+    check('a control request that is not a prompt is not a wait',
+          shim.status()['sessions'][0].get('awaiting_approval') is None)
+
+
+def test_the_codex_shim_sees_a_turn_waiting_on_a_human() -> None:
+    shim = _codex_shim()
+    shim._observe_from_client({'method': 'turn/start', 'params': {'threadId': 'thr-1'}})
+    shim._observe_from_server({'method': 'turn/started',
+                               'params': {'threadId': 'thr-1', 'turn': {'id': 'turn-1'}}})
+    shim._observe_from_server({'method': 'item/started', 'params': {
+        'threadId': 'thr-1', 'item': {'id': 'item-1', 'type': 'commandExecution'}}})
+
+    is_swallowed = shim._observe_from_server({
+        'id': 7, 'method': 'item/commandExecution/requestApproval',
+        'params': {'itemId': 'item-1', 'threadId': 'thr-1', 'command': 'rm -rf build'}})
+    check('an approval request still reaches the extension', is_swallowed is False)
+    thread = shim.status()['threads'][0]
+    check('and the thread is reported as waiting on a human',
+          thread.get('is_turn_active') is True
+          and (thread.get('awaiting_approval') or {}).get('kind')
+          == 'item/commandExecution/requestApproval', str(thread)[:240])
+
+    shim._observe_from_server({'id': 8, 'method': 'item/permissions/requestApproval',
+                               'params': {'itemId': 'item-1'}})
+    check('a request naming only the item is tied to its thread through the item',
+          shim.approvals[8]['thread_id'] == 'thr-1', str(shim.approvals.get(8)))
+
+    shim._observe_from_client({'id': 7, 'result': {'decision': 'accept'}})
+    check('the human answering clears that prompt and no other',
+          7 not in shim.approvals and 8 in shim.approvals, str(list(shim.approvals)))
+
+    shim._observe_from_server({'method': 'turn/completed', 'params': {
+        'threadId': 'thr-1', 'turn': {'id': 'turn-1', 'status': 'completed'}}})
+    thread = shim.status()['threads'][0]
+    check('the turn ending clears the rest',
+          thread.get('is_turn_active') is False and thread.get('awaiting_approval') is None,
+          str(thread)[:240])
+
+    is_swallowed = shim._observe_from_server({'id': 9, 'method': 'item/tool/call',
+                                              'params': {'threadId': 'thr-1'}})
+    check('a server request that is not a prompt is forwarded and not counted',
+          is_swallowed is False and not shim.approvals)
+
+
+def test_a_codex_turn_is_settled_by_its_echo_when_the_ids_never_match() -> None:
+    """The mechanism behind defect 1: the app server answered `turn/start` with one id and ran
+    the turn under another, so no completion event ever matched and the shim waited forever.
+    The peer's own words carry the request id, and those are evidence enough."""
+    shim = _codex_shim()
+    sent = []
+
+    def write(payload):
+        message = json.loads(payload)
+        sent.append(message)
+        threading.Timer(0.01, shim._observe_from_server, args=(
+            {'id': message['id'], 'result': {'turn': {'id': 'turn-A'}}},)).start()
+
+    shim.write_to_child = write
+    shim._observe_from_client({'method': 'turn/start', 'params': {'threadId': 'thr-1'}})
+    receipt = shim.inject('hello req_5_abcdef', 'thr-1', timeout=5, accept_timeout=2)
+    check('the message is taken under one turn id',
+          receipt.get('accepted') is True and receipt.get('pending') is True
+          and receipt.get('turnId') == 'turn-A', str(receipt)[:200])
+
+    # ...and run under another; nothing the app server sends will ever say "turn-A"
+    shim._observe_from_server({'method': 'turn/started',
+                               'params': {'threadId': 'thr-1', 'turn': {'id': 'turn-B'}}})
+    shim._observe_from_server({'method': 'turn/completed', 'params': {
+        'threadId': 'thr-1', 'turn': {'id': 'turn-C', 'status': 'completed'}}})
+    still = shim.await_turn(receipt['injectionId'], timeout=0.05)
+    check('another turn ending on the thread does not end ours',
+          still.get('pending') is True, str(still)[:200])
+
+    shim._observe_from_server({'method': 'item/completed', 'params': {
+        'threadId': 'thr-1', 'turnId': 'turn-B',
+        'item': {'type': 'agentMessage', 'text': 'req_5_abcdef 처리 완료'}}})
+    shim._observe_from_server({'method': 'turn/completed', 'params': {
+        'threadId': 'thr-1', 'turn': {'id': 'turn-B', 'status': 'completed'}}})
+    done = shim.await_turn(receipt['injectionId'], timeout=1)
+    check('a turn that echoed our request id ends ours when it ends',
+          done.get('ok') is True and done.get('reply') == 'req_5_abcdef 처리 완료',
+          str(done)[:200])
+    check('and the slot is released', not shim.injections, str(shim.injections))
+
+    # an echo on another thread is somebody else quoting us, not our answer
+    receipt = shim.inject('again req_6_abcdef', 'thr-1', timeout=5, accept_timeout=2)
+    shim._observe_from_client({'method': 'turn/start', 'params': {'threadId': 'thr-2'}})
+    shim._observe_from_server({'method': 'item/completed', 'params': {
+        'threadId': 'thr-2', 'turnId': 'turn-Z',
+        'item': {'type': 'agentMessage', 'text': 'req_6_abcdef 를 봤다'}}})
+    shim._observe_from_server({'method': 'turn/completed', 'params': {
+        'threadId': 'thr-2', 'turn': {'id': 'turn-Z', 'status': 'completed'}}})
+    still = shim.await_turn(receipt['injectionId'], timeout=0.05)
+    check('an echo on another thread does not count', still.get('pending') is True,
+          str(still)[:200])
+
+
 def contextlib_suppress():
     import contextlib
     return contextlib.suppress(Exception)
@@ -1930,6 +2240,12 @@ def run_all() -> None:
     test_the_claude_shim_hands_over_and_reports_later()
     test_a_long_panel_turn_keeps_its_busy_lock()
     test_delivery_report_rereads_the_peer_transcript()
+    test_a_finished_turn_that_echoes_the_request_ends_the_wait()
+    test_the_caller_named_by_its_metadata_is_the_return_address()
+    test_a_recovered_reply_says_why_the_transport_failed()
+    test_the_claude_shim_sees_a_turn_waiting_on_a_human()
+    test_the_codex_shim_sees_a_turn_waiting_on_a_human()
+    test_a_codex_turn_is_settled_by_its_echo_when_the_ids_never_match()
 
 if __name__ == '__main__':
     # Delivery records are written by any finished job, so a test run left rows like

@@ -14,6 +14,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
 
 from . import bridge, caller, config, discovery, outbox, registry, uihook
 
@@ -62,9 +63,45 @@ async def _run_blocking(func, *args, **kwargs) -> Any:
     return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
 
 
-async def _send(target_agent: str, **kwargs) -> Dict[str, Any]:
+def _request_meta(ctx: Optional[Context]) -> Optional[Dict[str, Any]]:
+    """Whatever the calling client attached to this request, as a plain dict."""
     try:
-        return await _run_blocking(bridge.send_message, target_agent, **kwargs)
+        if ctx is None:
+            return None
+        meta = ctx.request_context.meta
+        if meta is None:
+            return None
+        if hasattr(meta, 'model_dump'):
+            return meta.model_dump(by_alias=True)
+        return dict(meta)
+    except Exception:
+        return None
+
+
+def caller_session_from_meta(meta: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The session the caller says it is in.
+
+    Codex attaches `x-codex-turn-metadata` to every MCP tool call: the thread id, the turn
+    id, when the turn began. That is the calling thread, exactly - not the busiest thread of
+    the window, which is all the process tree can tell when several threads share one
+    app server. Claude Code attaches nothing of the kind, and does not need to: it runs one
+    process per conversation, so the process tree already names the session.
+    """
+    if not isinstance(meta, dict):
+        return None
+    turn_meta = meta.get('x-codex-turn-metadata')
+    if isinstance(turn_meta, dict):
+        thread_id = turn_meta.get('thread_id') or turn_meta.get('session_id')
+        if isinstance(thread_id, str) and thread_id:
+            return thread_id
+    return None
+
+
+async def _send(target_agent: str, ctx: Optional[Context] = None, **kwargs) -> Dict[str, Any]:
+    try:
+        caller_session_id = caller_session_from_meta(_request_meta(ctx))
+        return await _run_blocking(bridge.send_message, target_agent,
+                                   caller_session_id=caller_session_id, **kwargs)
     except bridge.BridgeError as e:
         logger.error(f'_send [exception]: {target_agent} {e}')
         return {'ok': False, 'target_agent': target_agent, 'error': str(e)}
@@ -107,6 +144,7 @@ async def send_to_codex(
     timeout: Optional[int] = None,
     conversation_id: Optional[str] = None,
     raw: bool = False,
+    ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """Args:
     message: What to ask Codex. Be self-contained; Codex cannot see this conversation.
@@ -123,7 +161,7 @@ async def send_to_codex(
     raw: Send the message verbatim, without the bridge envelope.
     """
     return await _send(
-        config.AGENT_CODEX, message=message, session_id=session_id,
+        config.AGENT_CODEX, ctx, message=message, session_id=session_id,
         is_new_session=new_session, scope=scope, cwd=cwd, timeout=timeout,
         conversation_id=conversation_id, is_raw=raw,
     )
@@ -155,6 +193,7 @@ async def send_to_claude(
     conversation_id: Optional[str] = None,
     raw: bool = False,
     allow_same_agent: bool = False,
+    ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """Args:
     message: What to ask Claude. Be self-contained; Claude cannot see this conversation.
@@ -172,7 +211,7 @@ async def send_to_claude(
     allow_same_agent: Allow a Claude session to message another Claude session.
     """
     return await _send(
-        config.AGENT_CLAUDE, message=message, session_id=session_id,
+        config.AGENT_CLAUDE, ctx, message=message, session_id=session_id,
         is_new_session=new_session, scope=scope, cwd=cwd, timeout=timeout,
         conversation_id=conversation_id, is_raw=raw, allows_same_agent=allow_same_agent,
     )
@@ -234,7 +273,8 @@ async def list_agent_sessions(
     ),
 )
 async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
-                        delivery_id: Optional[str] = None) -> Dict[str, Any]:
+                        delivery_id: Optional[str] = None,
+                        ctx: Optional[Context] = None) -> Dict[str, Any]:
     """Args:
     cwd: Working directory to resolve sessions against.
     scope: 'cwd' (default), 'tree' or 'any'.
@@ -243,6 +283,11 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
     """
     if delivery_id:
         return await _run_blocking(bridge.delivery_report, delivery_id)
+
+    # what the calling client attached to this request. Codex names its thread here, which is
+    # how a reply finds its way back to the thread that asked rather than the busiest one.
+    caller_meta = _request_meta(ctx)
+    caller_session_id = caller_session_from_meta(caller_meta)
 
     scope = scope or config.DEFAULT_SCOPE
     target_cwd = os.path.realpath(os.path.expanduser(cwd)) if cwd else os.getcwd()
@@ -263,6 +308,9 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
             'shim_pid': session.get('shim_pid'),
             'last_user_activity': session.get('last_user_activity'),
             'started_at': session.get('started_at'),
+            'is_turn_active': session.get('is_turn_active'),
+            # a turn paused on a prompt only the human can answer; not working, waiting
+            'awaiting_approval': session.get('awaiting_approval'),
         }
 
     panels: Dict[str, Any] = {}
@@ -281,6 +329,10 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
         'ok': True,
         'running_under': identity['agent'],
         'process_chain': identity['chain'],
+        # the thread this call came from, when the host says so (Codex does); replies to a
+        # request made from here are addressed to it
+        'caller_session_id': caller_session_id,
+        'caller_meta': caller_meta,
         'cwd': target_cwd,
         'scope': scope,
         'resolved_sessions': resolved,

@@ -198,6 +198,10 @@ class Job:
         self.reply = ''
         self.reply_length = 0
         self.is_reply_recovered = False
+        # the answer was the peer's own finished turn, echoing this request's token, read from
+        # its transcript while the shim still reported the turn as running. Delivered, not
+        # recovered: the token proves it is the answer, whatever the shim's bookkeeping said.
+        self.is_reply_confirmed_by_transcript = False
         # the message never landed - set only when the transport says so, never inferred
         self.is_undelivered = False
         self.attempts = 0
@@ -249,6 +253,9 @@ class Job:
             # true when the answer was read out of the peer's transcript instead of being
             # handed back by the process this server started
             'is_reply_recovered': self.is_reply_recovered or None,
+            # true when the peer's echoed, finished answer was read from its transcript while
+            # the panel still reported the turn as running - a delivered answer, not a guess
+            'is_reply_confirmed_by_transcript': self.is_reply_confirmed_by_transcript or None,
             # true when the peer provably never received the message
             'is_undelivered': self.is_undelivered or None,
             'error': self.error,
@@ -365,6 +372,8 @@ class Outbox:
             reply = str(result.get('reply') or '').strip()
             job.reply = reply
             job.reply_length = len(reply)
+            job.is_reply_confirmed_by_transcript = bool(
+                result.get('is_reply_confirmed_by_transcript'))
             job.state = STATE_DELIVERED
         except NotDeliveredError as e:
             job.state = STATE_FAILED
