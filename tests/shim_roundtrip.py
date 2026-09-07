@@ -8,7 +8,7 @@ message. The checks that matter are that the injected turn's events reach the *e
 stream - that is what makes the exchange visible in the real panel - and that the extension
 never sees a response to a request it did not send.
 
-Spends one real Codex turn. Touches no VS Code settings.
+Spends three real Codex turns. Touches no VS Code settings.
 """
 
 import json
@@ -164,6 +164,30 @@ def main() -> int:
 
         check('turn/completed reached the extension',
               bool(extension.notifications('turn/completed')))
+
+        # the two-phase hand-over: a receipt at acceptance, the answer on await
+        receipt = socket_request(
+            socket_path,
+            {'op': 'send', 'text': 'Reply with exactly: AWAIT_OK', 'timeout': 240,
+             'acceptTimeout': 30},
+            60)
+        print(f'       receipt -> {json.dumps(receipt, ensure_ascii=False)[:220]}')
+        check('a send with acceptTimeout returns a receipt once the app server takes the turn',
+              receipt.get('pending') is True and receipt.get('accepted') is True
+              and bool(receipt.get('injectionId')), str(receipt)[:250])
+        check('the receipt names the turn the app server assigned', bool(receipt.get('turnId')))
+
+        answer = socket_request(
+            socket_path,
+            {'op': 'await', 'injectionId': receipt.get('injectionId'), 'timeout': 240},
+            260)
+        print(f'       await -> {json.dumps(answer, ensure_ascii=False)[:220]}')
+        check('await collects the answer of the turn the receipt was for',
+              answer.get('ok') and 'AWAIT_OK' in (answer.get('reply') or ''), str(answer)[:250])
+        check('a collected turn cannot be collected twice',
+              not socket_request(socket_path, {'op': 'await',
+                                               'injectionId': receipt.get('injectionId'),
+                                               'timeout': 1}, 5).get('ok'))
     finally:
         extension.stop()
 

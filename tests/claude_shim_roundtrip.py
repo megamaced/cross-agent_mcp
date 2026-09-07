@@ -7,7 +7,7 @@ drives one ordinary turn over stream-json the way the panel does, then asks the 
 socket to inject a bridged message. What matters is that the injected turn's output reaches
 the *extension* stream, because that is what the panel renders.
 
-Spends two real Claude turns. Touches no VS Code settings.
+Spends four real Claude turns. Touches no VS Code settings.
 """
 
 import json
@@ -162,6 +162,27 @@ def main() -> int:
 
         results = extension.messages('result', before)
         check('extension stream received the turn result', bool(results), str(len(results)))
+
+        # the two-phase hand-over: a receipt at acceptance, the answer on await
+        receipt = socket_request(
+            socket_path,
+            {'op': 'send', 'text': 'Reply with exactly: AWAIT_OK', 'timeout': 240,
+             'acceptTimeout': 30},
+            60)
+        print(f'       receipt -> {json.dumps(receipt, ensure_ascii=False)[:220]}')
+        check('a send with acceptTimeout returns a receipt as soon as the CLI has the message',
+              receipt.get('pending') is True and receipt.get('accepted') is True
+              and bool(receipt.get('injectionId')), str(receipt)[:250])
+
+        answer = socket_request(
+            socket_path,
+            {'op': 'await', 'injectionId': receipt.get('injectionId'), 'timeout': 240},
+            260)
+        print(f'       await -> {json.dumps(answer, ensure_ascii=False)[:220]}')
+        check('await collects the answer of the turn the receipt was for',
+              answer.get('ok') and 'AWAIT_OK' in (answer.get('reply') or ''), str(answer)[:250])
+        check('the answer came from the same panel session',
+              answer.get('sessionId') == session_id, str(answer.get('sessionId')))
     finally:
         extension.stop()
 
