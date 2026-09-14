@@ -269,7 +269,10 @@ async def list_agent_sessions(
         'With delivery_id it reports that one delivery instead, together with a fresh read '
         'of the peer\'s transcript: the answer of the last turn the peer finished after the '
         'request, or that it is still working. Use it when a reply was recovered as a '
-        'fragment, or a DELIVERY FAILED notice said the peer may still be working.'
+        'fragment, or a DELIVERY FAILED notice said the peer may still be working. '
+        'Any server answers for any delivery, even one whose server has since exited: '
+        'deliveries are recorded from the moment they are queued, and one whose server is '
+        'gone is reported with is_orphaned=true. Nothing is ever resent.'
     ),
 )
 async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
@@ -374,7 +377,10 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
                      'moment it lands; kind=failure-notice tells a sender its request produced '
                      'nothing. is_undelivered=true means the peer never received the message. '
                      'Pass delivery_id to see one delivery with the peer\'s current progress. '
-                     'Only this server process is listed; the peer runs its own.'),
+                     '`pending` and `recent` are this server process\'s own. `earlier` are '
+                     'finished deliveries kept on disk. `in_flight_elsewhere` are deliveries '
+                     'other server processes recorded as still in flight: is_orphaned=true when '
+                     'that server is gone - nothing will move them on, and nothing resends them.'),
             **await _run_blocking(outbox.OUTBOX.snapshot),
         },
         'busy_locks': await _run_blocking(registry.list_busy_locks),

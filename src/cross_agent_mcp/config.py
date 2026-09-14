@@ -36,9 +36,10 @@ LOCK_DIR: str = HOME_DIR + 'locks/'
 LOG_DIR: str = HOME_DIR + 'logs/'
 LOG_PATH: str = LOG_DIR + 'bridge.log'
 
-# Finished deliveries, kept so an answer outlives the server process that carried it. Only
-# finished ones: a queue on disk would be re-sent after a restart rather than resumed, which
-# asks the peer to do the same work twice.
+# Deliveries, kept so they outlive the server process that carried them: recorded from the
+# moment one is queued (under in-flight/ until it ends), finished ones directly here. Records
+# are for reporting only. Nothing reads them back to resume or resend a delivery - a restarted
+# server re-sending its queue would ask the peer to do the same work twice.
 DELIVERY_DIR: str = HOME_DIR + 'deliveries/'
 
 # delivery records older than this are pruned when the directory is read

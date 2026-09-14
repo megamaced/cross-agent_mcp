@@ -20,10 +20,11 @@ import contextlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import config, registry
 
@@ -73,6 +74,23 @@ UNDELIVERED_RETRY_SECONDS = 20
 # with something ahead, makes the caller sit out the whole window.
 EARLY_FAILURE_WINDOW_SECONDS = 8
 
+# Deliveries still under way are recorded one directory below finished ones. Servers from before
+# in-flight records existed prune every `*.json` in the delivery directory whose `finished_at` is
+# older than the TTL, and an in-flight record has none - the first `bridge_status` any of them
+# answered would delete it. They never look into a subdirectory.
+IN_FLIGHT_SUBDIR = 'in-flight/'
+
+# a delivery id names a file here; anything that is not an id is refused, never joined to a path
+DELIVERY_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
+
+# A writer that died between writing its temporary file and renaming it leaves the temporary
+# behind. Past this age it belongs to no write still in progress.
+STALE_TEMP_SECONDS = 3600
+
+# Margin on top of the longest a delivery can legitimately take. Past that an in-flight record is
+# not believed however its server's pid looks - pids are reused.
+IN_FLIGHT_GRACE_SECONDS = 300
+
 KIND_REQUEST = 'request'
 KIND_REPLY = 'reply'
 KIND_NOTICE = 'failure-notice'
@@ -88,53 +106,226 @@ def new_request_id() -> str:
     return f'req_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}'
 
 
-def _write_record(record: Dict[str, Any]) -> None:
-    """Keep a finished delivery where the next server process can still read it.
+def _in_flight_dir() -> str:
+    return config.DELIVERY_DIR + IN_FLIGHT_SUBDIR
+
+
+def _record_path(delivery_id: str, is_finished: bool) -> str:
+    return (config.DELIVERY_DIR if is_finished else _in_flight_dir()) + f'{delivery_id}.json'
+
+
+def _write_json_atomically(path: str, record: Dict[str, Any]) -> None:
+    """Write to a temporary file of this write's own, then rename it into place.
+
+    A reader in any process sees the previous record or the new one, never half of either, and
+    two writers never truncate each other's temporary.
+    """
+    tmp = f'{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
+
+
+def _write_record(record: Dict[str, Any], is_finished: bool = True) -> None:
+    """Keep a delivery where every server process - this one's successor included - can read it.
+
+    Written when the delivery is queued and again at every change of state, not only when it
+    ends. A server exits with whatever started it - an app that quits takes its server along -
+    and a delivery that lived only in that server's memory left nothing behind: the peer still
+    did the work, and every later `bridge_status` answered "no delivery is known". The record is
+    for reporting only. Nothing reads it back to resume or resend a delivery, which would ask the
+    peer for the same work twice.
 
     Only what `describe()` returns is written - never the payload or the child environment,
     which carries every variable this process was started with.
     """
     try:
         config.ensure_dirs()
-        path = config.DELIVERY_DIR + f"{record['delivery_id']}.json"
-        tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump({**record, 'finished_at': time.time()}, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
+        os.makedirs(_in_flight_dir(), exist_ok=True)
+        now = time.time()
+        stamped = {**record, 'origin_pid': record.get('origin_pid') or os.getpid(),
+                   'updated_at': now}
+        delivery_id = record['delivery_id']
+        if is_finished:
+            _write_json_atomically(_record_path(delivery_id, is_finished=True),
+                                   {**stamped, 'finished_at': now, 'expires_at': None})
+            # the finished record is in place before the in-flight one goes, so a reader that
+            # looks in both never finds neither
+            with contextlib.suppress(OSError):
+                os.remove(_record_path(delivery_id, is_finished=False))
+        else:
+            _write_json_atomically(_record_path(delivery_id, is_finished=False),
+                                   {**stamped, 'finished_at': None})
     except Exception as e:
         logger.error(f'_write_record [exception]: {e}')
 
 
-def read_records(limit: int = 20) -> List[Dict[str, Any]]:
-    """Finished deliveries from disk, newest first, pruning what has aged out."""
-    records: List[Dict[str, Any]] = []
+def persist(job: 'Job') -> None:
+    """Record a delivery as it stands now. Called when it is queued and at every change of state.
+
+    The record is described inside the job's own lock, at the moment of writing, so writes from
+    different threads may arrive in any order and the last one still says the latest thing. Once
+    the finished record is down, nothing reopens it.
+    """
+    with job.record_guard:
+        if job.is_record_final:
+            return
+        is_finished = job.finished_at is not None
+        _write_record(job.describe(), is_finished=is_finished)
+        job.is_record_final = is_finished
+
+
+def _is_in_flight(record: Dict[str, Any]) -> bool:
+    return not record.get('finished_at')
+
+
+def _prune_at(record: Dict[str, Any]) -> float:
+    """When a record is removed from disk.
+
+    A finished record keeps the TTL from when it finished. An in-flight one keeps the same TTL
+    from `expires_at`, the point past which no server can still be carrying it. Removing it at
+    that point instead would answer "no delivery is known" exactly when the question gets asked -
+    the day after the app that sent it quit - about a request the peer may well have carried out.
+    """
+    if _is_in_flight(record):
+        base = record.get('expires_at') or record.get('updated_at') or 0
+    else:
+        base = record.get('finished_at') or 0
+    return float(base) + config.DELIVERY_TTL_SECONDS
+
+
+def _remove_if_unchanged(path: str, inode: int) -> None:
+    """Remove a record only while it is still the file that was judged.
+
+    A writer may have renamed a fresh record into place since this one was read; that one stays.
+    """
+    with contextlib.suppress(OSError):
+        if os.stat(path).st_ino == inode:
+            os.remove(path)
+
+
+def _load_record(path: str) -> Optional[Dict[str, Any]]:
+    """Read one record, removing it when it is unreadable or has aged out."""
     try:
-        config.ensure_dirs()
-        names = os.listdir(config.DELIVERY_DIR)
+        handle = open(path, 'r', encoding='utf-8')
     except OSError:
-        return records
+        return None
+
+    with handle:
+        inode = os.fstat(handle.fileno()).st_ino
+        try:
+            record = json.load(handle)
+            is_expired = time.time() > _prune_at(record)
+        except Exception:
+            record, is_expired = None, True
+
+    if is_expired or not isinstance(record, dict):
+        _remove_if_unchanged(path, inode)
+        return None
+    return record
+
+
+def _scan_dir(directory: str) -> List[Dict[str, Any]]:
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
 
     now = time.time()
+    records: List[Dict[str, Any]] = []
     for name in names:
-        if not name.endswith('.json'):
-            continue
-        path = config.DELIVERY_DIR + name
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                record = json.load(f)
-        except Exception:
+        path = directory + name
+        if name.endswith('.tmp'):
             with contextlib.suppress(OSError):
-                os.remove(path)
-            continue
+                if now - os.stat(path).st_mtime > STALE_TEMP_SECONDS:
+                    os.remove(path)
+        elif name.endswith('.json'):
+            record = _load_record(path)
+            if record is not None:
+                records.append(record)
+    return records
 
-        if now - float(record.get('finished_at') or 0) > config.DELIVERY_TTL_SECONDS:
-            with contextlib.suppress(OSError):
-                os.remove(path)
-            continue
-        records.append(record)
 
-    records.sort(key=lambda r: float(r.get('finished_at') or 0), reverse=True)
-    return records[:limit]
+def _scan_records() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Finished and in-flight records on disk, pruning what has aged out.
+
+    In-flight records are read first. A delivery that finishes between the two reads then shows
+    up in both, and the finished record wins; read the other way round it would show up in
+    neither.
+    """
+    with contextlib.suppress(OSError):
+        config.ensure_dirs()
+    in_flight = _scan_dir(_in_flight_dir())
+    finished = _scan_dir(config.DELIVERY_DIR)
+
+    finished_ids = {r.get('delivery_id') for r in finished}
+    return finished, [r for r in in_flight if r.get('delivery_id') not in finished_ids]
+
+
+def read_records(limit: int = 20) -> List[Dict[str, Any]]:
+    """Finished deliveries from disk, newest first, pruning what has aged out."""
+    finished, _ = _scan_records()
+    finished.sort(key=lambda r: float(r.get('finished_at') or 0), reverse=True)
+    return finished[:limit]
+
+
+def read_record(delivery_id: str) -> Optional[Dict[str, Any]]:
+    """One delivery's record, finished or still in flight - None when none is kept.
+
+    None means it was never recorded, or has aged out: the only cases left in which "no delivery
+    is known" is the answer. Looked for finished, in flight, then finished again - a delivery
+    that finishes meanwhile is written to its finished place before it leaves the in-flight one.
+    """
+    if not isinstance(delivery_id, str) or not DELIVERY_ID_PATTERN.match(delivery_id):
+        return None
+    finished_path = _record_path(delivery_id, is_finished=True)
+    return (_load_record(finished_path)
+            or _load_record(_record_path(delivery_id, is_finished=False))
+            or _load_record(finished_path))
+
+
+def describe_origin(record: Dict[str, Any], is_carried_here: bool = False) -> Dict[str, Any]:
+    """A record, plus whether the server that carried it can still move it on.
+
+    A finished record needs nobody. An in-flight one is only as good as the process that wrote
+    it: once that process is gone nothing will finish the delivery, and the record says no more
+    than what it last saw - an answer, if there is one, is in the peer's transcript. Two things
+    tell: whether the writer's pid still runs, and whether the record is past `expires_at`,
+    beyond which no server could still be carrying it, whatever that pid belongs to now.
+
+    Reporting only. Nothing here resumes or resends a delivery.
+    """
+    described = dict(record)
+    if not _is_in_flight(record):
+        described.update(is_origin_alive=None, is_orphaned=False)
+        return described
+    if is_carried_here:
+        described.update(is_origin_alive=True, is_orphaned=False)
+        return described
+
+    now = time.time()
+    try:
+        pid = int(record.get('origin_pid') or 0)
+        expires_at = record.get('expires_at')
+        is_expired = expires_at is not None and now > float(expires_at)
+        # durations as of now, the way a carried delivery reports them, not as of the last write
+        if record.get('created_at'):
+            started_at = record.get('started_at')
+            described['queued_seconds'] = round(float(started_at or now)
+                                                - float(record['created_at']), 1)
+            described['elapsed_seconds'] = (round(now - float(started_at), 1)
+                                            if started_at else None)
+    except (TypeError, ValueError):
+        pid, is_expired = 0, True
+    # a record naming our own pid that we are not carrying was written by an earlier process
+    is_alive = pid > 0 and pid != os.getpid() and registry._is_pid_alive(pid)
+    described.update(is_origin_alive=is_alive, is_orphaned=not is_alive or is_expired)
+    return described
 
 
 class PeerBusyError(Exception):
@@ -209,6 +400,12 @@ class Job:
         # Until this instant the caller of send_message is still on the line and will be handed
         # a failure directly. After it, a failure is announced into the sender's session.
         self.report_failures_until = 0.0
+        # past this instant no server can still be carrying the delivery; set when it is queued
+        # and moved when a worker starts it (Outbox._longest_run)
+        self.expires_at: Optional[float] = None
+        # serialises this delivery's record writes, see persist()
+        self.record_guard = threading.Lock()
+        self.is_record_final = False
 
     def key(self) -> str:
         """Deliveries sharing this key are serialised."""
@@ -216,12 +413,15 @@ class Job:
 
     def mark_accepted(self, session_id: Optional[str] = None) -> None:
         """The peer has the message. From here on its turn is running and we are listening."""
+        before = (self.accepted_at, self.resolved_session_id, self.state)
         if self.accepted_at is None:
             self.accepted_at = time.time()
         if session_id:
             self.resolved_session_id = session_id
         if self.state == STATE_DELIVERING:
             self.state = STATE_AWAITING
+        if (self.accepted_at, self.resolved_session_id, self.state) != before:
+            persist(self)
 
     def is_failure_reportable_synchronously(self) -> bool:
         """Whether the send_message caller, not a notice, is the one to hear about a failure."""
@@ -241,9 +441,14 @@ class Job:
             'hop': self.hop,
             'is_reply': not self.wants_reply,
             'summary': self.summary,
+            'created_at': self.created_at,
             'started_at': self.started_at,
             'accepted_at': self.accepted_at,
             'finished_at': self.finished_at,
+            # while in flight: past this no server can still be carrying the delivery
+            'expires_at': self.expires_at if self.finished_at is None else None,
+            # the server process carrying the delivery; on disk, the one that wrote the record
+            'origin_pid': os.getpid(),
             'queued_seconds': round((self.started_at or time.time()) - self.created_at, 1),
             'elapsed_seconds': (round((self.finished_at or time.time()) - self.started_at, 1)
                                 if self.started_at else None),
@@ -272,6 +477,8 @@ class Outbox:
         self._workers: Dict[str, threading.Thread] = {}
         self._pending: Dict[str, Job] = {}
         self._history: List[Job] = []
+        # the job each worker is running right now, by key
+        self._running: Dict[str, Job] = {}
 
         # injected by bridge to avoid an import cycle
         self.deliver: Optional[Callable[[Job], Dict[str, Any]]] = None
@@ -285,6 +492,12 @@ class Outbox:
     def submit(self, job: Job) -> str:
         key = job.key()
         with self._guard:
+            ahead = list(self._queues.get(key, []))
+            if key in self._running:
+                ahead.append(self._running[key])
+            # until a worker starts it, a delivery may wait out everything ahead of it in full
+            job.expires_at = (time.time() + self._longest_run(job)
+                              + sum(self._longest_run(j) for j in ahead))
             self._pending[job.delivery_id] = job
             self._queues.setdefault(key, []).append(job)
             condition = self._wakeups.setdefault(key, threading.Condition())
@@ -295,6 +508,11 @@ class Outbox:
                     target=self._work, args=(key,), name=f'outbox:{key}', daemon=True)
                 self._workers[key] = worker
                 worker.start()
+
+        # On disk before the caller hears "accepted": from here on, a server that exits still
+        # leaves the delivery findable. A worker already writing a later state is not undone -
+        # persist() describes the job at the moment it writes.
+        persist(job)
 
         with condition:
             condition.notify_all()
@@ -354,7 +572,13 @@ class Outbox:
                     return
                 continue
 
-            self._run(job)
+            with self._guard:
+                self._running[key] = job
+            try:
+                self._run(job)
+            finally:
+                with self._guard:
+                    self._running.pop(key, None)
 
     def _next_is_empty(self, key: str) -> bool:
         with self._guard:
@@ -363,6 +587,8 @@ class Outbox:
     def _run(self, job: Job) -> None:
         job.state = STATE_DELIVERING
         job.started_at = time.time()
+        job.expires_at = job.started_at + self._longest_run(job)
+        persist(job)
         logger.info(f'_run [BEGIN]: {job.delivery_id} {job.sender_agent}->{job.target_agent} '
                     f'session={job.target_session_id or "NEW"} conv={job.conversation_id}')
 
@@ -423,6 +649,8 @@ class Outbox:
         attempts = 1 if job.wants_reply else UNDELIVERED_RETRY_ATTEMPTS
         for attempt in range(1, attempts + 1):
             job.attempts = attempt
+            if attempt > 1:
+                persist(job)
             try:
                 return self._deliver_with_lock(job)
             except NotDeliveredError as e:
@@ -447,6 +675,17 @@ class Outbox:
         if job.ui_shim is not None:
             return max(job.timeout, config.PANEL_PATIENCE_SECONDS)
         return job.timeout
+
+    def _longest_run(self, job: Job) -> float:
+        """The longest one delivery can legitimately take once a worker starts it.
+
+        Per attempt: waiting out a busy session, then the turn, each up to the patience. Then the
+        transcript watch after a transport failure, and a margin. Past it no server is still
+        carrying the delivery, which is what keeps a record honest when its server's pid is reused.
+        """
+        attempts = 1 if job.wants_reply else UNDELIVERED_RETRY_ATTEMPTS
+        return (attempts * (2 * self._patience(job) + UNDELIVERED_RETRY_SECONDS)
+                + RECOVERY_WINDOW_SECONDS + IN_FLIGHT_GRACE_SECONDS)
 
     def _deliver_with_lock(self, job: Job) -> Dict[str, Any]:
         """Hold the cross-process busy lock only while the turn actually runs.
@@ -491,6 +730,7 @@ class Outbox:
             return text
 
         job.state = STATE_AWAITING
+        persist(job)
         logger.info(f'_recover_with_patience [waiting]: {job.delivery_id} the transport gave '
                     f'up but {job.target_agent} may still be working; watching its transcript')
 
@@ -558,11 +798,13 @@ class Outbox:
     # --------------------------------------------------------------- reporting
 
     def _archive(self, job: Job) -> None:
+        # The finished record goes down before the job leaves `pending`: a process that exits as
+        # soon as nothing is pending must not take the last word with it.
+        persist(job)
         with self._guard:
             self._pending.pop(job.delivery_id, None)
             self._history.append(job)
             del self._history[:-HISTORY_LIMIT]
-        _write_record(job.describe())
 
     def find(self, delivery_id: str) -> Optional[Job]:
         with self._guard:
@@ -578,11 +820,18 @@ class Outbox:
             recent = [j.describe() for j in reversed(self._history[-limit:])]
         pending.sort(key=lambda d: d['queued_seconds'], reverse=True)
 
-        # Deliveries this process carried are in memory; earlier ones survive on disk, which
-        # is how an answer outlives the server that received it.
-        seen = {d['delivery_id'] for d in recent}
-        earlier = [r for r in read_records(limit) if r['delivery_id'] not in seen]
-        return {'pending': pending, 'recent': recent, 'earlier': earlier}
+        # Deliveries this process carries are in memory. Everything else is on disk: finished
+        # ones, which is how an answer outlives the server that received it, and ones other
+        # servers recorded as in flight - still carried there, or orphaned by a server now gone.
+        carried = {d['delivery_id'] for d in pending + recent}
+        finished, in_flight = _scan_records()
+        finished.sort(key=lambda r: float(r.get('finished_at') or 0), reverse=True)
+        in_flight.sort(key=lambda r: float(r.get('updated_at') or 0), reverse=True)
+        earlier = [r for r in finished if r.get('delivery_id') not in carried][:limit]
+        elsewhere = [describe_origin(r) for r in in_flight
+                     if r.get('delivery_id') not in carried][:limit]
+        return {'pending': pending, 'recent': recent, 'earlier': earlier,
+                'in_flight_elsewhere': elsewhere}
 
 
 OUTBOX = Outbox()

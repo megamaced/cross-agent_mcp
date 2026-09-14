@@ -924,6 +924,24 @@ outbox.OUTBOX.recover = _recover_reply
 outbox.OUTBOX.reroute = _reroute
 
 
+def _orphan_note(record: Dict[str, Any], is_never_handed_over: bool) -> str:
+    why = (f'the server process that carried it (pid {record.get("origin_pid")}) has exited'
+           if not record.get('is_origin_alive') else
+           'it is past the longest any server could still be carrying it (expires_at)')
+    if is_never_handed_over:
+        return (f'ORPHANED: {why} while the delivery was still queued. The peer never received '
+                'this message, so no answer to it will come. It is not resent - send it again '
+                'if it still matters.')
+    handed_over = ('' if record.get('accepted_at') else
+                   ' The hand-over was never acknowledged, so the peer may or may not have '
+                   'received it; an answer in peer_transcript that echoes the request id settles '
+                   'that it did.')
+    return (f'ORPHANED: {why}, so nothing will move this delivery past '
+            f'state={record.get("state")}, and it is not resent.{handed_over} The peer may still '
+            'have done the work: peer_transcript is read just now - `answer` is its answer to '
+            'this request, `is_working` means it is still on it.')
+
+
 def delivery_report(delivery_id: str) -> Dict[str, Any]:
     """One delivery in full, with a fresh look at what its target has written since.
 
@@ -931,22 +949,41 @@ def delivery_report(delivery_id: str) -> Dict[str, Any]:
     two part ways exactly when it matters: a delivery closed while the peer was mid-task has a
     fragment, or nothing, where the answer belongs. Reading the transcript again later - after
     the peer has finished - is how that answer is found, and this is where to ask for it.
+
+    Any server can answer for any delivery, including one whose server has exited: every
+    delivery is on disk from the moment it is queued. One whose server is gone is reported with
+    `is_orphaned`, and its answer is still read from the peer transcript. Nothing is resent.
     """
     job = outbox.OUTBOX.find(delivery_id)
     if job is not None:
-        record = job.describe()
+        record = outbox.describe_origin(job.describe(), is_carried_here=True)
     else:
-        record = next((r for r in outbox.read_records(limit=1000)
-                       if r.get('delivery_id') == delivery_id), None)
+        kept = outbox.read_record(delivery_id)
+        record = outbox.describe_origin(kept) if kept is not None else None
     if record is None:
         return {'ok': False,
                 'error': f'no delivery {delivery_id} is known to this server or kept on disk'}
 
     report: Dict[str, Any] = {'ok': True, 'delivery': record}
 
+    # Orphaned while still queued, the message never reached the peer. Its transcript holds no
+    # answer to it, and reading one there - with no request time to filter by - would hand back
+    # whatever the peer last said about something else.
+    is_never_handed_over = (bool(record.get('is_orphaned'))
+                            and record.get('state') == outbox.STATE_QUEUED)
+    if record.get('is_orphaned'):
+        report['note'] = _orphan_note(record, is_never_handed_over)
+
     target_agent = record.get('target_agent')
     target_session = record.get('target_session_id')
-    if target_agent in CALLERS and target_session:
+    if target_agent in CALLERS and target_session and is_never_handed_over:
+        report['peer_transcript'] = {
+            'answer': None,
+            'note': ('Not read: this delivery was still queued when its server stopped, so the '
+                     'peer never received it and nothing in its transcript answers it.'),
+        }
+        report['peer_panel'] = panel_state(target_agent, target_session)
+    elif target_agent in CALLERS and target_session:
         after = record.get('started_at')
         progress = discovery.peer_progress(target_agent, target_session, after=after,
                                            token=delivery_id)

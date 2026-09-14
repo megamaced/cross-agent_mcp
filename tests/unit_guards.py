@@ -1209,7 +1209,15 @@ def test_naming_a_session_and_forcing_a_new_one_is_refused() -> None:
 
 
 def test_a_delivery_does_not_outlive_the_server_that_started_it() -> None:
-    """An orphaned delivery keeps working unwatched, and frees the lock guarding its session."""
+    """An orphaned delivery keeps working unwatched, and frees the lock guarding its session.
+
+    So the delivery's *process* must not outlive the server: shutting down kills the CLI and its
+    tool tree, and that still holds. What changed on 2026-09-14, at the user's request relayed
+    by koppa, is the delivery's *record*: it now does outlive the server, written from the moment
+    the delivery is queued, so another server can report it as orphaned and read its answer from
+    the peer transcript. Nothing is resumed or resent from it - see
+    test_an_orphaned_delivery_is_reported_by_another_server.
+    """
     with tempfile.TemporaryDirectory(prefix='orphan-') as work_dir:
         marker = work_dir + '/child.pid'
         command = ['/bin/bash', '-c', f'sleep 45 & echo $! > {marker}; wait']
@@ -2173,6 +2181,542 @@ def test_a_codex_turn_is_settled_by_its_echo_when_the_ids_never_match() -> None:
           str(still)[:200])
 
 
+# --------------- a delivery is on disk from the moment it is queued (koppa, 2026-09-14)
+
+# A bridge server that carries requests and is then killed with them still in flight.
+_ORIGIN_SERVER = r'''
+import sys, threading
+sys.path.insert(0, sys.argv[1])
+from cross_agent_mcp import outbox
+
+mode = sys.argv[2]
+box = outbox.Outbox()
+
+
+def deliver(job):
+    if mode == 'accepted':
+        job.mark_accepted(job.target_session_id)
+    threading.Event().wait()  # the peer's turn outlives this server
+
+
+box.deliver = deliver
+
+
+def request(summary):
+    return outbox.Job(
+        target_agent='codex', target_session_id='peer-sid', payload='SECRET-PAYLOAD',
+        run_cwd='/w', pin_cwd='/w', env={'SECRET_ENV': 'SECRET-VALUE'}, timeout=600,
+        ui_shim={'socket': '/nowhere'}, title=None, conversation_id='conv_orphan', hop=1,
+        sender_agent='claude', sender_session_id='sender-sid', wants_reply=True, summary=summary)
+
+
+ids = [box.submit(request('first'))]
+if mode == 'queued':
+    ids.append(box.submit(request('second')))
+print(' '.join(ids), flush=True)
+threading.Event().wait()
+'''
+
+# A bridge server that carries a burst of requests to the end and exits.
+_BUSY_SERVER = r'''
+import os, sys, time
+sys.path.insert(0, sys.argv[1])
+from cross_agent_mcp import outbox
+
+box = outbox.Outbox()
+box.deliver = lambda job: {'session_id': job.target_session_id, 'reply': 'ok',
+                           'is_new_session': False}
+for index in range(int(sys.argv[2])):
+    box.submit(outbox.Job(
+        target_agent='codex', target_session_id=f'peer-{os.getpid()}-{index % 3}', payload='x',
+        run_cwd='/w', pin_cwd='/w', env={}, timeout=5, ui_shim=None, title=None,
+        conversation_id='conv_race', hop=1, sender_agent='claude', sender_session_id=None,
+        wants_reply=True, summary=str(index)))
+deadline = time.time() + 30
+while box._pending and time.time() < deadline:
+    time.sleep(0.01)
+print('done' if not box._pending else 'stuck', flush=True)
+'''
+
+
+def _spawn_server(script: str, home: str, *args: str):
+    import subprocess
+    src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + '/src'
+    return subprocess.Popen([sys.executable, '-c', script, src_dir, *args],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                            env={**os.environ, 'CROSS_AGENT_HOME': home})
+
+
+def _kill(process) -> None:
+    with contextlib_suppress():
+        process.kill()
+    with contextlib_suppress():
+        process.wait(timeout=5)
+
+
+def _await_record(delivery_id: str, state: str, deadline_seconds: float = 5.0):
+    deadline = time.time() + deadline_seconds
+    record = None
+    while time.time() < deadline:
+        record = outbox.read_record(delivery_id)
+        if record and record.get('state') == state:
+            return record
+        time.sleep(0.02)
+    return record
+
+
+def _collapse(states: list) -> list:
+    return [s for index, s in enumerate(states) if index == 0 or states[index - 1] != s]
+
+
+def test_a_delivery_is_on_disk_from_the_moment_it_is_queued() -> None:
+    """koppa, 2026-09-14: Studio started a bridge server, sent a request and quit before the
+    peer's turn ended. The server went with it, and every later bridge_status answered "no
+    delivery is known" for a request the peer did carry out - three times that day. A record
+    written only at the end cannot outlive the server it lives in; this one is written as the
+    delivery is queued, and again at every change of state."""
+    original_write = outbox._write_record
+    writes = []
+
+    def spy(record, is_finished=True):
+        writes.append((record['delivery_id'], record['state'], is_finished))
+        original_write(record, is_finished)
+
+    outbox._write_record = spy
+    try:
+        box = outbox.Outbox()
+        entered, go_accept, accepted, go_finish = (threading.Event() for _ in range(4))
+
+        def deliver(job):
+            if job.summary == 'first':
+                entered.set()
+                go_accept.wait(5)
+                job.mark_accepted(job.target_session_id)
+                accepted.set()
+                go_finish.wait(5)
+            return {'session_id': job.target_session_id, 'reply': '', 'is_new_session': False}
+
+        box.deliver = deliver
+        first = box.submit(_job(box, 'sid-record', summary='first'))
+        entered.wait(5)
+        second = box.submit(_job(box, 'sid-record', summary='second'))
+
+        queued = outbox.read_record(second) or {}
+        check('a delivery is on disk as soon as submit returns',
+              queued.get('state') == outbox.STATE_QUEUED, str(queued)[:200])
+        check('apart from finished records, where an older server would prune it',
+              not os.path.exists(outbox.config.DELIVERY_DIR + f'{second}.json')
+              and os.path.exists(outbox._in_flight_dir() + f'{second}.json'))
+        check('with no finish time, and an expiry to be judged by',
+              'finished_at' in queued and queued['finished_at'] is None
+              and (queued.get('expires_at') or 0) > time.time(), str(queued)[:200])
+
+        delivering = outbox.read_record(first) or {}
+        check('a started delivery is recorded as delivering',
+              delivering.get('state') == outbox.STATE_DELIVERING
+              and delivering.get('started_at') is not None, str(delivering)[:200])
+        check('expiring after the longest it may legitimately take',
+              abs((delivering.get('expires_at') or 0) - (delivering.get('started_at') or 0)
+                  - box._longest_run(box.find(first))) < 1, str(delivering)[:200])
+        check('while the one queued behind it allows for it too',
+              (queued.get('expires_at') or 0) > (delivering.get('expires_at') or 0))
+
+        go_accept.set()
+        accepted.wait(5)
+        awaiting = outbox.read_record(first) or {}
+        check('the hand-over is recorded the moment the peer takes the message',
+              awaiting.get('state') == outbox.STATE_AWAITING
+              and awaiting.get('accepted_at') is not None, str(awaiting)[:200])
+
+        go_finish.set()
+        _drain(box)
+        done = outbox.read_record(first) or {}
+        check('the end is recorded where finished records have always been',
+              done.get('state') == outbox.STATE_DELIVERED and done.get('finished_at')
+              and done.get('expires_at') is None
+              and os.path.exists(outbox.config.DELIVERY_DIR + f'{first}.json'), str(done)[:200])
+        check('and the in-flight record is gone',
+              not os.path.exists(outbox._in_flight_dir() + f'{first}.json'))
+
+        states = _collapse([state for delivery_id, state, _ in writes if delivery_id == first])
+        check('every change of state was written, in order',
+              states[-3:] == [outbox.STATE_DELIVERING, outbox.STATE_AWAITING,
+                              outbox.STATE_DELIVERED]
+              and states[0] in (outbox.STATE_QUEUED, outbox.STATE_DELIVERING), str(states))
+        check('only the last write is the finished one',
+              [f for delivery_id, _, f in writes if delivery_id == first][-1] is True
+              and not any([f for delivery_id, _, f in writes if delivery_id == first][:-1]))
+
+        outbox.persist(box.find(first))
+        check('a finished record is never reopened as in flight',
+              not os.path.exists(outbox._in_flight_dir() + f'{first}.json'))
+    finally:
+        outbox._write_record = original_write
+
+
+def test_a_watched_transport_failure_is_recorded_as_awaiting_the_peer() -> None:
+    original = (outbox.RECOVERY_POLL_SECONDS, outbox.RECOVERY_WINDOW_SECONDS,
+                outbox._write_record)
+    seen = []
+
+    def spy(record, is_finished=True):
+        seen.append(dict(record, is_finished_write=is_finished))
+        original[2](record, is_finished)
+
+    outbox.RECOVERY_POLL_SECONDS, outbox.RECOVERY_WINDOW_SECONDS = 0.02, 2
+    outbox._write_record = spy
+    try:
+        box = outbox.Outbox()
+
+        def deliver(job):
+            job.mark_accepted(job.target_session_id)
+            raise RuntimeError('IDE panel relay failed: the peer turn is still running after 3600s')
+
+        box.deliver = deliver
+        looks = {'count': 0}
+        box.recover = lambda job: (looks.update(count=looks['count'] + 1)
+                                   or ('늦게 도착한 답' if looks['count'] >= 3 else None))
+        job = _job(box, 'sid-watch', wants_reply=True)
+        job.ui_shim = {'socket': '/panel'}
+        delivery_id = box.submit(job)
+        _drain(box)
+
+        mine = [r for r in seen if r['delivery_id'] == delivery_id]
+        watching = [r for r in mine if r['state'] == outbox.STATE_AWAITING and r.get('error')]
+        check('while the transcript is watched the record says awaiting-peer, with the failure',
+              bool(watching) and watching[0]['is_finished_write'] is False,
+              str([(r['state'], r.get('error')) for r in mine])[:300])
+        check('and it closes as failed with the recovered answer',
+              bool(mine) and mine[-1]['state'] == outbox.STATE_FAILED
+              and mine[-1]['is_finished_write'] is True
+              and mine[-1].get('is_reply_recovered') is True, str(mine[-1:])[:300])
+    finally:
+        outbox.RECOVERY_POLL_SECONDS, outbox.RECOVERY_WINDOW_SECONDS, outbox._write_record = original
+
+
+def test_a_delivery_record_is_replaced_whole_or_not_at_all() -> None:
+    box = outbox.Outbox()
+    job = _job(box, 'sid-atomic', summary='atomic')
+    job.expires_at = time.time() + 60
+    outbox.persist(job)
+    path = outbox._in_flight_dir() + f'{job.delivery_id}.json'
+    temporaries = lambda: [n for n in os.listdir(outbox._in_flight_dir())
+                           if n.startswith(job.delivery_id) and n.endswith('.tmp')]
+
+    original_replace = outbox.os.replace
+    original_error = outbox.logger.error
+    logged = []
+    outbox.logger.error = lambda message: logged.append(message)
+
+    def failing_replace(source, destination):
+        raise OSError('the disk went away mid-write')
+
+    outbox.os.replace = failing_replace
+    try:
+        job.state = outbox.STATE_DELIVERING
+        outbox.persist(job)
+    finally:
+        outbox.os.replace = original_replace
+    kept = json.load(open(path, encoding='utf-8'))
+    check('a write that fails leaves the previous record whole',
+          kept.get('state') == outbox.STATE_QUEUED, str(kept)[:200])
+    check('and no temporary behind', not temporaries(), str(temporaries()))
+
+    logged.clear()
+    errors = []
+    stop = threading.Event()
+
+    def writer() -> None:
+        for attempt in range(150):
+            job.attempts = attempt
+            outbox.persist(job)
+
+    def reader() -> None:
+        while not stop.is_set():
+            try:
+                with open(path, encoding='utf-8') as f:
+                    json.load(f)
+            except Exception as e:
+                errors.append(repr(e))
+
+    try:
+        watcher = threading.Thread(target=reader, daemon=True)
+        watcher.start()
+        writers = [threading.Thread(target=writer) for _ in range(6)]
+        for thread in writers:
+            thread.start()
+        for thread in writers:
+            thread.join(30)
+        stop.set()
+        watcher.join(5)
+    finally:
+        outbox.logger.error = original_error
+    check('a reader never sees a torn or missing record while writers replace it',
+          not errors, str(errors[:3]))
+    check('writers never trip over each other\'s temporary', not logged, str(logged[:3]))
+    check('and leave none behind', not temporaries(), str(temporaries()))
+
+
+def test_an_orphaned_delivery_is_reported_by_another_server() -> None:
+    """The koppa case end to end: the server carrying a request is killed mid-turn, and a
+    server that never saw the request answers for it - still carried while that server runs,
+    orphaned once it is gone, with the answer read from the peer transcript. Nothing is resent."""
+    original_dir = outbox.config.DELIVERY_DIR
+    originals = (bridge.discovery.peer_progress, bridge.panel_state, outbox.OUTBOX.submit,
+                 bridge.uihook.send)
+    original_callers = dict(bridge.CALLERS)
+    resent = []
+    asked = []
+    with tempfile.TemporaryDirectory(prefix='orphan-home-') as home:
+        outbox.config.DELIVERY_DIR = home + '/deliveries/'
+        bridge.panel_state = lambda agent, session_id: {'is_open_in_a_panel': False}
+        outbox.OUTBOX.submit = lambda job: resent.append(('submit', job.delivery_id))
+        bridge.uihook.send = lambda *a, **kw: resent.append(('send', a[:1]))
+        for name in list(bridge.CALLERS):
+            bridge.CALLERS[name] = lambda *a, **kw: resent.append(('call', a[:1]))
+        server = _spawn_server(_ORIGIN_SERVER, home, 'accepted')
+        try:
+            ids = server.stdout.readline().split()
+            check('the carrying server queued a request', len(ids) == 1, str(ids))
+            delivery_id = ids[0] if ids else 'req_0_000000'
+            carried = _await_record(delivery_id, outbox.STATE_AWAITING)
+            raw = (open(outbox._in_flight_dir() + f'{delivery_id}.json', encoding='utf-8').read()
+                   if carried else '')
+            check('its in-flight record is on disk, without the payload or the environment',
+                  bool(raw) and 'SECRET-PAYLOAD' not in raw and 'SECRET' not in raw, raw[:200])
+
+            def working(agent, session_id, after=None, token=None):
+                asked.append((agent, session_id, after, token))
+                return {'answer': None, 'answered_at': None, 'is_working': True,
+                        'last_turn_finished_at': None, 'transcript_mtime': 1.0}
+
+            bridge.discovery.peer_progress = working
+            live = bridge.delivery_report(delivery_id)
+            record = live.get('delivery') or {}
+            check('another server reports a delivery it never carried',
+                  live.get('ok') is True and record.get('state') == outbox.STATE_AWAITING,
+                  str(live)[:300])
+            check('as still carried while its server runs',
+                  record.get('is_origin_alive') is True and record.get('is_orphaned') is False
+                  and record.get('origin_pid') == server.pid and 'note' not in live,
+                  str(record)[:300])
+
+            _kill(server)
+            orphaned = bridge.delivery_report(delivery_id)
+            record = orphaned.get('delivery') or {}
+            note = str(orphaned.get('note') or '')
+            check('once its server is gone it is reported as orphaned, not unknown',
+                  orphaned.get('ok') is True and record.get('is_orphaned') is True
+                  and record.get('is_origin_alive') is False, str(orphaned)[:300])
+            check('in the state its server last recorded',
+                  record.get('state') == outbox.STATE_AWAITING, str(record.get('state')))
+            check('saying so, and that it is not resent',
+                  note.startswith('ORPHANED') and 'not resent' in note, note)
+            check('with the peer read as still working',
+                  (orphaned.get('peer_transcript') or {}).get('is_working') is True)
+            check('read as for a live delivery: from the request time, matched by its id',
+                  bool(asked) and asked[-1] == ('codex', 'peer-sid', record.get('started_at'),
+                                                delivery_id), str(asked[-1:]))
+
+            answer = f'이미지 11장 등록 완료\n{delivery_id}'
+            bridge.discovery.peer_progress = lambda agent, session_id, after=None, token=None: {
+                'answer': answer, 'answered_at': time.time(), 'is_working': False,
+                'last_turn_finished_at': time.time(), 'transcript_mtime': 1.0}
+            answered = bridge.delivery_report(delivery_id)
+            check('once the peer finishes, its answer comes back through the orphaned record',
+                  (answered.get('peer_transcript') or {}).get('answer') == answer,
+                  str(answered)[:300])
+            check('and nothing was resent at any point', not resent, str(resent))
+
+            listing = outbox.Outbox().snapshot()
+            listed = next((r for r in listing['in_flight_elsewhere']
+                           if r.get('delivery_id') == delivery_id), None)
+            check('the overall status lists it among other servers\' in-flight deliveries',
+                  listed is not None and listed.get('is_orphaned') is True,
+                  str(listing['in_flight_elsewhere'])[:300])
+            check('and not among finished ones',
+                  all(r.get('delivery_id') != delivery_id for r in listing['earlier']))
+        finally:
+            _kill(server)
+            outbox.config.DELIVERY_DIR = original_dir
+            (bridge.discovery.peer_progress, bridge.panel_state, outbox.OUTBOX.submit,
+             bridge.uihook.send) = originals
+            bridge.CALLERS.update(original_callers)
+
+
+def test_a_delivery_orphaned_in_the_queue_is_known_never_to_have_landed() -> None:
+    original_dir = outbox.config.DELIVERY_DIR
+    originals = (bridge.discovery.peer_progress, bridge.panel_state)
+    asked = []
+    with tempfile.TemporaryDirectory(prefix='orphan-queue-') as home:
+        outbox.config.DELIVERY_DIR = home + '/deliveries/'
+        bridge.panel_state = lambda agent, session_id: {'is_open_in_a_panel': False}
+        # a peer whose last word is about something else entirely
+        bridge.discovery.peer_progress = lambda agent, session_id, after=None, token=None: (
+            asked.append(token) or {'answer': '다른 요청에 대한 답', 'answered_at': 1.0,
+                                    'is_working': False})
+        server = _spawn_server(_ORIGIN_SERVER, home, 'queued')
+        try:
+            ids = server.stdout.readline().split()
+            check('the carrying server has one delivery started and one queued behind it',
+                  len(ids) == 2, str(ids))
+            first, second = (ids + ['req_0_000000', 'req_0_000001'])[:2]
+            _await_record(first, outbox.STATE_DELIVERING)
+            _await_record(second, outbox.STATE_QUEUED)
+            _kill(server)
+
+            report = bridge.delivery_report(second)
+            record = report.get('delivery') or {}
+            check('a delivery orphaned in the queue is reported as queued and orphaned',
+                  report.get('ok') is True and record.get('state') == outbox.STATE_QUEUED
+                  and record.get('is_orphaned') is True, str(report)[:300])
+            check('its peer transcript is not searched for an answer it cannot have',
+                  (report.get('peer_transcript') or {}).get('answer') is None
+                  and second not in asked, str(report.get('peer_transcript')))
+            check('and the note says the peer never received it',
+                  'never received' in str(report.get('note')), str(report.get('note')))
+
+            started = bridge.delivery_report(first)
+            check('one orphaned mid-hand-over says it may or may not have landed',
+                  (started.get('delivery') or {}).get('is_orphaned') is True
+                  and 'never acknowledged' in str(started.get('note')), str(started)[:300])
+        finally:
+            _kill(server)
+            outbox.config.DELIVERY_DIR = original_dir
+            bridge.discovery.peer_progress, bridge.panel_state = originals
+
+
+def test_in_flight_records_expire_and_are_pruned() -> None:
+    original = (outbox.config.DELIVERY_DIR, outbox.config.DELIVERY_TTL_SECONDS)
+    with tempfile.TemporaryDirectory(prefix='delivery-ttl-') as store:
+        outbox.config.DELIVERY_DIR = store + '/'
+        outbox.config.DELIVERY_TTL_SECONDS = 100
+        try:
+            in_flight_dir = outbox._in_flight_dir()
+            os.makedirs(in_flight_dir, exist_ok=True)
+            now = time.time()
+            alive_pid = os.getppid()
+
+            def put(directory, delivery_id, **fields):
+                with open(directory + f'{delivery_id}.json', 'w', encoding='utf-8') as f:
+                    json.dump({'delivery_id': delivery_id, 'state': outbox.STATE_AWAITING,
+                               'target_agent': 'codex', 'target_session_id': 'peer-sid',
+                               **fields}, f)
+
+            put(in_flight_dir, 'req_1_aaaaaa', finished_at=None, origin_pid=alive_pid,
+                updated_at=now, expires_at=now + 50, created_at=now - 40, started_at=now - 30,
+                queued_seconds=0.0, elapsed_seconds=0.0)
+            put(in_flight_dir, 'req_2_aaaaaa', finished_at=None, origin_pid=alive_pid,
+                updated_at=now - 60, expires_at=now - 50)
+            put(in_flight_dir, 'req_3_aaaaaa', finished_at=None, origin_pid=alive_pid,
+                updated_at=now - 300, expires_at=now - 200)
+            put(in_flight_dir, 'req_4_aaaaaa', finished_at=None, origin_pid=os.getpid(),
+                updated_at=now, expires_at=now + 50)
+            put(in_flight_dir, 'req_5_aaaaaa', finished_at=None, updated_at=now - 200)
+            put(store + '/', 'req_6_aaaaaa', state=outbox.STATE_DELIVERED, finished_at=now - 50)
+            put(store + '/', 'req_7_aaaaaa', state=outbox.STATE_DELIVERED, finished_at=now - 200)
+            with open(in_flight_dir + 'req_8_aaaaaa.json', 'w', encoding='utf-8') as f:
+                f.write('{"delivery_id": "req_8_')
+            stale_temp = in_flight_dir + 'req_9_aaaaaa.json.1.deadbeef.tmp'
+            fresh_temp = in_flight_dir + 'req_10_aaaaaa.json.2.deadbeef.tmp'
+            for path in (stale_temp, fresh_temp):
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write('{')
+            os.utime(stale_temp, (now - outbox.STALE_TEMP_SECONDS - 10,) * 2)
+
+            def origin(delivery_id):
+                record = outbox.read_record(delivery_id)
+                return outbox.describe_origin(record) if record else None
+
+            fresh = origin('req_1_aaaaaa') or {}
+            check('an in-flight record whose server runs, before its expiry, is carried',
+                  fresh.get('is_origin_alive') is True and fresh.get('is_orphaned') is False,
+                  str(fresh))
+            check('its durations are as of now, not as of the write that froze them',
+                  fresh.get('queued_seconds') == 10.0
+                  and 29 <= (fresh.get('elapsed_seconds') or 0) <= 35, str(fresh))
+            reused = origin('req_2_aaaaaa') or {}
+            check('past its expiry it is orphaned even if the pid runs - pids are reused',
+                  reused.get('is_origin_alive') is True and reused.get('is_orphaned') is True,
+                  str(reused))
+            mine = origin('req_4_aaaaaa') or {}
+            check('a record naming our own pid that we do not carry was a previous process\'s',
+                  mine.get('is_origin_alive') is False and mine.get('is_orphaned') is True,
+                  str(mine))
+
+            gone = bridge.delivery_report('req_3_aaaaaa')
+            check('an in-flight record a TTL past its expiry is pruned, and is unknown again',
+                  gone == {'ok': False, 'error': 'no delivery req_3_aaaaaa is known to this '
+                                                 'server or kept on disk'}
+                  and not os.path.exists(in_flight_dir + 'req_3_aaaaaa.json'), str(gone))
+            check('one that never recorded an expiry ages out from its last update',
+                  outbox.read_record('req_5_aaaaaa') is None
+                  and not os.path.exists(in_flight_dir + 'req_5_aaaaaa.json'))
+            check('finished records keep their TTL from when they finished',
+                  outbox.read_record('req_6_aaaaaa') is not None
+                  and outbox.read_record('req_7_aaaaaa') is None)
+            check('a torn record is removed',
+                  outbox.read_record('req_8_aaaaaa') is None
+                  and not os.path.exists(in_flight_dir + 'req_8_aaaaaa.json'))
+
+            outbox.read_records()
+            check('a temporary no write can still own is removed, a fresh one is left alone',
+                  not os.path.exists(stale_temp) and os.path.exists(fresh_temp))
+
+            escape = bridge.delivery_report('../req_6_aaaaaa')
+            check('a delivery id is never joined to a path',
+                  outbox.read_record('../req_6_aaaaaa') is None and escape.get('error')
+                  == 'no delivery ../req_6_aaaaaa is known to this server or kept on disk',
+                  str(escape))
+        finally:
+            outbox.config.DELIVERY_DIR, outbox.config.DELIVERY_TTL_SECONDS = original
+
+
+def test_servers_sharing_the_delivery_directory_do_not_trip_over_each_other() -> None:
+    """Every bridge server of every editor window writes and prunes the same directory."""
+    original_dir = outbox.config.DELIVERY_DIR
+    with tempfile.TemporaryDirectory(prefix='delivery-race-') as home:
+        outbox.config.DELIVERY_DIR = home + '/deliveries/'
+        servers = []
+        try:
+            servers = [_spawn_server(_BUSY_SERVER, home, '40') for _ in range(4)]
+            failures = []
+            stop = threading.Event()
+
+            def reader() -> None:
+                # reads and prunes both directories, as every bridge_status does
+                while not stop.is_set():
+                    try:
+                        outbox.Outbox().snapshot()
+                    except Exception as e:
+                        failures.append(repr(e))
+
+            watcher = threading.Thread(target=reader, daemon=True)
+            watcher.start()
+            outputs = [server.communicate(timeout=60)[0].strip() for server in servers]
+            stop.set()
+            watcher.join(10)
+
+            names = [n for n in os.listdir(outbox.config.DELIVERY_DIR) if n.endswith('.json')]
+            records = [json.load(open(outbox.config.DELIVERY_DIR + n, encoding='utf-8'))
+                       for n in names]
+            left = os.listdir(outbox._in_flight_dir()) if os.path.isdir(outbox._in_flight_dir()) else []
+            check('four servers finished their deliveries side by side',
+                  outputs == ['done'] * 4, str(outputs))
+            check('every delivery of every server has its finished record - none lost to a '
+                  'reader pruning at the same moment', len(records) == 160, str(len(records)))
+            check('all readable, all delivered',
+                  all(r.get('state') == outbox.STATE_DELIVERED for r in records))
+            check('from four distinct servers',
+                  len({r.get('origin_pid') for r in records}) == 4)
+            check('no in-flight record or temporary left behind', not left, str(left[:5]))
+            check('the reader never tripped', not failures, str(failures[:3]))
+        finally:
+            for server in servers:
+                _kill(server)
+            outbox.config.DELIVERY_DIR = original_dir
+
+
 def contextlib_suppress():
     import contextlib
     return contextlib.suppress(Exception)
@@ -2246,6 +2790,13 @@ def run_all() -> None:
     test_the_claude_shim_sees_a_turn_waiting_on_a_human()
     test_the_codex_shim_sees_a_turn_waiting_on_a_human()
     test_a_codex_turn_is_settled_by_its_echo_when_the_ids_never_match()
+    test_a_delivery_is_on_disk_from_the_moment_it_is_queued()
+    test_a_watched_transport_failure_is_recorded_as_awaiting_the_peer()
+    test_a_delivery_record_is_replaced_whole_or_not_at_all()
+    test_an_orphaned_delivery_is_reported_by_another_server()
+    test_a_delivery_orphaned_in_the_queue_is_known_never_to_have_landed()
+    test_in_flight_records_expire_and_are_pruned()
+    test_servers_sharing_the_delivery_directory_do_not_trip_over_each_other()
 
 if __name__ == '__main__':
     # Delivery records are written by any finished job, so a test run left rows like
