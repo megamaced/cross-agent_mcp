@@ -2717,6 +2717,112 @@ def test_servers_sharing_the_delivery_directory_do_not_trip_over_each_other() ->
             outbox.config.DELIVERY_DIR = original_dir
 
 
+def _legacy_write_record(record) -> None:
+    """`outbox._write_record` as of 9327e26, verbatim: how a server from before in-flight
+    records writes a finished record."""
+    try:
+        config.ensure_dirs()
+        path = config.DELIVERY_DIR + f"{record['delivery_id']}.json"
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({**record, 'finished_at': time.time()}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _legacy_read_records(limit: int = 20) -> list:
+    """`outbox.read_records` as of 9327e26, verbatim: what such a server runs over the shared
+    delivery directory on every bridge_status, deleting whatever it judges aged out."""
+    records = []
+    try:
+        config.ensure_dirs()
+        names = os.listdir(config.DELIVERY_DIR)
+    except OSError:
+        return records
+
+    now = time.time()
+    for name in names:
+        if not name.endswith('.json'):
+            continue
+        path = config.DELIVERY_DIR + name
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                record = json.load(f)
+        except Exception:
+            with contextlib_suppress():
+                os.remove(path)
+            continue
+
+        if now - float(record.get('finished_at') or 0) > config.DELIVERY_TTL_SECONDS:
+            with contextlib_suppress():
+                os.remove(path)
+            continue
+        records.append(record)
+
+    records.sort(key=lambda r: float(r.get('finished_at') or 0), reverse=True)
+    return records[:limit]
+
+
+def test_servers_from_before_in_flight_records_share_the_directory_safely() -> None:
+    """koppa, 2026-09-14: until every running server has been restarted, old and new code write
+    and prune one directory. The old pruning deletes every `*.json` there without a recent
+    finished_at - which is exactly what an in-flight record would be, kept beside finished ones."""
+    original_dir = outbox.config.DELIVERY_DIR
+    originals = (bridge.discovery.peer_progress, bridge.panel_state)
+    with tempfile.TemporaryDirectory(prefix='delivery-mixed-') as store:
+        outbox.config.DELIVERY_DIR = store + '/'
+        bridge.discovery.peer_progress = lambda agent, session_id, after=None, token=None: {
+            'answer': None, 'answered_at': None, 'is_working': True}
+        bridge.panel_state = lambda agent, session_id: {'is_open_in_a_panel': False}
+        try:
+            box = outbox.Outbox()
+            in_flight = _job(box, 'sid-mixed', wants_reply=True, summary='in flight')
+            in_flight.expires_at = time.time() + 600
+            outbox.persist(in_flight)
+
+            finished_new = _job(box, 'sid-mixed', summary='finished by a new server')
+            finished_new.state, finished_new.finished_at = outbox.STATE_DELIVERED, time.time()
+            outbox.persist(finished_new)
+
+            finished_old = _job(box, 'sid-mixed', summary='finished by an old server')
+            finished_old.state, finished_old.finished_at = outbox.STATE_DELIVERED, time.time()
+            _legacy_write_record({k: v for k, v in finished_old.describe().items()
+                                  if k not in ('created_at', 'expires_at', 'origin_pid')})
+
+            seen_by_old = {r['delivery_id'] for r in _legacy_read_records(limit=1000)}
+            in_flight_path = outbox._in_flight_dir() + f'{in_flight.delivery_id}.json'
+            check('an old server leaves a record still in flight alone',
+                  os.path.exists(in_flight_path))
+            check('and does not mistake it for a finished delivery',
+                  in_flight.delivery_id not in seen_by_old, str(seen_by_old))
+            check('it reads a new server\'s finished record as it always read finished records',
+                  {finished_new.delivery_id, finished_old.delivery_id} <= seen_by_old,
+                  str(seen_by_old))
+
+            carried = outbox.read_record(in_flight.delivery_id) or {}
+            check('the in-flight record is whole after the old server has been through',
+                  carried.get('state') == outbox.STATE_QUEUED and carried.get('finished_at') is None,
+                  str(carried)[:200])
+
+            report = bridge.delivery_report(finished_old.delivery_id)
+            record = report.get('delivery') or {}
+            check('a new server reports a record an old server wrote',
+                  report.get('ok') is True and record.get('state') == outbox.STATE_DELIVERED
+                  and record.get('is_orphaned') is False and 'note' not in report, str(report)[:300])
+
+            # an old server's write in progress uses one fixed temporary name
+            legacy_temporary = store + f'/{finished_old.delivery_id}.json.tmp'
+            with open(legacy_temporary, 'w', encoding='utf-8') as f:
+                f.write('{')
+            outbox.read_records()
+            check('a new server leaves an old server\'s fresh temporary alone',
+                  os.path.exists(legacy_temporary))
+        finally:
+            outbox.config.DELIVERY_DIR = original_dir
+            bridge.discovery.peer_progress, bridge.panel_state = originals
+
+
 def contextlib_suppress():
     import contextlib
     return contextlib.suppress(Exception)
@@ -2797,6 +2903,7 @@ def run_all() -> None:
     test_a_delivery_orphaned_in_the_queue_is_known_never_to_have_landed()
     test_in_flight_records_expire_and_are_pruned()
     test_servers_sharing_the_delivery_directory_do_not_trip_over_each_other()
+    test_servers_from_before_in_flight_records_share_the_directory_safely()
 
 if __name__ == '__main__':
     # Delivery records are written by any finished job, so a test run left rows like
