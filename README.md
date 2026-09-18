@@ -1,9 +1,45 @@
 # cross-agent MCP
 
-VS Code에서 **이미 대화 중인 Claude Code 세션**과 **Codex 스레드**를 서로 교신시키는 중계 MCP 서버.
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-새 에이전트를 매번 띄우는 것이 아니라, 각 제품이 디스크에 남기는 세션 트랜스크립트에서
-**현재 활성 세션 ID를 찾아 그 세션을 resume** 하므로 양쪽 모두 기존 문맥을 그대로 유지한다.
+**Let your Claude Code session and your Codex thread talk to each other — live, in VS Code, without either one losing its memory.**
+
+cross-agent MCP is a relay MCP server for two coding agents that are already running side by
+side in the same VS Code window: an active **Claude Code** session and an active **Codex**
+thread. Either one can hand a message to the other through `send_to_codex` / `send_to_claude`,
+and the bridge finds each product's **currently active session** from the transcript it leaves
+on disk and **resumes it** — instead of spawning a disposable new agent — so both sides keep
+their full existing context.
+
+That's the difference from just running a second CLI by hand: neither side has to re-explain
+the task, and neither one loses the conversation it was already having. A few things this is
+useful for:
+
+- **Get a second opinion without leaving your conversation.** Ask Codex to review or double-check
+  Claude's plan, or the other way around, and keep working while it thinks.
+- **Hand off a long task and keep going.** `send_to_*` is asynchronous — it queues the message
+  and returns immediately. Whenever the peer's answer is ready, it arrives back as a new message
+  in your own session.
+- **Watch it happen, not just read a log.** With the two panel shims from
+  [section 3](#3-registration) installed, both directions render in VS Code's real chat panel
+  like any other message, instead of just appending a line to a transcript file.
+- **Nothing is lost to a timeout.** Because nothing blocks, a peer turn that takes ten minutes is
+  fine — the reply lands whenever it lands.
+
+## Contents
+
+- [1. Requirements](#1-requirements)
+- [2. Installation](#2-installation)
+- [3. Registration](#3-registration)
+- [4. Tools](#4-tools)
+- [5. Session resolution rules](#5-session-resolution-rules)
+- [6. Preventing infinite calls](#6-preventing-infinite-calls)
+- [7. Environment variables](#7-environment-variables)
+- [8. Verification](#8-verification)
+- [9. Known limitations](#9-known-limitations)
+- [License](#license)
 
 ```
         VS Code
@@ -19,45 +55,33 @@ session A        thread B
    (~/.cross-agent/registry.json)
 ```
 
-| 방향 | 도구 | 패널 셰임이 있을 때 | 없을 때 (폴백) |
+| Direction | Tool | With panel shim | Without it (fallback) |
 |---|---|---|---|
-| Claude → Codex | `send_to_codex` | 패널 app-server에 `turn/start` 주입 | `codex exec resume <thread-id> --json` |
-| Codex → Claude | `send_to_claude` | 패널 프로세스에 stream-json 사용자 메시지 주입 | `claude -p --resume <session-id> --output-format json` |
+| Claude → Codex | `send_to_codex` | Inject `turn/start` into the panel's app-server | `codex exec resume <thread-id> --json` |
+| Codex → Claude | `send_to_claude` | Inject a stream-json user message into the panel process | `claude -p --resume <session-id> --output-format json` |
 
-셰임을 붙이면 교신이 **실제 VS Code 패널에 그대로 렌더링**된다(3장 참고).
+With the shim attached, the exchange **renders directly in the real VS Code panel** (see section 3).
 
-교신은 **비동기**다. `send_to_*`는 메시지를 큐에 넣고 즉시 반환하며 상대의 답을 담지
-않는다. 상대 턴은 백그라운드 워커가 수행하고, 답이 나오면 그 답을 **발신자 세션에 새
-메시지로 배달**한다. 기다림이 없으므로 어느 쪽 세션도 상대 턴 동안 잠기지 않고, 턴이
-몇 분 걸려도 타임아웃으로 유실되지 않는다.
+The exchange is **asynchronous**. `send_to_*` queues the message and returns immediately — it does not carry the peer's reply. A background worker runs the peer's turn, and once a reply exists, it's **delivered to the sender's session as a new message**. Because nothing blocks, neither session is locked while the peer's turn runs, and a turn that takes several minutes won't be lost to a timeout.
 
 ```
-send_to_codex ──▶ [outbox 큐] ──▶ Codex 턴 (수 분)
-     │                                  │
-  즉시 반환                          답변 생성
+send_to_codex ──▶ [outbox queue] ──▶ Codex turn (minutes)
+     │                                   │
+returns immediately                answer generated
   (delivery_id)                         │
                                         ▼
-                        Claude 세션에 "BRIDGE REPLY" 메시지 배달
+                  delivered to the Claude session as a "BRIDGE REPLY" message
 ```
 
-#### 회신 주소
+#### Reply address
 
-답이 돌아올 곳을 알아야 하므로, 발신자는 **자기 세션을 정확히 알아야 한다.** 이건 추론하지
-않는다 — 셰임이 확장과 에이전트 사이에 끼어 있으므로 MCP 서버는 자기 셰임의 자손이고,
-**자기 조상 체인에 pid가 있는 셰임이 곧 자신을 호스팅하는 대화**다. 확정이지 추측이 아니다.
+Since the reply needs somewhere to land, the sender must **know its own session precisely.** This isn't inferred — because the shim sits between the extension and the agent, the MCP server is a descendant of its own shim, and **the shim whose pid appears in its own ancestor chain is exactly the conversation hosting it.** That's a certainty, not a guess.
 
-pin으로 이걸 대신하면 안 된다. pin은 "어디로 **보낼**까"를 기록한 것이지 "내가 **누구**인가"가
-아니다. 실제로 그렇게 동작하던 시절, 오래된 pin이 회신 주소로 쓰여 답장이 엉뚱한 세션으로
-갔다.
+A pin must not substitute for this. A pin records "where to **send**," not "who **I am**." When it once worked that way, a stale pin got used as the reply address and replies landed in the wrong session.
 
-Codex는 한 단계 더 정확하다. 한 창의 Codex 스레드들은 app-server 하나와 MCP 서버 하나를
-**공유**하므로 프로세스 트리는 "이 창"까지만 말해 주고, 그 안의 어느 스레드인지는 못 가른다
-(가장 최근에 활동한 스레드를 고르던 시절, 회신 4통이 묻지도 않은 스레드로 갔다). 대신 Codex는
-MCP 호출마다 `x-codex-turn-metadata`(thread id, turn id)를 실어 보내므로, 브리지는 **호출한
-스레드가 스스로 밝힌 id**를 회신 주소로 쓴다. 이 값이 있으면 추론보다 우선한다. Claude Code는
-대화마다 프로세스가 따로라 트리만으로 충분하다.
+Codex needs one more level of precision. All the Codex threads in one window **share** a single app-server and a single MCP server, so the process tree can only tell you "this window," not which thread within it (back when the most-recently-active thread was picked instead, four replies landed in threads that had never asked anything). Instead, Codex attaches `x-codex-turn-metadata` (thread id, turn id) to every MCP call, so the bridge uses **the id the calling thread declares about itself** as the reply address. When this value is present it takes priority over inference. Claude Code runs a separate process per conversation, so the process tree alone is enough there.
 
-주소는 봉투에도 적힌다 — 이메일의 From과 같다.
+The address is also written into the envelope — like the From line of an email.
 
 ```
 === CROSS-AGENT BRIDGE MESSAGE ===
@@ -66,35 +90,30 @@ reply-to: claude session 058a16bc-3a77-4604-a328-9409c391f918
 conversation: conv_7bc3806dc3a8 | hop 1/4
 ```
 
-브리지가 답을 알아서 배달하므로 이 줄이 회신을 **성립시키는** 것은 아니다. 자동 경로가
-안 될 때, 그리고 상대가 **새 요청**을 되보낼 때 값을 한다 — 이쪽에서 뭐가 활성인지 다시
-추론하지 않고 정확히 그 세션을 겨냥할 수 있다.
+Since the bridge delivers the reply on its own, this line doesn't **establish** the reply. It earns its keep when the automatic path fails, and when the peer sends back a **new request** — it can target that exact session without re-inferring what's active on this side.
 
-회신 배달은 **발신자 세션의 디렉터리에서** 실행한다. Claude 트랜스크립트는 자기 프로젝트
-디렉터리 아래 보관되므로, 요청이 향했던 디렉터리에서 resume하면 세션이 멀쩡해도
-`No conversation found`가 난다.
+Reply delivery runs **from the sender session's directory.** Claude transcripts are stored under their own project directory, so resuming from the directory the request was headed toward produces `No conversation found` even when the session itself is fine.
 
 ---
 
-## 1. 요구사항
+## 1. Requirements
 
 - macOS / Linux, Python 3.10+
 - `claude` CLI (Claude Code 2.x), `codex` CLI (0.146+)
-- 두 CLI 모두 로그인 완료 상태
+- Both CLIs logged in
 
-## 2. 설치
+## 2. Installation
 
 ```bash
-cd /Users/dexter/project/cross-agent_mcp
+cd ~/project/cross-agent_mcp
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 chmod +x run-server.sh
 ```
 
-## 3. 등록
+## 3. Registration
 
-양쪽 모두 **user-level(전역)** 로 등록한다. 브리지가 새로 만드는 세션은
-샌드박스/승인 없이 동작하도록 환경변수를 함께 준다.
+Register both at the **user (global) level.** Pass along the environment variables so that sessions the bridge newly creates run without sandbox/approval friction.
 
 ### Claude Code
 
@@ -102,17 +121,16 @@ chmod +x run-server.sh
 claude mcp add cross-agent -s user \
   -e CROSS_AGENT_CODEX_SANDBOX=danger-full-access \
   -e CROSS_AGENT_CLAUDE_PERMISSION_MODE=bypassPermissions \
-  -- /Users/dexter/project/cross-agent_mcp/run-server.sh
+  -- ~/project/cross-agent_mcp/run-server.sh
 ```
 
-`~/.claude.json`의 최상위 `mcpServers`에 기록되어 모든 프로젝트에서 쓸 수 있다.
-특정 프로젝트에만 붙이려면 `-s local`, 리포지터리로 공유하려면 프로젝트 루트 `.mcp.json`을 쓴다.
+This is written into the top-level `mcpServers` of `~/.claude.json`, so it's available in every project. To attach it to just one project use `-s local`; to share it via the repository, use a project-root `.mcp.json`.
 
 ```json
 {
   "mcpServers": {
     "cross-agent": {
-      "command": "/Users/dexter/project/cross-agent_mcp/run-server.sh",
+      "command": "~/project/cross-agent_mcp/run-server.sh",
       "env": {
         "CROSS_AGENT_CODEX_SANDBOX": "danger-full-access",
         "CROSS_AGENT_CLAUDE_PERMISSION_MODE": "bypassPermissions"
@@ -128,30 +146,26 @@ claude mcp add cross-agent -s user \
 codex mcp add cross-agent \
   --env CROSS_AGENT_CODEX_SANDBOX=danger-full-access \
   --env CROSS_AGENT_CLAUDE_PERMISSION_MODE=bypassPermissions \
-  -- /Users/dexter/project/cross-agent_mcp/run-server.sh
+  -- ~/project/cross-agent_mcp/run-server.sh
 ```
 
-`~/.codex/config.toml`에 아래가 추가된다(Codex는 전역 설정만 지원).
+This adds the following to `~/.codex/config.toml` (Codex only supports global config).
 
 ```toml
 [mcp_servers.cross-agent]
-command = "/Users/dexter/project/cross-agent_mcp/run-server.sh"
-default_tools_approval_mode = "approve"   # UI에서 매번 승인 프롬프트가 뜨지 않도록 (수동 추가)
+command = "~/project/cross-agent_mcp/run-server.sh"
+default_tools_approval_mode = "approve"   # so the UI doesn't show an approval prompt every time (added manually)
 
 [mcp_servers.cross-agent.env]
 CROSS_AGENT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
 CROSS_AGENT_CODEX_SANDBOX = "danger-full-access"
 ```
 
-`default_tools_approval_mode`는 `codex mcp add`에 해당 플래그가 없어 config.toml에 직접 넣는다.
-유효값은 `auto` / `prompt` / `writes` / `approve`이며, 매번 뜨는 승인 프롬프트를 없애려면
-`approve`를 쓴다(`auto`로는 계속 물어봤다). 헤드리스 `codex exec`의 취소 문제는 이것으로
-해결되지 않는다(9장 참고). UI 프롬프트에서 **"Always allow"** 를 한 번 눌러도 같은 효과다.
+`default_tools_approval_mode` has no corresponding flag on `codex mcp add`, so it's added directly to config.toml. Valid values are `auto` / `prompt` / `writes` / `approve`; use `approve` to stop the approval prompt from popping up every time (`auto` kept asking). This does **not** fix the cancellation problem with headless `codex exec` (see section 9). Clicking **"Always allow"** once on the UI prompt has the same effect.
 
-### 승인 프롬프트 끄기 (Claude Code)
+### Turning off the approval prompt (Claude Code)
 
-Claude Code는 MCP 도구 호출마다 승인을 묻는다. `~/.claude/settings.json`에 서버 단위
-규칙을 추가하면 된다(도구별 나열이나 `*` 와일드카드가 아니라 **서버 이름 하나**).
+Claude Code asks for approval on every MCP tool call. Add a server-level rule to `~/.claude/settings.json` (**a single server name**, not a per-tool list or a `*` wildcard).
 
 ```json
 {
@@ -161,426 +175,437 @@ Claude Code는 MCP 도구 호출마다 승인을 묻는다. `~/.claude/settings.
 }
 ```
 
-> ⚠️ 위 두 환경변수는 **브리지를 통해 도달한 에이전트의 안전장치를 끈다.**
-> Claude는 권한 확인 없이 파일을 수정·명령을 실행하고, 새로 생성되는 Codex 세션은
-> 샌드박스 없이 동작한다. 신뢰하는 로컬 작업에서만 쓸 것.
-> 되돌리려면 두 `-e/--env` 인자를 빼고 다시 등록하면 기본값(`read-only` / 에이전트 기본 권한)으로 돌아간다.
+> [!WARNING]
+> The two environment variables above **turn off the safety rails for an agent reached through the bridge.**
+> Claude edits files and runs commands without confirmation, and newly created Codex sessions
+> run without a sandbox. Use this only for trusted local work.
+> To revert, drop both `-e`/`--env` arguments and re-register; that restores the defaults (`read-only` / the agent's default permissions).
 
-> 등록 직후에는 **VS Code 창을 새로고침**하거나 새 세션을 시작해야 도구가 잡힌다.
-> MCP 서버는 세션 시작 시점에만 연결된다.
+> [!NOTE]
+> Right after registering, you need to **reload the VS Code window** or start a new session for the tool to be picked up.
+> MCP servers connect only at session start.
 
-### IDE 패널 연동 (양방향)
+### IDE panel integration (bidirectional)
 
-CLI resume 경로(`codex exec resume` / `claude -p --resume`)는 세션 기록에 턴을 덧붙이므로
-문맥은 유지되지만 **VS Code 패널에는 나타나지 않는다.** 패널의 세션은 확장이 stdio로 직결해
-띄운 자식 프로세스 안에만 살아 있고, 밖에서 들어갈 통로가 없기 때문이다.
+The CLI resume path (`codex exec resume` / `claude -p --resume`) appends a turn to the session history, so context is preserved, but it **doesn't show up in the VS Code panel.** The panel's session lives only inside the child process the extension spawned and connected to directly over stdio, and there's no way in from outside.
 
-두 셰임을 그 파이프 가운데 끼우면 해결된다.
+Inserting the two shims into the middle of that pipe solves it.
 
 ```
-VS Code 확장 ──stdio──▶ codex-shim.sh  ──stdio──▶ 진짜 codex app-server
-VS Code 확장 ──stdio──▶ claude-shim.sh ──stdio──▶ 진짜 claude (stream-json)
-                            ▲
-                            │ 유닉스 소켓
-                      cross-agent MCP  ──▶ 메시지 주입 ──▶ 패널에 렌더링
+VS Code extension ──stdio──▶ codex-shim.sh  ──stdio──▶ real codex app-server
+VS Code extension ──stdio──▶ claude-shim.sh ──stdio──▶ real claude (stream-json)
+                                  ▲
+                                  │ unix socket
+                          cross-agent MCP  ──▶ inject message ──▶ rendered in panel
 ```
 
-VS Code 사용자 설정에 추가하고 **창을 새로고침**한다.
+Add these to VS Code user settings and **reload the window.**
 
 ```json
-"chatgpt.cliExecutable": "/Users/dexter/project/cross-agent_mcp/codex-shim.sh",
-"claudeCode.claudeProcessWrapper": "/Users/dexter/project/cross-agent_mcp/claude-shim.sh"
+"chatgpt.cliExecutable": "~/project/cross-agent_mcp/codex-shim.sh",
+"claudeCode.claudeProcessWrapper": "~/project/cross-agent_mcp/claude-shim.sh"
 ```
 
 | | Codex | Claude Code |
 |---|---|---|
-| 설정 키 | `chatgpt.cliExecutable` (바이너리 **교체**) | `claudeCode.claudeProcessWrapper` (`<wrapper> <진짜경로> <args>`) |
-| 가로채는 호출 | plain `app-server` | `--input-format stream-json` 세션 |
-| 주입 방식 | JSON-RPC `turn/start` (id는 `xagent-` 네임스페이스) | stream-json `{"type":"user",...}` |
-| 세션 id 출처 | `thread/started` · 요청 params | argv `--resume=` · `system/init` |
-| 사람 입력 관측 | 확장이 보낸 `turn/start` · `turn/steer` | 확장이 보낸 `{"type":"user"}` |
-| 패널 표시 | 사용자 메시지 + 응답 | 사용자 메시지 + 응답 |
-| 설정 성격 | "DEVELOPMENT ONLY" 표시 | 정식 설정 |
+| Setting key | `chatgpt.cliExecutable` (**replaces** the binary) | `claudeCode.claudeProcessWrapper` (`<wrapper> <real-path> <args>`) |
+| Call intercepted | plain `app-server` | `--input-format stream-json` sessions |
+| Injection method | JSON-RPC `turn/start` (id in the `xagent-` namespace) | stream-json `{"type":"user",...}` |
+| Session id source | `thread/started` · request params | argv `--resume=` · `system/init` |
+| Human input observed | `turn/start` · `turn/steer` sent by the extension | `{"type":"user"}` sent by the extension |
+| Shown in panel | user message + response | user message + response |
+| Setting status | marked "DEVELOPMENT ONLY" | an official setting |
 
-공통 규칙:
+Shared rules:
 
-- 모든 바이트를 그대로 통과시키고, **패널 세션 호출만** 가로챈다
-  (`--version`, `login`, `app-server daemon`, `claude -p` 등은 진짜 바이너리로 exec)
-- 진짜 바이너리는 확장 디렉터리에서 자동 탐색한다
-  (`CROSS_AGENT_REAL_CODEX` / `CROSS_AGENT_REAL_CLAUDE`로 지정 가능)
-- 어떤 이유로든 실패하면 진짜 바이너리를 그대로 exec 한다 (fail-open)
-- 셰임은 자기 pid 조상 목록을 `~/.cross-agent/panels/<agent>-<pid>.json`에 기록한다.
-  브리지는 **자신과 조상을 공유하는 셰임**을 고르므로, 창이 여러 개여도
-  "지금 이 IDE 인스턴스"를 정확히 겨냥한다
-- Claude 셰임은 사용자가 대화 중이면 그 턴이 끝날 때까지 기다렸다가 주입한다
-- Codex 셰임은 **서브에이전트 스레드를 대상에서 제외**한다. 멀티에이전트 실행이 만드는
-  스레드는 app-server가 직접 입력을 거부하며(`direct app-server input is not allowed for
-  multi-agent v2 sub-agents`), `parentThreadId`·`agentNickname`·`agentRole`·
-  `canAcceptDirectInput`로 판별한다. 알림에 실려 오는 thread id만으로는 대상을 새로 만들지
-  않고, 확장이 직접 보낸 `thread/start`·`thread/resume`·`turn/start`·`turn/steer`만 신뢰한다.
-  그래도 거부당하면 그 스레드를 버리고 새 대화를 열어 한 번 재시도한다
+- Passes every byte straight through, and intercepts **only panel-session calls**
+  (`--version`, `login`, `app-server daemon`, `claude -p`, etc. exec straight to the real binary)
+- Auto-discovers the real binary inside the extension directory
+  (can be overridden with `CROSS_AGENT_REAL_CODEX` / `CROSS_AGENT_REAL_CLAUDE`)
+- On any failure, it execs the real binary as-is (fail-open)
+- The shim records its own pid ancestor list in `~/.cross-agent/panels/<agent>-<pid>.json`.
+  The bridge picks the **shim that shares an ancestor with itself**, so even with multiple
+  windows open it targets exactly "this IDE instance"
+- The Claude shim waits for the current turn to finish before injecting, if the user is mid-conversation
+- The Codex shim **excludes sub-agent threads** from targeting. Threads created by a
+  multi-agent run reject direct input at the app-server level (`direct app-server input is
+  not allowed for multi-agent v2 sub-agents`), and are identified via `parentThreadId` ·
+  `agentNickname` · `agentRole` · `canAcceptDirectInput`. A thread id arriving only in a
+  notification is never enough on its own to create a new target — only `thread/start` ·
+  `thread/resume` · `turn/start` · `turn/steer` sent directly by the extension are trusted.
+  If it's still rejected, the shim drops that thread, opens a new conversation, and retries once
 
-#### 새 대화는 최후의 수단
+#### A new conversation is the last resort
 
-**긴 작업 중에 새 대화가 열리면 그 전까지의 문맥이 전부 사라진다.** 상대가 갑자기 아무것도
-기억 못 하는 것처럼 보이므로, 되살릴 수 있는 대화가 하나라도 있으면 절대 새로 만들지 않는다.
+**If a new conversation opens mid-task, all context up to that point is gone.** The peer suddenly appears to remember nothing, so if there's any recoverable conversation at all, a new one is never created.
 
 ```
-1. session_id 로 지정한 세션        ← id 또는 대화 이름
-2. pin_agent_session 으로 고정한 세션
-3. 이 창 패널에 열려 있는 대화       ← 패널에 그대로 보임
-4. 디스크의 활성 세션 (CLI resume)   ← 패널엔 안 보이지만 문맥은 그대로
-5. 어디에도 없을 때만 → 새 대화
+1. The session named by session_id        ← id or conversation name
+2. The session pinned via pin_agent_session
+3. The conversation open in this window's panel   ← visible directly in the panel
+4. The active session on disk (CLI resume)  ← not visible in the panel, but context is intact
+5. Only when none of these exist → a new conversation
 ```
 
-3번과 4번의 순서가 중요하다. 예전에는 "패널에 대화가 없으면 새로 연다"가 4번보다 먼저
-걸려서, 디스크에 멀쩡한 세션이 있어도 새 대화를 만들어 버렸다.
+The order of 3 and 4 matters. It used to be that "if the panel has no conversation, open a new one" fired before step 4, so a perfectly fine session on disk would still get a new conversation created over it.
 
-**이름으로 지정할 수 있다. 단 정확 일치만.** 사람은 uuid가 아니라 이름으로 대화를 부르므로
-`session_id`에 대화 이름을 그대로 넣어도 된다.
+**You can specify by name — but only an exact match.** People refer to conversations by name, not uuid, so you can put the conversation name directly into `session_id`.
 
-- **사람이 붙인 이름이 정본이다.** 패널 상단에 보이는 그 이름이며, 트랜스크립트에
-  `{"type":"custom-title","customTitle":"…"}`로 남는다. 개명하면 다시 붙으므로 **마지막 값**을
-  쓴다. Codex 스레드는 `~/.codex/session_index.jsonl`이 이름을 준다.
-- 이름을 안 붙인 대화는 첫 메시지로 만든 제목이 대신 쓰인다. 그건 **설명이지 이름이 아니므로**
-  그 안의 단어로는 찾히지 않는다.
-- **부분 일치는 하지 않는다.** 예전에는 했고, `koppa_studio`가 몇 달 전 세션의 첫 메시지에
-  인용된 경로와 맞아떨어져 아무도 보고 있지 않은 세션을 헤드리스로 되살렸다. 정작
-  `koppa_studio`라는 이름을 가진 세션은 못 찾은 채로.
-- 일치하는 이름이 없으면 **비슷한 제목들을 알려주고 실패**하며, 새 대화를 만들지 않는다.
-`session_id`와 `new_session`은 함께 쓸 수 없다(서로 반대 의도).
-`pin_agent_session`도 마찬가지다.
+- **The name a human assigned is the source of truth.** It's the name shown at the top of the panel, recorded in the transcript as `{"type":"custom-title","customTitle":"…"}`. Renaming appends another one, so the **last value** is used. For Codex threads, `~/.codex/session_index.jsonl` supplies the name.
+- A conversation with no assigned name falls back to a title generated from the first message. That's a **description, not a name**, so it can't be found by a word inside it.
+- **No partial matching.** It used to allow it, and `koppa_studio` once matched a path quoted in a months-old session's first message, headlessly reviving a session nobody was watching — while the session actually *named* `koppa_studio` went unfound.
+- If no name matches, it **reports similar titles and fails** rather than creating a new conversation.
+`session_id` and `new_session` can't be used together (they express opposite intents), and neither can `session_id` and `pin_agent_session`.
 
 ```
 send_to_claude(message=..., session_id="studio_v4_orginial")
 pin_agent_session(agent="claude", session_id="studio_v4_orginial")
 ```
 
-이름이든 id든 **지정한 것이 없으면 새로 만들지 않고 에러**를 낸다. 조용히 다른 대화를
-시작하는 것보다 실패하는 편이 낫기 때문이다.
+Whether by name or id, if what was specified **doesn't exist, it errors instead of creating a new one.** Failing is better than silently starting a different conversation.
 
-새 대화가 열렸을 때는 응답의 `warning` 필드에 그 사실과 이유가 실린다.
+When a new conversation is opened, the response's `warning` field carries that fact and the reason.
 
-#### 패널에 열린 대화가 없을 때
+#### When the panel has no conversation open
 
-패널이 대화 목록만 띄우고 있어도 그 뒤에는 살아 있는 프로세스가 있다. 이때 CLI로
-폴백하면 요청자는 답을 받지만 **패널은 빈 채로 남아** 브리지가 아무 일도 안 한 것처럼 보인다.
-그래서 셰임이 **패널에 새 대화를 연 뒤** 거기에 메시지를 넣는다.
+Even when the panel is only showing a conversation list, there's a live process behind it. Falling back to the CLI here means the requester gets an answer, but **the panel stays empty**, making it look like the bridge did nothing. So the shim **opens a new conversation in the panel** and puts the message there instead.
 
-- Codex : `thread/start`로 스레드를 만든다. app-server가 `thread/started` 알림을
-  브로드캐스트하므로 확장이 그 스레드를 인지하고 렌더링한다
-- Claude : 세션 없이 떠 있는 패널 프로세스에 그냥 사용자 메시지를 쓴다.
-  CLI가 새 대화를 시작하고 `system/init`으로 세션 id가 잡힌다
+- Codex: creates a thread with `thread/start`. The app-server broadcasts a `thread/started` notification, so the extension picks up the thread and renders it
+- Claude: just writes a user message to the panel process that's running without a session. The CLI starts a new conversation and the session id is captured from `system/init`
 
-접수증의 `will_create_session`이 `true`면 이렇게 새로 열릴 대화다.
-Codex는 `thread/name/set`으로 **"발신자: 메시지 앞부분"** 형태의 제목까지 달아 준다.
-그렇지 않으면 목록에 "New chat"으로만 남아 어떤 대화인지 알 수 없다.
+When the receipt's `will_create_session` is `true`, this is the conversation that will be opened. Codex also sets a title of the form **"sender: start of the message"** via `thread/name/set`; otherwise it would just sit in the list as "New chat" with no way to tell which conversation it is.
 
-새 대화는 목록에 뜨고 unread 표시가 붙지만 **패널이 자동으로 그 대화를 열지는 않는다.**
-app-server 프로토콜에는 클라이언트를 특정 대화로 이동시키는 알림이 없고,
-확장의 `vscode://` 딥링크(`/local/<thread-id>` 라우트)는 **창을 지정할 수 없어**
-열려 있는 모든 VS Code 인스턴스의 Codex 패널이 함께 이동한다. 그래서 채택하지 않았다.
+The new conversation shows up in the list with an unread marker, but **the panel doesn't automatically open it.** The app-server protocol has no notification that moves the client to a specific conversation, and the extension's `vscode://` deep link (the `/local/<thread-id>` route) **can't target a specific window** — it moves the Codex panel of every open VS Code instance at once. So it wasn't adopted.
 
-#### 어느 대화 탭으로 가는가
+#### Which conversation tab it goes to
 
-확장은 **대화 탭마다 프로세스를 따로 띄우므로** 한 창에 셰임이 여러 개 뜬다. 어느 탭이
-포커스인지는 어디에도 기록되지 않으므로, 다음 순서의 증거로 고른다.
+The extension **spawns a separate process per conversation tab**, so a single window ends up with multiple shims running. Nothing records which tab has focus, so it's picked using the following order of evidence.
 
 ```
-1. send_to_*(session_id=...) 로 명시한 세션
-2. pin_agent_session 으로 고정한 세션
-3. 사람이 마지막으로 입력한 탭 (셰임이 확장→에이전트 방향에서 직접 관측)
-4. (셰임 기동 후 아무도 입력하지 않은 경우 - 예: 창 새로고침 직후)
-   트랜스크립트가 가장 최근에 갱신된 탭
-5. 가장 나중에 열린 탭
+1. The session explicitly given via send_to_*(session_id=...)
+2. The session pinned via pin_agent_session
+3. The tab a human typed into most recently (observed directly by the shim on the extension→agent path)
+4. (If nobody has typed since the shim started — e.g. right after a window reload)
+   the tab whose transcript was updated most recently
+5. The most recently opened tab
 ```
 
-관측된 사람 입력이 트랜스크립트 시각보다 **항상 우선**한다. 브리지가 주입한 턴도
-트랜스크립트를 건드리므로, 그렇지 않으면 브리지가 자기가 마지막에 쓴 탭을 계속
-다시 고르게 된다. 주입 턴은 관측 대상이 아니라 이 오염이 애초에 생기지 않는다.
+Observed human input **always takes priority** over transcript timing. Turns the bridge itself injects also touch the transcript, so without this rule the bridge would keep re-picking the tab it last wrote to. Injected turns aren't counted as observed input, so this contamination never arises in the first place.
 
-`bridge_status`의 `ide_panels`가 열린 탭 목록과 선택 결과를 그대로 보여준다.
-원하는 탭이 아니면 `pin_agent_session`으로 고정하면 된다.
+`bridge_status`'s `ide_panels` shows the list of open tabs and the selection result as-is. If it's not the tab you want, pin one with `pin_agent_session`.
 
-#### 다른 VS Code 창의 대화
+#### Conversations in another VS Code window
 
-셰임 소켓은 평범한 유닉스 소켓이라 창에 종속되지 않는다. 프로세스 조상 판별이 정하는 것은
-**"어느 창인가"이지 "닿을 수 있는가"가 아니다.** 그래서 규칙을 둘로 나눈다.
+The shim socket is an ordinary unix socket and isn't tied to a window. What process-ancestor detection determines is **"which window," not "can it be reached."** So the rule splits into two.
 
-| 상황 | 동작 |
+| Case | Behavior |
 |---|---|
-| `session_id` 없이 자동 선택 | **이 창 안에서만** 고른다. 다른 창의 대화에 멋대로 들어가면 곤란하므로 |
-| `session_id`로 명시 | 이 창을 먼저 뒤지고, 없으면 **다른 창까지 찾아 그 창의 셰임으로 배달**한다 |
+| Auto-selected, no `session_id` | Picks **only within this window** — barging into another window's conversation uninvited would be a problem |
+| Explicit `session_id` | Searches this window first, then, if not found, **looks across other windows and delivers to that window's shim** |
 
-`bridge_status`의 `ide_panels.<agent>.other_window_sessions`가 다른 창에서 열린 대화를
-보여준다. 자동 선택 후보는 아니지만 `session_id`로 지목하면 닿는다.
+`bridge_status`'s `ide_panels.<agent>.other_window_sessions` shows conversations open in other windows. They're not candidates for auto-selection, but they're reachable if named explicitly via `session_id`.
 
-이 구분이 없으면 다른 창의 세션은 헤드리스 CLI resume으로 폴백하는데, 그 대화를 그 창의
-패널이 살아서 물고 있으면 CLI가 `thread-store conflict: already has an active writer`로
-거부한다. 즉 **명시된 세션을 창 밖까지 찾는 것은 편의가 아니라 유일하게 성공하는 경로다.**
+Without this distinction, a session in another window would fall back to a headless CLI resume, which the CLI rejects with `thread-store conflict: already has an active writer` if that window's live panel is still holding onto the conversation. In other words, **reaching outside the window for an explicitly named session isn't a convenience — it's the only path that actually succeeds.**
 
-`CROSS_AGENT_UI_HOOK`으로 동작을 고른다 — `auto`(기본, 있으면 쓰고 없으면 CLI로 폴백),
-`off`(항상 CLI), `require`(패널을 못 찾으면 조용히 폴백하지 않고 실패).
+`CROSS_AGENT_UI_HOOK` selects the behavior — `auto` (default: use it if present, fall back to CLI otherwise), `off` (always CLI), `require` (fail instead of silently falling back if the panel can't be found).
 
-> ⚠️ 셰임은 확장과 에이전트 사이에 끼는 프로세스다. 확장이 업데이트되면 깨질 수 있고,
-> `chatgpt.cliExecutable`은 확장이 "DEVELOPMENT ONLY"로 표시한 application 스코프 설정이다.
-> 되돌리려면 해당 설정 줄을 지우고 창을 새로고침하면 된다.
+> [!WARNING]
+> The shim is a process wedged between the extension and the agent. It can break when the extension updates, and `chatgpt.cliExecutable` is an application-scoped setting the extension itself marks "DEVELOPMENT ONLY."
+> To revert, delete that setting line and reload the window.
 
-### 상태 점검
+### Status check
 
 ```bash
 ./run-server.sh --check
 ```
 
-실행 주체, 두 CLI 경로, 현재 해석되는 활성 세션, 적용 중인 설정을 출력하고 종료한다.
-인자 없이 실행하면 MCP stdio 서버로 떠서 stdin을 기다린다(정상 동작이며, Ctrl-C로 종료).
+Prints who's running it, both CLI paths, the currently resolved active session, and the settings in effect, then exits. Run with no arguments, it comes up as an MCP stdio server and waits on stdin (this is normal — exit with Ctrl-C).
 
 ---
 
-## 4. 도구
+## 4. Tools
 
-| 도구 | 설명 |
+| Tool | Description |
 |---|---|
-| `send_to_codex(message, ...)` | 활성 Codex 스레드에 메시지를 보낸다. **비동기 — 응답은 담기지 않는다** |
-| `send_to_claude(message, ...)` | 활성 Claude 세션에 메시지를 보낸다. **비동기 — 응답은 담기지 않는다** |
-| `list_agent_sessions(agent, scope, cwd, limit)` | 브리지가 찾을 수 있는 세션 목록 (최신순, 활성 여부 포함) |
-| `bridge_status(cwd, scope, delivery_id)` | 실행 주체·해석된 세션·설정·잠금 상태와 **진행 중인 배달** 진단. `delivery_id`를 주면 그 배달 하나를 상대 트랜스크립트(`peer_transcript`)와 패널 상태(`peer_panel`: 턴 진행 중인지, **승인 프롬프트에 멈춰 있는지**)까지 다시 읽어 보고한다 |
-| `pin_agent_session(agent, session_id, cwd)` | 특정 세션을 고정(id 또는 대화 이름). 고정해 두면 새 대화가 열리지 않는다. 비우면 해제 |
+| `send_to_codex(message, ...)` | Sends a message to the active Codex thread. **Asynchronous — the response isn't carried back** |
+| `send_to_claude(message, ...)` | Sends a message to the active Claude session. **Asynchronous — the response isn't carried back** |
+| `list_agent_sessions(agent, scope, cwd, limit)` | List of sessions the bridge can find (newest first, including active status) |
+| `bridge_status(cwd, scope, delivery_id)` | Diagnostics: who's running, the resolved session, settings, lock state, and **deliveries in flight**. Given a `delivery_id`, it re-reads that one delivery's peer transcript (`peer_transcript`) and panel state (`peer_panel`: whether a turn is running, **whether it's stuck on an approval prompt**) and reports both |
+| `pin_agent_session(agent, session_id, cwd)` | Pins a specific session (by id or conversation name). While pinned, no new conversation is opened. Leave it empty to unpin |
 
-`send_to_*` 공통 파라미터:
+Common `send_to_*` parameters:
 
-| 이름 | 기본값 | 의미 |
+| Name | Default | Meaning |
 |---|---|---|
-| `message` | (필수) | 상대 에이전트에게 보낼 내용. 상대는 이쪽 대화를 못 보므로 자기완결적으로 작성 |
-| `session_id` | 자동 탐색 | 특정 세션을 지정. **세션 id 또는 대화 이름**. 일치하는 게 없으면 새로 만들지 않고 실패 |
-| `new_session` | `false` | 활성 세션이 있어도 강제로 새 세션 생성 |
-| `scope` | `cwd` | `cwd` = 같은 디렉터리 및 그 하위, `tree` = 상위 디렉터리까지, `any` = 전체 |
-| `cwd` | 서버 실행 디렉터리 | 탐색 기준 및 신규 세션 생성 위치 |
-| `timeout` | `600` | **상대 턴 자체의 예산(초).** 워커가 적용하며 호출자를 기다리게 하지 않는다 |
-| `conversation_id` | 자동 생성 | 기존 브리지 대화를 이어받아 hop 예산 공유 |
-| `raw` | `false` | 브리지 헤더 없이 원문 그대로 전달 |
+| `message` | (required) | The content to send to the peer agent. The peer can't see this side's conversation, so write it self-contained |
+| `session_id` | auto-discovered | Targets a specific session. **Session id or conversation name.** If nothing matches, it fails instead of creating a new one |
+| `new_session` | `false` | Forces a new session even if one is active |
+| `scope` | `cwd` | `cwd` = same directory and its subdirectories, `tree` = up through parent directories too, `any` = everything |
+| `cwd` | the server's working directory | Basis for discovery and where a new session gets created |
+| `timeout` | `600` | **Budget (seconds) for the peer's turn itself.** Enforced by the worker; it doesn't make the caller wait |
+| `conversation_id` | auto-generated | Continues an existing bridge conversation, sharing its hop budget |
+| `raw` | `false` | Delivers the raw text with no bridge header |
 
-`send_to_*` 반환값은 **접수증**이지 답변이 아니다.
+`send_to_claude` additionally takes `allow_same_agent` (default `false`) — a Claude session
+messaging another Claude session is refused unless this is set, or an explicit `session_id` is
+given. `send_to_codex` has no such flag; reaching another Codex thread requires an explicit
+`session_id` (see [section 6](#6-preventing-infinite-calls)).
 
-| 필드 | 의미 |
+The return value of `send_to_*` is a **receipt**, not an answer.
+
+| Field | Meaning |
 |---|---|
-| `delivery_id` | 이 배달의 식별자. `bridge_status`의 `deliveries`에서 상태를 조회 |
-| `accepted` | 큐 적재 성공 |
-| `note` | 응답이 없다는 사실과, 나중에 별도 메시지로 도착한다는 안내 |
-| `reply_lands_in_session` | 상대 답변이 배달될 발신자 세션 id. `null`이면 답변을 되돌릴 곳이 없다 |
-| `queue_depth` | 같은 대상 세션 앞에 대기 중인 배달 수 |
-| `will_create_session` | 기존 세션을 못 찾아 새 대화가 열릴 예정인지 |
+| `delivery_id` | This delivery's identifier. Look up its status in `bridge_status`'s `deliveries` |
+| `accepted` | Successfully queued |
+| `note` | States that there's no response yet, and that it'll arrive later as a separate message |
+| `reply_lands_in_session` | The sender session id the peer's answer will be delivered to. `null` means there's nowhere for the answer to return to |
+| `queue_depth` | Number of deliveries already waiting ahead of this one for the same target session |
+| `will_create_session` | Whether a new conversation will be opened because no existing session was found |
 
 ---
 
-## 5. 세션 해석 규칙
+## 5. Session resolution rules
 
-`send_to_*` 호출 시 대상 세션은 다음 순서로 결정된다.
+On a `send_to_*` call, the target session is determined in the following order.
 
 ```
-1. session_id 인자가 있으면 → 그 세션
-     - 이 창의 패널 → 다른 창의 패널 → 디스크 트랜스크립트 순으로 찾는다
-2. 레지스트리에 pin이 있으면 → 그 세션
-     - pin_agent_session으로 고정한 pin은 만료되지 않음
-     - 브리지가 자동 생성한 pin은 활성 창(기본 240분) 안에서만 유효
-3. 세션 저장소 스캔 → 조건을 만족하는 가장 적합한 트랜스크립트
-     - Claude : ~/.claude/projects/<slug(cwd)>/*.jsonl
-                사용자 메시지가 있고 sidechain 전용이 아닌 것
-     - Codex  : ~/.codex/sessions/**/rollout-*.jsonl
-                session_meta.thread_source == 'user' (subagent 스레드 제외)
-                같은 session_id의 rollout이 여러 개면 가장 최신 것
-     - 마지막 기록이 활성 창(기본 240분) 이내인 것만 "활성"으로 인정
-     - 정렬 우선순위: ① 디렉터리 일치도(정확 > 하위 > 상위) ② 최근 기록순
-       상위 디렉터리는 scope='tree'에서만 후보가 된다. 홈 디렉터리가 모든
-       프로젝트의 상위이므로, ~에서 연 세션이 아무 프로젝트나 가로채면 곤란하기 때문
-4. 위 조건을 만족하는 세션이 하나도 없으면 → 새 세션을 생성한다
-     - Claude : claude -p --session-id <새 uuid> ...
-     - Codex  : codex exec --json -C <cwd> ... (thread.started에서 id 회수)
-     - 생성된 세션은 레지스트리에 pin되어 다음 호출부터 resume 대상이 된다
+1. If a session_id argument is given → that session
+     - Searched in the order: this window's panel → another window's panel → transcript on disk
+2. If the registry has a pin → that session
+     - A pin set via pin_agent_session never expires
+     - A pin the bridge created automatically is valid only within the active window (default 240 min)
+3. Scan the session store → the best-fit transcript matching the conditions
+     - Claude: ~/.claude/projects/<slug(cwd)>/*.jsonl
+               has a user message and isn't sidechain-only
+     - Codex:  ~/.codex/sessions/**/rollout-*.jsonl
+               session_meta.thread_source == 'user' (sub-agent threads excluded)
+               if multiple rollouts share a session_id, the newest one
+     - Only counted as "active" if its last record falls within the active window (default 240 min)
+     - Sort priority: ① directory match (exact > subdirectory > parent) ② most recently recorded
+       Parent directories are only candidates under scope='tree' — since the home directory
+       is a parent of every project, a session opened at ~ must not be able to hijack an
+       arbitrary project
+4. If no session satisfies the above → create a new session
+     - Claude: claude -p --session-id <new uuid> ...
+     - Codex:  codex exec --json -C <cwd> ... (id recovered from thread.started)
+     - The created session gets pinned in the registry, becoming the resume target from the next call on
 ```
 
-즉 **활성 세션이 있으면 문맥을 유지한 채 이어 붙이고, 없으면 새로 만들어 그 이후로 재사용**한다.
+In short: **if there's an active session, it continues the context; if not, it creates one and reuses it from then on.**
 
-## 6. 무한 호출 방지
+## 6. Preventing infinite calls
 
-세 겹으로 막는다.
+It's blocked in three layers.
 
-1. **hop 예산** — 대화당 최대 `MAX_HOPS`(기본 4)회. `conversation_id`는 자식 프로세스에
-   환경변수로 전파되므로 A→B→A→B 체인이 자동으로 같은 예산을 공유한다. 초과 시 거부.
-2. **busy 잠금** — 같은 세션에 두 턴이 겹쳐 들어가는 것을 막는다. 에이전트 CLI가
-   트랜스크립트당 writer를 하나만 허용하므로 이건 예의가 아니라 필수다.
-   `~/.cross-agent/locks/`에 `O_EXCL`로 원자적으로 선점하므로 "확인 후 점유" 사이의
-   경합이 없다. 해제는 자기 토큰이 남아 있을 때만 하고, 죽은 프로세스의 잠금은 자동 회수된다.
-   **비동기 전환 이후 이 잠금은 거절 사유가 아니라 순서 대기 사유다** — 워커가 잠금이
-   풀릴 때까지 기다렸다 배달한다. 발신자 자신의 세션에는 더 이상 잠금을 걸지 않는다.
-   기다리는 쪽이 없으니 되돌아오는 relay가 교착을 만들지 않기 때문이다.
-3. **자기호출 가드** — 부모 프로세스 체인으로 호출자를 판별해, Claude가 `send_to_claude`를
-   부르는 것을 거부한다(`allow_same_agent=true` + `session_id` 명시 시에만 허용).
-4. **배달은 서버보다 오래 살지 않는다** — CLI는 자기 프로세스 그룹에서 돌기 때문에 서버가
-   죽어도 살아남는다. 그러면 아무도 보지 않는 채 상대 세션과 저장소를 계속 쓰고, busy 잠금은
-   **서버 pid로 생사를 판정**하므로 그 세션을 더는 보호하지 못한다. 재요청이 들어오면 같은
-   파일에 두 번째 에이전트가 붙는다 — 실제로 창 새로고침 후 `claude -p --resume` 두 개가
-   한 세션에서 동시에 돌았다. 서버 종료 시(atexit·SIGTERM·SIGINT·SIGHUP) 진행 중인 배달의
-   프로세스 그룹을 함께 정리한다.
+1. **Hop budget** — at most `MAX_HOPS` (default 4) per conversation. `conversation_id` propagates to child processes as an environment variable, so an A→B→A→B chain automatically shares the same budget. Rejected once exceeded.
+2. **Busy lock** — prevents two turns from overlapping in the same session. Agent CLIs allow only one writer per transcript, so this isn't courtesy, it's mandatory. It's acquired atomically in `~/.cross-agent/locks/` with `O_EXCL`, so there's no race between "check" and "acquire." It's released only while its own token is still present, and locks held by dead processes are reclaimed automatically. **Since the move to async, this lock is a reason to wait in line, not a reason to reject** — the worker waits for the lock to free up and then delivers. The sender's own session is no longer locked at all, since nobody's waiting on it, so a relay coming back around can't create a deadlock.
+3. **Self-call guard** — by default, an agent refuses to relay into another session of its *own*
+   kind: Claude cannot reach another Claude session, and Codex cannot reach another Codex thread.
+   The caller is identified from the parent process chain, not a self-reported label. This exists
+   because the two peer tools (`send_to_codex` / `send_to_claude`) are meant to cross from one
+   product to the other — routing Claude into Claude by mistake should fail loudly instead of
+   silently starting a same-agent relay.
+   - **Claude → Claude** is allowed either by passing `allow_same_agent=true` on `send_to_claude`
+     (auto-discovers another active Claude session, excluding the caller's own), or by naming an
+     explicit `session_id` (which alone is also enough to pass the guard, with or without the flag).
+   - **Codex → Codex** has no `allow_same_agent` flag — `send_to_codex` doesn't expose one — so the
+     only way to reach another Codex thread is to name it explicitly with `session_id`.
+   - Either way, **auto-discovery never picks the caller's own current session** as the target, so
+     a same-agent relay can't be routed back into itself.
+4. **A delivery doesn't outlive the server** — since the CLI runs in its own process group, it survives even if the server dies. It would then keep writing to the peer session and store with nobody watching, and since the busy lock **decides life or death by the server's pid**, it can no longer protect that session. If a re-request comes in, a second agent attaches to the same file — in practice, two `claude -p --resume` processes once ran concurrently against the same session after a window reload. On server shutdown (atexit, SIGTERM, SIGINT, SIGHUP), the process groups of any in-flight deliveries are cleaned up together with it.
 
-전달되는 메시지에는 발신자·대화 ID·남은 hop이 담긴 헤더가 붙는다. 상대의 최종 메시지는
-`BRIDGE REPLY` 헤더를 달고 발신자 세션으로 배달되며, **이 회신은 hop을 소모하지 않는다**
-— 요청이 이미 지불한 hop을 닫는 것이기 때문이다. 새 요청만 예산을 쓴다.
+Every delivered message carries a header with the sender, conversation ID, and hops remaining. The peer's final message is delivered back to the sender's session with a `BRIDGE REPLY` header, and **this reply doesn't consume a hop** — it's closing out a hop the request already paid for. Only new requests spend from the budget.
 
-## 7. 환경변수
+## 7. Environment variables
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
 |---|---|---|
-| `CROSS_AGENT_HOME` | `~/.cross-agent` | 레지스트리·잠금·로그 위치 |
-| `CROSS_AGENT_ACTIVE_WINDOW_MIN` | `240` | 활성 세션으로 인정할 최대 경과 시간(분) |
-| `CROSS_AGENT_MAX_HOPS` | `4` | 대화당 최대 중계 횟수 |
-| `CROSS_AGENT_TIMEOUT` | `600` | 상대 턴 자체의 예산(초). 호출자를 기다리게 하지 않는다 |
-| `CROSS_AGENT_DELIVERY_TTL` | `604800` | 완료된 배달 기록 보관 기간(초, 기본 7일) |
-| `CROSS_AGENT_SCOPE` | `cwd` | 기본 탐색 범위 (`cwd` / `tree` / `any`) |
-| `CROSS_AGENT_UI_HOOK` | `auto` | Codex 패널 주입 (`auto` / `off` / `require`) |
-| `CROSS_AGENT_REAL_CODEX` | (자동 탐색) | 셰임이 감쌀 진짜 codex 바이너리 |
-| `CROSS_AGENT_REAL_CLAUDE` | (자동 탐색) | 셰임이 감쌀 진짜 claude 바이너리 |
-| `CROSS_AGENT_CODEX_SANDBOX` | `read-only` | **신규 생성** Codex 세션의 샌드박스 (`read-only` / `workspace-write` / `danger-full-access`) |
-| `CROSS_AGENT_CLAUDE_PERMISSION_MODE` | (미설정) | Claude 호출 시 `--permission-mode` (`acceptEdits` / `bypassPermissions` / `plan` 등) |
-| `CROSS_AGENT_CODEX_MODEL` / `CROSS_AGENT_CLAUDE_MODEL` | (미설정) | 모델 강제 |
-| `CROSS_AGENT_CLAUDE_BIN` / `CROSS_AGENT_CODEX_BIN` | `claude` / `codex` | CLI 경로 |
-| `CROSS_AGENT_CODEX_SCAN_LIMIT` | `2000` | Codex rollout 스캔 안전판(scope=`any`에만 적용) |
-| `CROSS_AGENT_SELF` | (자동 판별) | 호출자 에이전트 강제 지정 |
-| `CROSS_AGENT_DEBUG` | (미설정) | 값이 있으면 DEBUG 로깅 |
+| `CROSS_AGENT_HOME` | `~/.cross-agent` | Location of the registry, locks, and logs |
+| `CROSS_AGENT_ACTIVE_WINDOW_MIN` | `240` | Maximum elapsed time (minutes) for a session to still count as active |
+| `CROSS_AGENT_MAX_HOPS` | `4` | Maximum number of relays per conversation |
+| `CROSS_AGENT_TIMEOUT` | `600` | Budget (seconds) for the peer's turn itself. Doesn't make the caller wait |
+| `CROSS_AGENT_DELIVERY_TTL` | `604800` | How long finished delivery records are kept (seconds, default 7 days) |
+| `CROSS_AGENT_SCOPE` | `cwd` | Default discovery scope (`cwd` / `tree` / `any`) |
+| `CROSS_AGENT_UI_HOOK` | `auto` | Codex panel injection (`auto` / `off` / `require`) |
+| `CROSS_AGENT_REAL_CODEX` | (auto-discovered) | The real codex binary for the shim to wrap |
+| `CROSS_AGENT_REAL_CLAUDE` | (auto-discovered) | The real claude binary for the shim to wrap |
+| `CROSS_AGENT_CODEX_SANDBOX` | `read-only` | Sandbox for **newly created** Codex sessions (`read-only` / `workspace-write` / `danger-full-access`) |
+| `CROSS_AGENT_CLAUDE_PERMISSION_MODE` | (unset) | `--permission-mode` passed on Claude calls (`acceptEdits` / `bypassPermissions` / `plan`, etc.) |
+| `CROSS_AGENT_CODEX_MODEL` / `CROSS_AGENT_CLAUDE_MODEL` | (unset) | Force a specific model |
+| `CROSS_AGENT_CLAUDE_BIN` / `CROSS_AGENT_CODEX_BIN` | `claude` / `codex` | CLI path |
+| `CROSS_AGENT_CODEX_SCAN_LIMIT` | `2000` | Safety cap on Codex rollout scanning (applies only to scope=`any`) |
+| `CROSS_AGENT_SELF` | (auto-detected) | Force which agent is treated as the caller |
+| `CROSS_AGENT_DEBUG` | (unset) | DEBUG logging when set to any value |
 
-Claude Code에서 값을 주려면 `claude mcp add cross-agent -s user -e KEY=VALUE -- <script>`,
-Codex에서는 `codex mcp add cross-agent --env KEY=VALUE -- <script>`.
+To set a value in Claude Code: `claude mcp add cross-agent -s user -e KEY=VALUE -- <script>`;
+in Codex: `codex mcp add cross-agent --env KEY=VALUE -- <script>`.
 
-`CROSS_AGENT_CODEX_SANDBOX`는 **새로 생성되는** Codex 세션에만 적용된다.
-`codex exec resume`에는 샌드박스 인자가 없어, 기존 세션을 이어받을 때는 그 세션이
-처음 시작된 설정을 그대로 따른다. 반면 `CROSS_AGENT_CLAUDE_PERMISSION_MODE`는
-신규·resume 양쪽 모두에 적용된다.
+`CROSS_AGENT_CODEX_SANDBOX` only applies to **newly created** Codex sessions.
+`codex exec resume` has no sandbox argument, so resuming an existing session keeps whatever
+setting it was originally started with. `CROSS_AGENT_CLAUDE_PERMISSION_MODE`, on the other
+hand, applies to both new sessions and resumed ones.
 
-## 8. 검증
+## 8. Verification
 
 ```bash
-# 잠금/pin/스코프/타임아웃 단위 검증 (에이전트 턴 소비 없음)
+# Unit-level checks of locks/pins/scope/timeout (consumes no agent turns)
 PYTHONPATH=src .venv/bin/python tests/unit_guards.py
 
-# 셰임 통과·주입·패널 렌더링 검증 (VS Code 설정 불필요)
-PYTHONPATH=src .venv/bin/python tests/shim_roundtrip.py          # Codex 턴 1회
-PYTHONPATH=src .venv/bin/python tests/claude_shim_roundtrip.py   # Claude 턴 2회
+# Shim pass-through, injection, and panel rendering checks (no VS Code config needed)
+PYTHONPATH=src .venv/bin/python tests/shim_roundtrip.py          # 1 Codex turn
+PYTHONPATH=src .venv/bin/python tests/claude_shim_roundtrip.py   # 2 Claude turns
 
-# 프로토콜 핸드셰이크 + 탐색 + 3종 가드 (에이전트 턴 소비 없음)
+# Protocol handshake + discovery + all 3 guards (consumes no agent turns)
 PYTHONPATH=src .venv/bin/python tests/smoke_mcp.py
 
-# 실제 왕복 5종 (Codex/Claude 턴을 실제로 소비)
+# 5 real round trips (actually consumes Codex/Claude turns)
 PYTHONPATH=src .venv/bin/python tests/live_roundtrip.py
 ```
 
-로그는 `~/.cross-agent/logs/bridge.log`. 패널 셰임은 확장의 stdio 안에서 돌아 터미널이 없으므로
-따로 `~/.cross-agent/logs/shim-claude.log` / `shim-codex.log`에 쓴다 — 주입한 턴이 언제 접수되고
-어느 turn id로 끝났는지, 승인 프롬프트가 언제 떠서 언제 답해졌는지가 여기 남는다.
+Logs go to `~/.cross-agent/logs/bridge.log`. The panel shim runs inside the extension's stdio
+and has no terminal, so it writes separately to `~/.cross-agent/logs/shim-claude.log` /
+`shim-codex.log` — this is where you'll find when an injected turn was accepted, which turn id
+it finished as, and when an approval prompt appeared and was answered.
 
-## 9. 알려진 제약
+## 9. Known limitations
 
-- **Codex의 MCP 도구 승인 (upstream 제약)** — VS Code Codex UI에서는 승인 프롬프트가 뜨고
-  사용자가 허용하면 정상 동작한다. 반면 `codex exec` 헤드리스 모드에서는 승인 주체가 없어
-  모든 MCP 호출이 `user cancelled MCP tool call`로 자동 취소된다.
-  Codex 0.146.0에서 아래를 **직접 시험했고 전부 실패**했다.
+- **Codex's MCP tool approval (upstream limitation)** — in the VS Code Codex UI, an approval
+  prompt appears and things work fine once the user allows it. In headless `codex exec` mode,
+  though, there's nobody to approve, so every MCP call auto-cancels with
+  `user cancelled MCP tool call`.
+  The following were **tested directly against Codex 0.146.0, and all of them failed:**
 
-  | 시도 | 결과 |
+  | Attempt | Result |
   |---|---|
-  | `approval_policy = "never"` | 취소됨 |
-  | `mcp_servers.<name>.default_tools_approval_mode = "auto"` | 취소됨 |
-  | `approval_policy = { granular = { …, mcp_elicitations = false } }` | 취소됨 |
-  | 위 둘 조합 | 취소됨 |
-  | `--dangerously-bypass-approvals-and-sandbox` | 통과 |
+  | `approval_policy = "never"` | canceled |
+  | `mcp_servers.<name>.default_tools_approval_mode = "auto"` | canceled |
+  | `approval_policy = { granular = { …, mcp_elicitations = false } }` | canceled |
+  | Combination of the two above | canceled |
+  | `--dangerously-bypass-approvals-and-sandbox` | works |
 
-  `default_tools_approval_mode = "auto"`는 스키마상 유효한 정식 키라 UI 프롬프트를 줄이는
-  용도로 config.toml에 넣어 뒀지만, exec 모드의 취소는 막지 못한다.
-  참고로 `[permissions.<profile>]` / `default_permissions`는 실재하는 설정이지만
-  샌드박스 파일시스템·네트워크 권한용이라 이 문제와 무관하다.
-  즉 **헤드리스 Codex→Claude는 현재 upstream 한계**이며, 대화형 사용에는 영향이 없다.
-- **UI 반영 시점** — 셰임을 붙이지 않으면 브리지는 세션 트랜스크립트에 턴을 덧붙일 뿐이라
-  VS Code 채팅창이 실시간으로 갱신되지 않는다(해당 세션을 다시 열 때 반영).
-  3장의 두 셰임을 설정하면 양방향 모두 패널에 그려진다.
-- **셰임 경유 시 체인 상태 전파** — 패널 주입은 자식 프로세스를 새로 띄우지 않으므로
-  `CROSS_AGENT_CONVERSATION_ID` 같은 환경변수가 상대에게 전달되지 않는다. 대신 봉투
-  헤더에 conversation id를 실어 상대가 같은 대화로 이어붙일 수 있게 한다.
-- **동시 쓰기** — busy 잠금은 브리지가 보내는 배달끼리는 원자적으로 직렬화해 주지만,
-  **사람이 VS Code 채팅창에 직접 입력 중인 세션**은 보호하지 못한다(그쪽은 잠금을 모른다).
-  상대가 지금 타이핑 중인 세션을 겨냥하지 않는 것이 안전하다.
-- **배달 큐의 실행은 서버 프로세스 안에만 있다** — 의도적이다. 디스크에서 큐를 되살려 보내면
-  재시작 후 **재개가 아니라 재발송**이 된다(워커의 배달은 블로킹 자식 프로세스라 프로세스가
-  죽는 순간 상대 턴의 결과가 소실된다). 상대가 같은 작업을 두 번 하게 되므로 유실보다 나쁘다.
-  따라서 **서버가 종료되면 아직 넘기지 못한 배달은 이어서 보내지지 않는다** — MCP 서버는
-  세션(Claude 대화, Codex 창, 서버를 띄운 앱)마다 따로 뜨므로, 재시작 전에 그 세션에서
-  `bridge_status`로 `deliveries.pending`이 비었는지 확인한다. 대신 아래로 "답이 있는데 못 읽는"
-  경우를 없앤다.
-  - **배달 기록은 접수 순간부터 디스크에 남는다**(`~/.cross-agent/deliveries/`). 진행 중인 배달은
-    `in-flight/<delivery_id>.json`, 끝난 배달은 종전 그대로 `<delivery_id>.json`. 상태가 바뀔
-    때마다(queued → delivering → awaiting-peer → delivered/failed) 임시 파일 → rename으로
-    원자적으로 갱신한다. 그래서 배달을 들고 있던 서버가 앱과 함께 종료돼도 **다른 어느 서버든**
-    `bridge_status(delivery_id)`로 그 배달을 조회하고, 종전과 같은 방식으로 상대 트랜스크립트에서
-    답을 읽는다. 서버가 사라진 배달은 `is_orphaned: true`로 표시할 뿐 **재발송하지 않는다.**
-    대기열에 있던 채로 고아가 된 배달은 상대가 받은 적이 없으므로 트랜스크립트에서 답을 찾지 않는다.
-    완료된 배달은 `bridge_status`의 `deliveries.earlier`에서 `reply_preview`로도 읽을 수 있고,
-    다른 서버가 진행 중으로 기록한 배달은 `deliveries.in_flight_elsewhere`에 나온다.
-    payload와 자식 환경변수는 **저장하지 않는다** — env에는 이 프로세스의 모든 변수가 들어 있다.
-    - 진행 중 기록이 하위 폴더에 있는 이유: 이 기능 이전 버전의 서버는 `deliveries/*.json` 중
-      `finished_at`이 없는 기록을 만료로 보고 지운다. 하위 폴더는 들여다보지 않는다.
-    - 만료: 진행 중 기록은 이 배달이 합법적으로 걸릴 수 있는 최장 시간(시도 수 × (busy 대기 +
-      턴, 각 patience) + 트랜스크립트 감시 + 여유)이 지난 시각(`expires_at`)부터는 pid가 살아
-      있어도 고아로 본다(pid 재사용 대비). 파일은 거기서 다시 TTL(기본 7일)이 지나면 지운다 —
-      만료 즉시 지우면 앱이 다음 날 물었을 때 도로 "모른다"가 되기 때문이다. 끝난 기록은 종전대로
-      `finished_at` + TTL.
-  - **답변은 상대 트랜스크립트에서 회수한다.** 두 에이전트 모두 매 턴을 JSONL에 쓰므로,
-    전송이 깨졌거나 프로세스가 죽어 답을 못 받았어도 답 자체는 디스크에 있다. 배달이
-    답 없이 끝나면 상대 세션 기록의 마지막 assistant 메시지를 읽어 온다(`is_reply_recovered`).
-    재발송이 아니므로 상대에게 같은 일을 다시 시키지 않는다.
-  - **상대가 바쁘면 거절이 아니라 대기다.** 두 에이전트 모두 동시 입력을 이미 처리한다 —
-    Claude는 턴이 끝날 때까지 기다렸다 주입하고, Codex는 큐에 넣는다. 다만 한계가 있어서
-    그걸 넘으면 셰임이 `busy with another turn`·`already in flight`로 답한다. 그건 셰임의
-    마감이지 우리 마감이 아니므로, 배달 실패로 닫지 않고 **간격을 두고 다시 시도**한다
-    (job 타임아웃 안에서). 그 외 오류는 그대로 실패로 다룬다.
-  - **전송을 포기해도 상대는 계속 일한다.** 패널 경로의 상대는 우리가 띄우지도 멈추지도 못하는
-    세션이라, 소켓이 시간 초과됐다는 것이 그 턴이 끝났다는 뜻은 아니다. 그래서 배달이 시간
-    초과되면 실패로 닫지 않고 **상대 트랜스크립트를 주기적으로 다시 본다**(기본 15초 간격,
-    최대 15분). 상대가 답을 쓰는 순간 수거된다. CLI 경로는 그 턴이 우리 자식 프로세스였고
-    타임아웃이 프로세스 그룹을 죽였으므로 더 쓰일 것이 없다 — 기다리지 않고 바로 닫는다.
-  - **셰임이 턴을 놓쳐도 답은 30초 안에 수거된다.** 셰임은 app-server의 완료 이벤트가 자기가
-    시작한 turn id와 맞을 때 턴이 끝났다고 보고하는데, 그 id가 끝내 안 맞는 경우가 있다
-    (다른 턴 뒤에 줄 선 턴, `turn/start` 응답과 실제 실행의 id가 다른 경우). 그러면 셰임은
-    답이 디스크에 완성돼 있는데도 한 시간 내내 "still running"이라 답하고, 그 뒤로 같은 세션행
-    배달이 잠금에 줄을 선다 — 실제로 5통이 그렇게 밀렸다. 그래서 워커는 소켓 대기를 30초
-    단위로 끊고 **그 사이마다 상대 트랜스크립트를 읽어, 요청 토큰을 되돌려 적은 완성 턴이
-    있으면 그 자리에서 답으로 확정한다**(`is_reply_confirmed_by_transcript`). 토큰이 없는
-    완성 턴은 남의 턴일 수 있어 인정하지 않는다. 셰임 자신도 자기 스레드의 메시지에 토큰이
-    되돌아오면 turn id와 무관하게 그 턴의 끝을 자기 턴의 끝으로 잡는다.
-  - **승인 프롬프트에 멈춘 턴은 트랜스크립트로는 안 보인다.** 사람의 클릭을 기다리는 턴은
-    아무것도 쓰지 않으므로, 기록만 보면 일하는 중과 구분되지 않는다. 승인 요청과 그 답은 둘 다
-    셰임을 지나가므로(Claude: `control_request`/`control_response`, Codex:
-    `item/*/requestApproval`류) 셰임이 그걸 세고, `bridge_status(delivery_id=...)`의
-    `peer_panel.awaiting_approval`로 "몇 초째 어떤 프롬프트에 멈춰 있는지"를 보고한다.
-  - **요청마다 고유 토큰을 실어 보내고, 되돌아오면 그것으로 짝을 짓는다.** 봉투에
-    `request: req_<epoch ms>_<난수 6자>`가 실리고, 회신 지침이 마지막 줄에 그대로 적어 달라고
-    요청한다. 토큰이 일치하면 **시각과 무관하게** 그 요청의 답이고, 다른 토큰이면 다른 질문의
-    답이므로 거부한다. 밀리초 접두사라 토큰만 봐도 언제 보낸 요청인지 읽힌다.
-    상대가 안 적어도 무방하다 — 아래 시각 규칙으로 되돌아간다. **협조는 보너스지 조건이 아니다.**
-  - **요청보다 나중에 쓰인 글만 답으로 인정한다.** 회수는 "마지막 발화"를 가져오므로, 상대가
-    아직 그 요청을 보지도 않았으면 **질문 이전에 쓴 글**이 답으로 온다. 실제로 9분 전에 쓰인
-    한 문단이 서로 다른 두 질문의 답으로 각각 배달됐다. 배달 시각보다 앞선 발화는 답이 아니며,
-    그때는 아무것도 회수하지 않는다.
-  - **회수한 답은 봉투에 그렇게 적는다.** 회수는 "그 순간의 마지막 발화"를 가져오는데,
-    아직 일하는 중인 상대에게도 마지막 발화는 있다 — 다음에 뭘 할지 적은 한 줄이다.
-    표시 없이 배달하면 완성된 보고와 구분되지 않아 하지도 않은 보고를 근거로 행동하게 된다.
-    실제로 그런 일이 있었고, 그래서 회수된 회신에는 `RECOVERED, NOT RECEIVED` 경고와
-    헤더의 `| recovered from transcript` 표시가 붙는다. **왜 전송이 실패했는지도 같이 적는다**
-    (`transport failure:` 줄) — 패널이 메시지를 거절한 것과 소켓이 인내 시한을 넘긴 것은
-    다음에 할 일이 다른데, 사유 없는 경고만으로는 둘을 가를 수 없었다.
+  `default_tools_approval_mode = "auto"` is a legitimate schema key, so it's left in
+  config.toml to reduce UI prompts, but it doesn't stop the cancellation in exec mode.
+  For reference, `[permissions.<profile>]` / `default_permissions` are real settings too, but
+  they govern sandbox filesystem/network permissions and are unrelated to this issue.
+  In short, **headless Codex→Claude is currently an upstream limitation**, and it doesn't
+  affect interactive use.
+- **When the UI reflects changes** — without the shim attached, the bridge only appends a
+  turn to the session transcript, so the VS Code chat window doesn't update live (it shows up
+  the next time that session is reopened). Setting up both shims from section 3 renders both
+  directions in the panel.
+- **Chain-state propagation through the shim** — panel injection doesn't spawn a new child
+  process, so environment variables like `CROSS_AGENT_CONVERSATION_ID` aren't passed to the
+  peer. The envelope header carries the conversation id instead, so the peer can still
+  continue the same conversation.
+- **Concurrent writes** — the busy lock atomically serializes deliveries the bridge sends
+  against each other, but it can't protect **a session a human is typing into directly in the
+  VS Code chat window** (that side doesn't know about the lock). It's safer not to target a
+  session the peer is actively typing in right now.
+- **Delivery queue execution lives only inside the server process** — this is intentional.
+  Reviving the queue from disk and resending would make a restart mean **resend, not resume**
+  (a worker's delivery is a blocking child process, so the moment the process dies, the
+  peer-turn's result is lost). That would make the peer redo the same work — worse than losing
+  it outright. So **if the server shuts down, a delivery that hasn't gone out yet is not
+  resumed** — an MCP server comes up separately per session (a Claude conversation, a Codex
+  window, the app that launched the server), so before restarting, check `bridge_status` in
+  that session to confirm `deliveries.pending` is empty. What follows instead eliminates the
+  "there's an answer but it can't be read" case.
+  - **A delivery record hits disk the moment it's accepted** (`~/.cross-agent/deliveries/`). An
+    in-flight delivery lives at `in-flight/<delivery_id>.json`; a finished one, at
+    `<delivery_id>.json` as before. Every state change (queued → delivering → awaiting-peer →
+    delivered/failed) is written atomically via temp-file-then-rename. So even if the server
+    holding a delivery shuts down along with its app, **any other server** can look that
+    delivery up with `bridge_status(delivery_id)` and read the answer from the peer transcript
+    the same way as before. A delivery whose server disappeared is only marked
+    `is_orphaned: true` — it is **never resent.** A delivery orphaned while still queued was
+    never received by the peer, so no answer is looked up from the transcript for it. A
+    finished delivery can also be read via `reply_preview` in `bridge_status`'s
+    `deliveries.earlier`, and a delivery another server has recorded as in progress shows up
+    in `deliveries.in_flight_elsewhere`. The payload and child environment variables are
+    **never stored** — env holds every variable of this process.
+    - Why the in-flight record lives in a subfolder: a server running a version prior to this
+      feature treats any `deliveries/*.json` record without a `finished_at` as expired and
+      deletes it. It never looks inside a subfolder.
+    - Expiry: past `expires_at` — the longest this delivery could legitimately still be
+      running (attempt count × (busy-wait + turn, each with its own patience) + transcript
+      watch + margin) — an in-flight record is treated as orphaned even if its pid is still
+      alive (to guard against pid reuse). The file itself is deleted only after the TTL
+      (default 7 days) has also passed from there — deleting it right at expiry would make the
+      app go back to "I don't know" if it asks the next day. A finished record still follows
+      `finished_at` + TTL as before.
+  - **The answer is recovered from the peer's transcript.** Both agents write every turn to
+    JSONL, so even if the transport broke or the process died before the answer could be
+    received, the answer itself is still on disk. If a delivery ends without an answer, the
+    peer session's last assistant message is read back (`is_reply_recovered`). Since this
+    isn't a resend, the peer is never made to redo the same work.
+  - **If the peer is busy, it waits — it doesn't reject.** Both agents already handle
+    concurrent input — Claude waits for the current turn to finish before injecting, Codex
+    queues it. But there's a limit, and past it the shim answers with
+    `busy with another turn` / `already in flight`. That's the shim's own deadline, not ours,
+    so instead of closing the delivery as failed, it's **retried after an interval** (within
+    the job timeout). Any other error is treated as an outright failure.
+  - **Even after giving up on the transport, the peer keeps working.** On the panel path, the
+    peer is a session we neither spawned nor can stop, so a socket timing out doesn't mean the
+    turn is over. So when a delivery times out, it isn't closed as a failure — instead,
+    **the peer transcript is periodically re-checked** (every 15 seconds by default, up to 15
+    minutes). It's picked up the moment the peer writes its answer. On the CLI path, that turn
+    was our own child process and the timeout already killed its process group, so there's
+    nothing left to wait for — it closes immediately, with no waiting.
+  - **Even if the shim misses the turn, the answer is picked up within 30 seconds.** The shim
+    reports a turn finished when the app-server's completion event matches the turn id it
+    itself started — but sometimes that id never matches (a turn queued behind another turn,
+    or a case where the `turn/start` response's id differs from the id of the actual run).
+    When that happens, the shim keeps answering "still running" for a full hour even though
+    the answer is already complete on disk, and every subsequent delivery to that same session
+    piles up behind the lock — five of them actually backed up that way once. So the worker
+    breaks its socket wait into 30-second chunks and **in between each one, reads the peer
+    transcript; if it finds a finished turn that echoed the request token back, it settles that
+    right there as the answer** (`is_reply_confirmed_by_transcript`). A finished turn with no
+    token isn't accepted, since it could belong to someone else's turn. The shim itself, too,
+    treats the end of a turn whose message echoes its token as the end of its own turn,
+    regardless of turn id.
+  - **A turn stuck on an approval prompt is invisible in the transcript.** A turn waiting on a
+    human click writes nothing, so from the record alone it's indistinguishable from a turn
+    that's still working. Both the approval request and its answer pass through the shim
+    (Claude: `control_request`/`control_response`; Codex: the `item/*/requestApproval` family),
+    so the shim tracks them and reports via `bridge_status(delivery_id=...)`'s
+    `peer_panel.awaiting_approval` exactly which prompt it's stuck on and for how many seconds.
+  - **Every request carries a unique token, and a matching one coming back is how it's paired
+    up.** The envelope carries `request: req_<epoch ms>_<6 random chars>`, and the reply
+    instructions ask that it be echoed back verbatim on the last line. A matching token means
+    it's that request's answer **regardless of timing**; a different token means it's the
+    answer to a different question and is rejected. Because of the millisecond prefix, the
+    token alone tells you when the request was sent. It's fine if the peer doesn't echo it —
+    it just falls back to the timing rule below. **Cooperation is a bonus, not a requirement.**
+  - **Only text written after the request is accepted as the answer.** Recovery pulls the
+    "last utterance," so if the peer hasn't even seen the request yet, **text written before
+    the question** comes back as the answer. In practice, a single paragraph written nine
+    minutes earlier was once delivered as the answer to two different questions. An utterance
+    that predates the delivery time isn't an answer, and in that case nothing is recovered at
+    all.
+  - **A recovered answer is labeled as such in the envelope.** Recovery pulls "the last
+    utterance at that moment," and even a peer that's still working has a last utterance — a
+    line noting what it's about to do next. Delivered without a label, that's indistinguishable
+    from a finished report, and leads to acting on a report that was never actually made. This
+    actually happened, which is why a recovered reply carries a `RECOVERED, NOT RECEIVED`
+    warning and a `| recovered from transcript` marker in the header. **It also states why the
+    transport failed** (a `transport failure:` line) — a panel rejecting the message and a
+    socket exceeding its patience window call for different next steps, and a warning with no
+    reason couldn't tell the two apart.
 
-  남는 한계는 **상대가 답을 아예 만들지 않은 경우**뿐이며, 그건 어떤 설계로도 복구할 수 없다.
-- **다른 VS Code 창의 세션은 지목해야 닿는다** — `session_id`로 명시하면 다른 창의
-  셰임으로 배달되지만, 자동 선택은 이 창 안에서만 일어난다(3장 참고). 어느 창에도 패널이
-  열려 있지 않은 세션은 여전히 헤드리스 CLI resume으로 가며, 그 대화를 어딘가의 패널이
-  물고 있다면 `thread-store conflict`로 거부된다.
-- **회신은 발신자 세션을 깨운다** — 답변 배달은 발신자 세션에 새 턴을 만든다. 사람이 그
-  세션에서 다른 작업을 하는 중이면 그 흐름에 끼어든다.
-- **세션 탐색은 mtime 기반**이다. 한 디렉터리에서 여러 세션을 동시에 열어 두었다면
-  `pin_agent_session`으로 대상을 고정하는 편이 확실하다.
+  The one remaining limitation is **the peer never producing an answer at all**, which no
+  design can recover from.
+- **A session in another VS Code window is only reachable if it's named explicitly** —
+  specifying it via `session_id` delivers to that window's shim, but auto-selection only ever
+  happens within this window (see section 3). A session with no panel open in any window still
+  goes through headless CLI resume, and gets rejected with `thread-store conflict` if some
+  window's panel is holding onto that conversation.
+- **A reply wakes the sender session** — delivering the answer creates a new turn in the
+  sender's session. If a human is doing something else in that session, it interrupts that
+  flow.
+- **Session discovery is mtime-based.** If several sessions are open at once in the same
+  directory, pinning the target with `pin_agent_session` is the more reliable choice.
+
+## License
+
+[MIT](LICENSE)

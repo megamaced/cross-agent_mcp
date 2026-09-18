@@ -693,7 +693,7 @@ def test_an_echoed_token_identifies_which_request_was_answered() -> None:
 
     original = discovery.find_session
     try:
-        # 토큰이 맞으면 시각이 요청보다 앞서도 답으로 인정한다 — 증거가 추정을 이긴다.
+        # A matching token counts as the answer even if it predates the request — evidence beats inference.
         discovery.find_session = lambda a, s: {'path': transcript(f'끝났습니다.\n{mine}')}
         check('a matching token is accepted even against the clock',
               discovery.last_agent_message(
@@ -704,7 +704,7 @@ def test_an_echoed_token_identifies_which_request_was_answered() -> None:
               discovery.last_agent_message(
                   'claude', 'sid', after=spoke_at.timestamp() - 999, token=mine) is None)
 
-        # 상대가 토큰을 안 적으면 기존 시각 규칙으로 되돌아간다 — 협조는 보너스지 조건이 아니다.
+        # If the peer omits the token, it falls back to the old timing rule — cooperation is a bonus, not a requirement.
         discovery.find_session = lambda a, s: {'path': transcript('토큰 없이 답합니다.')}
         check('a peer that ignored the token still falls back to the clock',
               discovery.last_agent_message(
@@ -1032,7 +1032,7 @@ def test_a_panel_delivery_keeps_watching_after_the_transport_gives_up() -> None:
         box.recover = answer_on_the_third_look
 
         job = _job(box, 'sid-panel', wants_reply=True)
-        job.ui_shim = {'socket': '/panel'}  # 패널 경로 — 상대는 우리가 죽일 수 없다
+        job.ui_shim = {'socket': '/panel'}  # panel path — the peer isn't something we can kill
         delivery_id = box.submit(job)
         _drain(box)
 
@@ -1060,7 +1060,7 @@ def test_a_cli_delivery_does_not_wait_for_a_turn_that_was_killed() -> None:
         box.recover = lambda job: (looks.update(count=looks['count'] + 1) or None)
 
         started = time.time()
-        delivery_id = box.submit(_job(box, 'sid-cli', wants_reply=True))  # ui_shim 없음 = CLI 경로
+        delivery_id = box.submit(_job(box, 'sid-cli', wants_reply=True))  # no ui_shim = CLI path
         _drain(box)
         elapsed = time.time() - started
 

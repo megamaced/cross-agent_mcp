@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Wrapper for the Claude process the VS Code extension launches.
 #
-#   VS Code setting:  "claudeCode.claudeProcessWrapper": "/Users/dexter/project/cross-agent_mcp/claude-shim.sh"
+#   VS Code setting:  "claudeCode.claudeProcessWrapper": "~/project/cross-agent_mcp/claude-shim.sh"
 #
 # The extension invokes a wrapper as `<wrapper> <real-claude-binary> <args...>`. Every
 # invocation is forwarded; only the panel's stream-json session is intercepted so the bridge

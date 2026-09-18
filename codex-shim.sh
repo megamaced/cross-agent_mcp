@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Drop-in replacement for the Codex binary the VS Code extension launches.
 #
-#   VS Code setting:  "chatgpt.cliExecutable": "/Users/dexter/project/cross-agent_mcp/codex-shim.sh"
+#   VS Code setting:  "chatgpt.cliExecutable": "~/project/cross-agent_mcp/codex-shim.sh"
 #
 # Every invocation is forwarded to the real Codex binary. Only the plain `app-server` stdio
 # session is intercepted, so the bridge can hand messages to the thread open in the panel.

@@ -1137,7 +1137,7 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
     hop = int(record.get('hops', 1))
     remaining = max(config.MAX_HOPS - hop, 0)
 
-    # 봉투보다 먼저 발급한다 — 상대가 되돌려줄 토큰이 봉투 안에 있어야 하기 때문이다.
+    # Issued before the envelope, since the envelope must carry the token the peer echoes back.
     request_id = outbox.new_request_id()
     payload = message if is_raw else _build_envelope(
         sender_agent, target_agent, conversation_id, hop, remaining, message, self_session_id,
