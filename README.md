@@ -51,6 +51,9 @@ the human.
 - [1. Requirements](#1-requirements)
 - [2. Installation](#2-installation)
 - [3. Registration](#3-registration)
+  - [3.3 First run, with the prompts still on](#33-first-run-check-it-works-with-the-prompts-still-on)
+  - [3.4 Running unattended (opt-in)](#34-running-unattended-opt-in)
+  - [3.5 IDE panel integration](#35-ide-panel-integration-bidirectional)
 - [4. Tools](#4-tools)
 - [5. Session resolution rules](#5-session-resolution-rules)
 - [6. Preventing infinite calls](#6-preventing-infinite-calls)
@@ -140,15 +143,17 @@ chmod +x run-server.sh
 
 ## 3. Registration
 
-Register both at the **user (global) level.** Pass along the environment variables so that sessions the bridge newly creates run without sandbox/approval friction.
+Register both at the **user (global) level.** The setup below keeps every safety boundary
+the two products give you: a session the bridge creates is sandboxed, and file edits and
+commands still ask before they happen. Get it working like this first — nothing in the bridge
+needs those boundaries lowered to deliver a message or to preserve context. Once it works,
+[section 3.4](#34-running-unattended-opt-in) covers what to loosen if you want it unattended,
+and what each thing actually changes.
 
-### Claude Code
+### 3.1 Claude Code
 
 ```bash
-claude mcp add cross-agent -s user \
-  -e CROSS_AGENT_CODEX_SANDBOX=danger-full-access \
-  -e CROSS_AGENT_CLAUDE_PERMISSION_MODE=bypassPermissions \
-  -- ~/project/cross-agent_mcp/run-server.sh
+claude mcp add cross-agent -s user -- ~/project/cross-agent_mcp/run-server.sh
 ```
 
 This is written into the top-level `mcpServers` of `~/.claude.json`, so it's available in every project. To attach it to just one project use `-s local`; to share it via the repository, use a project-root `.mcp.json`.
@@ -157,23 +162,16 @@ This is written into the top-level `mcpServers` of `~/.claude.json`, so it's ava
 {
   "mcpServers": {
     "cross-agent": {
-      "command": "~/project/cross-agent_mcp/run-server.sh",
-      "env": {
-        "CROSS_AGENT_CODEX_SANDBOX": "danger-full-access",
-        "CROSS_AGENT_CLAUDE_PERMISSION_MODE": "bypassPermissions"
-      }
+      "command": "~/project/cross-agent_mcp/run-server.sh"
     }
   }
 }
 ```
 
-### Codex
+### 3.2 Codex
 
 ```bash
-codex mcp add cross-agent \
-  --env CROSS_AGENT_CODEX_SANDBOX=danger-full-access \
-  --env CROSS_AGENT_CLAUDE_PERMISSION_MODE=bypassPermissions \
-  -- ~/project/cross-agent_mcp/run-server.sh
+codex mcp add cross-agent -- ~/project/cross-agent_mcp/run-server.sh
 ```
 
 This adds the following to `~/.codex/config.toml` (Codex only supports global config).
@@ -181,18 +179,38 @@ This adds the following to `~/.codex/config.toml` (Codex only supports global co
 ```toml
 [mcp_servers.cross-agent]
 command = "~/project/cross-agent_mcp/run-server.sh"
-default_tools_approval_mode = "approve"   # so the UI doesn't show an approval prompt every time (added manually)
-
-[mcp_servers.cross-agent.env]
-CROSS_AGENT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
-CROSS_AGENT_CODEX_SANDBOX = "danger-full-access"
 ```
 
-`default_tools_approval_mode` has no corresponding flag on `codex mcp add`, so it's added directly to config.toml. Valid values are `auto` / `prompt` / `writes` / `approve`; use `approve` to stop the approval prompt from popping up every time (`auto` kept asking). This does **not** fix the cancellation problem with headless `codex exec` (see section 9). Clicking **"Always allow"** once on the UI prompt has the same effect.
+### 3.3 First run: check it works with the prompts still on
 
-### Turning off the approval prompt (Claude Code)
+Reload the window, then ask one agent to send the other a message — "ask Codex what this
+repository does", or call `send_to_codex` directly. You will be asked to approve the tool
+call. Approve it. That prompt is the bridge asking to relay a message; it is not a sign that
+anything is misconfigured, and the bridge works exactly the same with it on.
 
-Claude Code asks for approval on every MCP tool call. Add a server-level rule to `~/.claude/settings.json` (**a single server name**, not a per-tool list or a `*` wildcard).
+What you should see: the receipt says `accepted: true`, the peer answers with its own
+conversation context intact, and its answer arrives back as a separate message in your
+session. No environment variables set. If that works, the bridge is installed correctly.
+
+Without the shims from section 3.5 the exchange is appended to the peer's session history but
+is **not** drawn in its VS Code panel until that conversation is reopened — the delivery is
+real either way, and `is_visible_in_panel` in the receipt says which you got.
+
+`bridge_status` and `list_agent_sessions` are the two tools to reach for when it does not.
+
+### 3.4 Running unattended (opt-in)
+
+Everything below **removes a safety boundary**. None of it is needed for messages to be
+delivered or for a peer to keep its conversation context — get section 3.3 working first, then
+decide which of these you actually want. They are three separate things and are often
+confused for one another:
+
+**a. Approving the bridge tool itself.** This only stops your own editor asking you to confirm
+each relay. It changes nothing about what the peer agent is then allowed to do. It is the
+mildest of the three and usually the only one you want.
+
+Claude Code — a server-level rule in `~/.claude/settings.json` (**a single server name**, not
+a per-tool list or a `*` wildcard):
 
 ```json
 {
@@ -202,17 +220,67 @@ Claude Code asks for approval on every MCP tool call. Add a server-level rule to
 }
 ```
 
+Codex — `default_tools_approval_mode` in `~/.codex/config.toml`. It has no flag on
+`codex mcp add`, so it is added by hand. Valid values are `auto` / `prompt` / `writes` /
+`approve`; `approve` stops the prompt (`auto` kept asking). Clicking **"Always allow"** once
+on the UI prompt does the same thing.
+
+```toml
+[mcp_servers.cross-agent]
+default_tools_approval_mode = "approve"
+```
+
+This does **not** fix the cancellation problem with headless `codex exec` (see section 9).
+
+**b. What a bridge-created session is allowed to do.** These two variables apply to sessions
+the bridge *creates*, and they lower the peer agent's own limits — not the bridge's.
+
+```bash
+claude mcp add cross-agent -s user \
+  -e CROSS_AGENT_CODEX_SANDBOX=danger-full-access \
+  -e CROSS_AGENT_CLAUDE_PERMISSION_MODE=bypassPermissions \
+  -- ~/project/cross-agent_mcp/run-server.sh
+
+codex mcp add cross-agent \
+  --env CROSS_AGENT_CODEX_SANDBOX=danger-full-access \
+  --env CROSS_AGENT_CLAUDE_PERMISSION_MODE=bypassPermissions \
+  -- ~/project/cross-agent_mcp/run-server.sh
+```
+
 > [!WARNING]
-> The two environment variables above **turn off the safety rails for an agent reached through the bridge.**
-> Claude edits files and runs commands without confirmation, and newly created Codex sessions
-> run without a sandbox. Use this only for trusted local work.
-> To revert, drop both `-e`/`--env` arguments and re-register; that restores the defaults (`read-only` / the agent's default permissions).
+> These **turn off the safety rails for an agent reached through the bridge**. Claude edits
+> files and runs commands without confirming, and a newly created Codex session runs with no
+> sandbox at all. The agent acting under them is being driven by another agent, so nobody is
+> reading each command before it runs. Use this only on work you would be comfortable letting
+> an unattended agent do.
+
+Note the asymmetry: `CROSS_AGENT_CODEX_SANDBOX` applies only to **newly created** Codex
+sessions, because `codex exec resume` has no sandbox argument, while
+`CROSS_AGENT_CLAUDE_PERMISSION_MODE` applies to new **and resumed** Claude sessions.
+
+**To revert**, re-register without them:
+
+```bash
+claude mcp remove cross-agent -s user
+claude mcp add cross-agent -s user -- ~/project/cross-agent_mcp/run-server.sh
+```
+
+```bash
+codex mcp remove cross-agent
+codex mcp add cross-agent -- ~/project/cross-agent_mcp/run-server.sh
+```
+
+The defaults come back: `read-only` for a new Codex session, and Claude's own permission
+behaviour. Reload the window afterwards.
+
+**c. IDE panel integration.** Section 3.5, below. It changes where a message is rendered, not
+what anyone is allowed to do, and it removes no boundary.
 
 > [!NOTE]
 > Right after registering, you need to **reload the VS Code window** or start a new session for the tool to be picked up.
 > MCP servers connect only at session start.
 
-### IDE panel integration (bidirectional)
+### 3.5 IDE panel integration (bidirectional)
 
 Everything above works the same from a plain terminal — this section is optional, and only
 matters if you also use the VS Code extensions' chat panels.
