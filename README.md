@@ -28,6 +28,37 @@ useful for:
 - **Nothing is lost to a timeout.** Because nothing blocks, a peer turn that takes ten minutes is
   fine — the reply lands whenever it lands.
 
+### A real example
+
+One user runs a single Claude session as a **master** that directs about a dozen role-based
+sub-sessions — a Claude or Codex session per role (implementation/tooling, image generation,
+client, server, copy, and a few more) — tracked in a small map file of session IDs. When a
+session's context grows too large it's retired and replaced by a new generation of the same role
+(`-g01`, `-g02`, …), and a role can even move from one product to the other — Codex to Claude or
+back — if one hits its usage limit first, since the bridge resolves by name or `session_id`, not
+by provider.
+
+The master only delegates work whose intermediate output would be too large to keep in its own
+context — implementation, builds, tests, image generation, multi-file exploration. It keeps
+verification for itself: a peer's self-report is never taken as done, its claims get re-checked
+against the actual files, commits, or source lines before anything is passed up to the human.
+Every delegation names an explicit `session_id` — with a dozen sessions sharing one working
+directory, an auto-selected or pin-based target can land on the wrong one, especially during the
+few minutes two generations of the same role briefly coexist — and once a role has moved onto a
+Claude session, handoffs to it use `allow_same_agent: true`. Long turns are split to stay under
+the timeout budget (design/implement/test in one turn, install/commit/apply against real data in
+the next), and if the connection drops mid-turn, `bridge_status(delivery_id)` reads the peer's
+finished answer straight from its transcript instead of resending.
+
+A recent run: the master asked the image-generation role (Codex) for a composite request, then
+asked the tooling role (Claude, same-agent) to capture the official composite from it. Tooling
+refused — the request was missing a field its contract required — and reported back with the exact
+source line instead of working around it. The master re-derived the correct spec from source, had
+the image role rewrite the request (that's its job under the contract), independently diffed the
+new request with a separate check script, then re-dispatched to tooling, which succeeded. The
+master inspected the resulting image itself before handing it to the human for sign-off — three
+hops between two roles, with the master gating every one of them.
+
 ## Contents
 
 - [1. Requirements](#1-requirements)
