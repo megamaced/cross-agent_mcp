@@ -3195,6 +3195,81 @@ def test_a_real_store_is_read_to_the_end_to_settle_a_name() -> None:
             config.CLAUDE_PROJECTS_DIR = saved
 
 
+def test_a_title_search_will_not_read_a_transcript_outside_the_store() -> None:
+    """A title is matched from the file's own contents, so a search that skipped containment
+    would be a way in through the front door."""
+    with tempfile.TemporaryDirectory(prefix='claude-title-containment-') as store:
+        elsewhere = store + '/elsewhere'
+        projects = store + '/projects'
+        os.makedirs(elsewhere)
+        os.makedirs(projects + '/-w')
+
+        planted = elsewhere + f'/{REAL_CLAUDE_ID}.jsonl'
+        _write_claude_transcript(planted, ['Planted title'], 'hello')
+        os.symlink(planted, projects + f'/-w/{REAL_CLAUDE_ID}.jsonl')
+
+        inside = projects + '/-w/11111111-1111-4000-8000-111111111111.jsonl'
+        _write_claude_transcript(inside, ['Real title'], 'hello')
+
+        saved = config.CLAUDE_PROJECTS_DIR
+        config.CLAUDE_PROJECTS_DIR = projects + '/'
+        try:
+            titles = [s.get('title') for s in discovery.iter_sessions('claude')]
+            check('the iterator yields only the transcript that really lives in the store',
+                  titles == ['Real title'], str(titles))
+            check('and a planted title resolves to nothing',
+                  discovery.find_session_by_name('claude', 'Planted title') is None)
+            check('while the real one still resolves',
+                  (discovery.find_session_by_name('claude', 'Real title') or {})
+                  .get('session_id') == '11111111-1111-4000-8000-111111111111')
+        finally:
+            config.CLAUDE_PROJECTS_DIR = saved
+
+
+def test_a_codex_rollout_must_be_named_for_the_thread_it_carries() -> None:
+    """Same rule the lookup by id uses: neither the filename nor the payload is guessed
+    trustworthy when they disagree."""
+    with tempfile.TemporaryDirectory(prefix='codex-title-containment-') as store:
+        os.makedirs(store + '/2026/09/18')
+
+        def rollout(filename, session_id, title_id):
+            path = store + '/2026/09/18/' + filename
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(json.dumps({'type': 'session_meta', 'payload': {
+                    'session_id': session_id, 'cwd': '/w', 'originator': 'vscode',
+                    'thread_source': 'user'}}) + '\n')
+            return path
+
+        good = '4d0f2d3a-1111-4a00-8000-000000000001'
+        liar = '4d0f2d3a-2222-4a00-8000-000000000002'
+        rollout(f'rollout-2026-09-18T10-00-00-{good}.jsonl', good, good)
+        # named for one thread, carrying another
+        rollout(f'rollout-2026-09-18T11-00-00-{good}.jsonl'.replace(good, liar), good, good)
+
+        elsewhere = store + '/outside'
+        os.makedirs(elsewhere)
+        outside = elsewhere + f'/rollout-2026-09-18T12-00-00-{good}.jsonl'
+        with open(outside, 'w', encoding='utf-8') as f:
+            f.write(json.dumps({'type': 'session_meta', 'payload': {
+                'session_id': good, 'cwd': '/elsewhere', 'originator': 'vscode',
+                'thread_source': 'user'}}) + '\n')
+        os.symlink(outside, store + f'/2026/09/18/rollout-2026-09-18T13-00-00-{good}.jsonl')
+
+        saved = config.CODEX_SESSIONS_DIR
+        config.CODEX_SESSIONS_DIR = store + '/'
+        try:
+            found = list(discovery.iter_sessions('codex'))
+        finally:
+            config.CODEX_SESSIONS_DIR = saved
+
+        check('a rollout whose name disagrees with its payload is skipped',
+              [f['session_id'] for f in found] == [good],
+              str([(os.path.basename(f['path']), f['session_id']) for f in found]))
+        check('and a symlink out of the store is not followed',
+              all('outside' not in os.path.realpath(f['path']) for f in found),
+              str([os.path.realpath(f['path']) for f in found]))
+
+
 def run_all() -> None:
     test_busy_lock_is_exclusive()
     test_busy_lock_release_respects_owner()
@@ -3279,6 +3354,8 @@ def run_all() -> None:
     test_a_duplicate_past_the_old_boundary_is_still_found()
     test_the_search_stops_early_and_says_how_sure_it_is()
     test_a_real_store_is_read_to_the_end_to_settle_a_name()
+    test_a_title_search_will_not_read_a_transcript_outside_the_store()
+    test_a_codex_rollout_must_be_named_for_the_thread_it_carries()
 
 if __name__ == '__main__':
     # Delivery records are written by any finished job, so a test run left rows like

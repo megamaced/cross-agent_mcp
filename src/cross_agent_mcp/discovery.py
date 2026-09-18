@@ -416,25 +416,38 @@ def iter_sessions(agent: str) -> Iterator[Dict[str, Any]]:
     and the cap costs nothing because nobody needs the six-hundredth entry. A title search is
     not a sample: its whole job is to find the *second* session with a name, and a cap applied
     to it turns "I did not look that far" into "there is only one".
+
+    Every candidate goes through the same checks a lookup by id does: it has to really live
+    inside the configured store, carry an id that is allowed to be one, and - for Codex - be
+    named for the thread it contains. A search that skipped them would be a way in through the
+    front door, since a title is matched from the file's own contents.
     """
     if agent == config.AGENT_CLAUDE:
         for project_dir in sorted(glob.glob(config.CLAUDE_PROJECTS_DIR + '*')):
             if not os.path.isdir(project_dir):
                 continue
-            for path in sorted(glob.glob(project_dir + '/*.jsonl'), key=_safe_mtime,
-                               reverse=True):
+            found = glob.glob(project_dir + '/*.jsonl')
+            for path in sorted(paths.contained(found, config.CLAUDE_PROJECTS_DIR),
+                               key=_safe_mtime, reverse=True):
                 info = _parse_claude_session(path)
-                if info:
+                if info and paths.is_session_id(info['session_id']):
                     yield info
         return
 
     if agent == config.AGENT_CODEX:
         names = _load_codex_thread_names()
         seen: set = set()
-        paths = glob.glob(config.CODEX_SESSIONS_DIR + '**/rollout-*.jsonl', recursive=True)
-        for path in sorted(paths, key=_safe_mtime, reverse=True):
+        found = glob.glob(config.CODEX_SESSIONS_DIR + '**/rollout-*.jsonl', recursive=True)
+        for path in sorted(paths.contained(found, config.CODEX_SESSIONS_DIR),
+                           key=_safe_mtime, reverse=True):
             info = _parse_codex_session(path)
-            if not info or info['session_id'] in seen:
+            if not info or not paths.is_session_id(info['session_id']):
+                continue
+            if not os.path.basename(path).endswith(f'-{info["session_id"]}.jsonl'):
+                logger.info(f'iter_sessions [id mismatch]: {path} carries '
+                            f'{info["session_id"]}')
+                continue
+            if info['session_id'] in seen:
                 # a resumed thread writes several rollouts; it is one conversation, and
                 # counting it twice would make every resumed thread look like a duplicate
                 continue
