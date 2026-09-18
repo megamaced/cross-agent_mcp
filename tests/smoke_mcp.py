@@ -14,6 +14,8 @@ import shutil
 import sys
 import tempfile
 
+from typing import Optional
+
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -21,9 +23,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) +
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# set before the import: config reads CROSS_AGENT_HOME at import time
+# set before the import: config reads all three at import time
 STATE_DIR = tempfile.mkdtemp(prefix='cross-agent-smoke-')
-os.environ['CROSS_AGENT_HOME'] = STATE_DIR
+os.environ['CROSS_AGENT_HOME'] = STATE_DIR + '/bridge'
+os.environ['CLAUDE_CONFIG_DIR'] = STATE_DIR + '/claude'
+os.environ['CODEX_HOME'] = STATE_DIR + '/codex'
+for _empty in ('/claude/projects', '/codex/sessions'):
+    os.makedirs(STATE_DIR + _empty, exist_ok=True)
 
 from cross_agent_mcp import config, registry  # noqa: E402
 
@@ -35,15 +41,17 @@ def _text_of(result) -> str:
     return ''
 
 
-def _server(agent: str) -> StdioServerParameters:
-    """A bridge server told which agent it is, rather than inferring it from its parent."""
-    return StdioServerParameters(
-        command=ROOT_DIR + '/.venv/bin/python',
-        args=['-m', 'cross_agent_mcp'],
-        env={**os.environ, 'PYTHONPATH': ROOT_DIR + '/src',
-             'CROSS_AGENT_HOME': STATE_DIR, 'CROSS_AGENT_SELF': agent},
-        cwd=ROOT_DIR,
-    )
+def _server(agent: str, ambient: Optional[str] = None) -> StdioServerParameters:
+    """A bridge server told which agent it is, rather than inferring it from its parent.
+
+    `ambient` drops the override, to prove the isolation holds without it.
+    """
+    env = {**os.environ, 'PYTHONPATH': ROOT_DIR + '/src'}
+    env.pop('CROSS_AGENT_SELF', None)
+    if ambient is None:
+        env['CROSS_AGENT_SELF'] = agent
+    return StdioServerParameters(command=ROOT_DIR + '/.venv/bin/python',
+                                 args=['-m', 'cross_agent_mcp'], env=env, cwd=ROOT_DIR)
 
 
 def _delivery_records() -> list:
@@ -129,16 +137,31 @@ async def main() -> int:
         if await _refuses_its_own_agent(agent):
             return 1
 
+    # the case that used to send for real: a Codex runner reaching for Claude. Nothing here
+    # forces the identity, so this is the ambient path, and the isolated stores are what has
+    # to keep it harmless.
+    async with stdio_client(_server('claude', ambient='codex')) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            listing = json.loads(_text_of(await session.call_tool(
+                'list_agent_sessions', {'agent': 'both', 'scope': 'any'})))
+    if listing['claude'] or listing['codex']:
+        print(f'[FAIL] the isolated stores were not empty: {listing}')
+        return 1
+    print('[ok] ambient identity sees no real session to reach for')
+
     records = _delivery_records()
     if records:
         print(f'[FAIL] the run created delivery records: {records}')
         return 1
     print('[ok] no delivery record was created by any of it')
 
-    if not os.path.realpath(config.HOME_DIR).startswith(os.path.realpath(STATE_DIR)):
-        print(f'[FAIL] the run was not isolated: {config.HOME_DIR}')
-        return 1
-    print(f'[ok] state stayed in {STATE_DIR}')
+    for label, path in (('bridge', config.HOME_DIR), ('claude', config.CLAUDE_PROJECTS_DIR),
+                        ('codex', config.CODEX_SESSIONS_DIR)):
+        if not os.path.realpath(path).startswith(os.path.realpath(STATE_DIR)):
+            print(f'[FAIL] the {label} store was not isolated: {path}')
+            return 1
+    print(f'[ok] bridge, claude and codex state all stayed in {STATE_DIR}')
 
     print('\nALL CHECKS PASSED')
     return 0
