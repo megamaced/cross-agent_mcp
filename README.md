@@ -42,23 +42,32 @@ useful for:
 - [License](#license)
 
 ```
-        VS Code
-           │
-   ┌───────┴────────┐
-   │                │
-Claude Code       Codex
-session A        thread B
-   │                │
-   └──── cross-agent MCP ────┘
-              │
-       session registry
-   (~/.cross-agent/registry.json)
+                     VS Code
+                         │
+     ┌────────────┬──────┴─────┬────────────┐
+     │            │            │            │
+  Claude       Claude        Codex        Codex
+ session A    session B    thread C     thread D
+     │            │            │            │
+     └─────────── cross-agent MCP ──────────┘
+                         │
+                 session registry
+          (~/.cross-agent/registry.json)
 ```
+
+Any of these can reach any other through the same hub — Claude ↔ Codex across products, or
+Claude ↔ Claude / Codex ↔ Codex within the same product (see the same-agent row in the table
+below, and [section 6](#6-preventing-infinite-calls) for how that's gated).
 
 | Direction | Tool | With panel shim | Without it (fallback) |
 |---|---|---|---|
 | Claude → Codex | `send_to_codex` | Inject `turn/start` into the panel's app-server | `codex exec resume <thread-id> --json` |
 | Codex → Claude | `send_to_claude` | Inject a stream-json user message into the panel process | `claude -p --resume <session-id> --output-format json` |
+| Claude → Claude¹ | `send_to_claude` | Inject a stream-json user message into the panel process | `claude -p --resume <session-id> --output-format json` |
+| Codex → Codex¹ | `send_to_codex` | Inject `turn/start` into the panel's app-server | `codex exec resume <thread-id> --json` |
+
+¹ Same-agent rows need an explicit target — `allow_same_agent=true` or a `session_id` for Claude,
+a `session_id` for Codex — see [section 6](#6-preventing-infinite-calls).
 
 With the shim attached, the exchange **renders directly in the real VS Code panel** (see section 3).
 
