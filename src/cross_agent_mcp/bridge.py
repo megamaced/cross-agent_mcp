@@ -692,11 +692,25 @@ def _requested_session_id(target_agent: str, session_id: Optional[str],
 
     `session_id` may be a real id or the conversation's name, because that is what a human
     hands the agent. A sticky pin stands in when nothing was named.
+
+    What comes back is always the id the matched record carries, never the string the caller
+    typed. The two are usually the same and the difference only shows when it matters: an id
+    that arrived with whitespace around it, or a name that resolved to a session. Everything
+    downstream - the busy lock, the delivery record, the reply address - then refers to the
+    session by the one id the store itself uses for it.
     """
     if session_id:
-        if discovery.find_session(target_agent, session_id):
-            return session_id, session_id
-        named = discovery.find_session_by_name(target_agent, session_id)
+        found = discovery.find_session(target_agent, session_id)
+        if found:
+            return found['session_id'], session_id
+
+        try:
+            named = discovery.find_session_by_name(target_agent, session_id)
+        except discovery.AmbiguousSessionName as e:
+            raise BridgeError(
+                f'{len(e.matches)} {target_agent} sessions are named {session_id!r}, so it does '
+                'not identify one conversation. Nothing was sent and no session was created. '
+                f'Send again with one of these ids: {discovery.describe_sessions(e.matches)}')
         if named:
             logger.info(f'_requested_session_id [resolved by name]: '
                         f'{session_id!r} -> {named["session_id"]}')

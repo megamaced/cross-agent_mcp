@@ -16,7 +16,7 @@ import re
 import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from . import config, registry
+from . import config, paths, registry
 
 
 logger = logging.getLogger('cross_agent_mcp.discovery')
@@ -359,22 +359,44 @@ def list_sessions(agent: str, scope: str, cwd: str, limit: int = 20,
 
 
 def find_session(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
-    """Look up one session by id. Both stores encode the id in the file name."""
+    """Look up one session by id. Both stores encode the id in the file name.
+
+    The id is checked before it becomes part of a glob, and the transcript it matched has to
+    have been inside that agent's own store. An id that does not check out is simply not
+    found: the same argument also carries conversation names, and a name is not malformed for
+    failing to be an id - it belongs to `find_session_by_name`, which is tried next.
+
+    What comes back carries the id read out of the matching record, not the one that was
+    asked for, so everything downstream addresses the session by its own name for itself.
+    """
+    if not paths.is_session_id(session_id):
+        logger.debug(f'find_session [not an id]: {agent} {session_id!r}')
+        return None
+    wanted = paths.canonical_session_id(session_id)
+
     if agent == config.AGENT_CLAUDE:
-        for path in glob.glob(config.CLAUDE_PROJECTS_DIR + f'*/{session_id}.jsonl'):
+        found = glob.glob(config.CLAUDE_PROJECTS_DIR + f'*/{wanted}.jsonl')
+        for path in paths.contained(found, config.CLAUDE_PROJECTS_DIR):
             info = _parse_claude_session(path)
-            if info:
+            if info and info['session_id'] == wanted:
                 return info
         return None
 
     if agent == config.AGENT_CODEX:
-        paths = glob.glob(config.CODEX_SESSIONS_DIR + f'**/rollout-*-{session_id}.jsonl',
+        found = glob.glob(config.CODEX_SESSIONS_DIR + f'**/rollout-*-{wanted}.jsonl',
                           recursive=True)
-        for path in sorted(paths, key=_safe_mtime, reverse=True):
+        for path in sorted(paths.contained(found, config.CODEX_SESSIONS_DIR),
+                           key=_safe_mtime, reverse=True):
             info = _parse_codex_session(path)
-            if info:
-                info['title'] = _load_codex_thread_names().get(session_id, '')
-                return info
+            if not info:
+                continue
+            if info['session_id'] != wanted:
+                # the rollout is named for one thread and carries another; trust the record
+                logger.info(f'find_session [id mismatch]: {path} carries '
+                            f'{info["session_id"]}, not {wanted}')
+                continue
+            info['title'] = _load_codex_thread_names().get(wanted, '')
+            return info
         return None
 
     raise ValueError(f'unknown agent: {agent}')
@@ -392,7 +414,11 @@ def find_session_by_name(agent: str, name: str, limit: int = 500) -> Optional[Di
     while the session actually named koppa_studio went unseen.
 
     A name the caller half-remembers must fail loudly. Guessing is how a message ends up in a
-    conversation nobody is watching.
+    conversation nobody is watching. A name several conversations answer to is the same
+    problem wearing a better disguise, and it raises AmbiguousSessionName rather than picking
+    the freshest: duplicate titles are ordinary - two reviews of the same repository get the
+    same opening line - and "the newest one" is a guess about which conversation the human
+    meant, made at the moment the message is about to be written into it.
     """
     wanted = ' '.join(name.split()).casefold()
     if not wanted:
@@ -404,14 +430,36 @@ def find_session_by_name(agent: str, name: str, limit: int = 500) -> Optional[Di
     ]
     if not matches:
         return None
+    if len(matches) > 1:
+        raise AmbiguousSessionName(agent, name, sorted(matches, key=lambda s: -s['mtime']))
 
-    best = max(matches, key=lambda s: s['mtime'])
+    best = matches[0]
     best['source'] = 'name'
     best['matched_name'] = name
-    if len(matches) > 1:
-        logger.info(f'find_session_by_name [ambiguous]: {len(matches)} sessions are titled '
-                    f'{name!r}; took the freshest ({best["session_id"]})')
     return best
+
+
+class AmbiguousSessionName(LookupError):
+    """More than one conversation answers to a name, so none of them can be delivered to.
+
+    Carries the candidates rather than only the count: the caller's way out is to name one by
+    id, and it can only do that if it is told which ones there are.
+    """
+
+    def __init__(self, agent: str, name: str, matches: List[Dict[str, Any]]) -> None:
+        self.agent = agent
+        self.name = name
+        self.matches = matches
+        super().__init__(f'{len(matches)} {agent} sessions are titled {name!r}: '
+                         f'{describe_sessions(matches)}')
+
+
+def describe_sessions(sessions: List[Dict[str, Any]]) -> str:
+    """One line per candidate: which session, how long since it was written, and from where."""
+    return '; '.join(
+        f'{s["session_id"]} (last active {s.get("updated_at")}, {s.get("age_minutes")} min ago'
+        f'{"" if s.get("is_active") else ", idle"}, cwd={s.get("cwd") or "unknown"})'
+        for s in sessions)
 
 
 def suggest_session_names(agent: str, name: str, limit: int = 500,

@@ -3,6 +3,7 @@
     PYTHONPATH=src .venv/bin/python tests/unit_guards.py
 """
 
+import contextlib
 import json
 import os
 import sys
@@ -12,7 +13,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + '/src')
 
-from cross_agent_mcp import bridge, config, discovery, outbox, registry  # noqa: E402
+from cross_agent_mcp import bridge, config, discovery, outbox, paths, registry  # noqa: E402
 
 
 FAILURES = []
@@ -2833,6 +2834,240 @@ def uuid_hex() -> str:
     return uuid.uuid4().hex[:8]
 
 
+# ------------------------------------ a session id is checked before it reaches the filesystem
+
+REAL_CLAUDE_ID = 'e88ca075-5e19-4f47-8987-b265cb6272c3'
+REAL_CODEX_ID = '01a0b4b3-c75a-77d2-95b6-be4299edf5f9'
+
+MALFORMED_IDS = (
+    '../../../etc/passwd',          # traversal
+    'a/b',                          # a separator of any kind
+    'a\\b',
+    '*',                            # glob metacharacters: these would match real sessions
+    '?',
+    'sid[0-9]',
+    '{a,b}',
+    '~',
+    'sid with spaces',
+    'sid\nnewline',
+    'sid\x00null',
+    '.hidden',
+    '..',
+    '',
+    '   ',
+    'x' * (paths.SESSION_ID_MAX_LENGTH + 1),
+)
+
+
+def test_a_real_session_id_is_accepted_and_canonicalised() -> None:
+    check('a Claude session uuid is a valid id', paths.is_session_id(REAL_CLAUDE_ID))
+    check('a Codex thread id is a valid id', paths.is_session_id(REAL_CODEX_ID))
+    check('surrounding whitespace is forgiven, since ids get copied out of panels and logs',
+          paths.canonical_session_id(f'  {REAL_CODEX_ID}\n') == REAL_CODEX_ID)
+    check('and the canonical form is the id itself',
+          paths.canonical_session_id(REAL_CLAUDE_ID) == REAL_CLAUDE_ID)
+
+
+def test_a_malformed_session_id_is_refused() -> None:
+    accepted = [bad for bad in MALFORMED_IDS if paths.is_session_id(bad)]
+    check('no path separator, traversal, glob character, control character, blank or '
+          'over-long id is accepted', not accepted, str(accepted))
+    check('a non-string is refused too',
+          not paths.is_session_id(None) and not paths.is_session_id(42)
+          and not paths.is_session_id(['a']))
+
+    raised = []
+    for bad in MALFORMED_IDS:
+        try:
+            paths.canonical_session_id(bad)
+        except paths.InvalidSessionId:
+            raised.append(bad)
+    check('and canonicalising one raises rather than returning something usable',
+          len(raised) == len(MALFORMED_IDS), str(set(MALFORMED_IDS) - set(raised)))
+
+
+def test_a_malformed_id_never_reaches_a_glob() -> None:
+    """Refusing late is not refusing: by then the pattern has already walked the store."""
+    probed = []
+    original = discovery.glob.glob
+    discovery.glob.glob = lambda pattern, **kw: probed.append(pattern) or []
+    try:
+        results = [discovery.find_session(agent, bad)
+                   for bad in MALFORMED_IDS
+                   for agent in (config.AGENT_CLAUDE, config.AGENT_CODEX)]
+    finally:
+        discovery.glob.glob = original
+
+    check('a malformed id is simply not found', not any(results), str(results))
+    check('and nothing was globbed for it', not probed, str(probed[:3]))
+
+
+def test_a_malformed_id_never_creates_a_lock_file() -> None:
+    refused = []
+    for bad in MALFORMED_IDS:
+        try:
+            registry._lock_path(config.AGENT_CODEX, bad)
+        except paths.InvalidSessionId:
+            refused.append(bad)
+    check('a lock path is never built from a malformed id',
+          len(refused) == len(MALFORMED_IDS), str(set(MALFORMED_IDS) - set(refused)))
+
+    before = sorted(os.listdir(config.LOCK_DIR)) if os.path.isdir(config.LOCK_DIR) else []
+    try:
+        with registry.busy_lock(config.AGENT_CODEX, '../escape', 'conv_bad'):
+            check('claiming a session with a malformed id is refused', False, 'lock was taken')
+    except paths.InvalidSessionId:
+        pass
+    after = sorted(os.listdir(config.LOCK_DIR)) if os.path.isdir(config.LOCK_DIR) else []
+    check('and no lock file was left behind by the attempt', before == after,
+          str(set(after) - set(before)))
+
+    check('an unknown agent is refused as well',
+          not _accepts(lambda: registry._lock_path('not-an-agent', REAL_CODEX_ID)))
+    check('and a valid pair still resolves under the lock directory',
+          registry._lock_path(config.AGENT_CODEX, REAL_CODEX_ID)
+          == config.LOCK_DIR + f'codex__{REAL_CODEX_ID}.lock')
+
+
+def _accepts(call) -> bool:
+    try:
+        call()
+    except paths.InvalidSessionId:
+        return False
+    return True
+
+
+def test_a_transcript_outside_the_store_is_not_a_session() -> None:
+    """Containment is the second lock: it holds even if a pattern is widened later."""
+    with tempfile.TemporaryDirectory(prefix='claude-containment-') as store:
+        elsewhere = store + '/elsewhere'
+        projects = store + '/projects'
+        os.makedirs(elsewhere)
+        os.makedirs(projects + '/-w')
+        planted = elsewhere + f'/{REAL_CLAUDE_ID}.jsonl'
+        _write_claude_transcript(planted, ['planted'], 'hello')
+        os.symlink(planted, projects + f'/-w/{REAL_CLAUDE_ID}.jsonl')
+
+        saved = config.CLAUDE_PROJECTS_DIR
+        config.CLAUDE_PROJECTS_DIR = projects + '/'
+        try:
+            found = discovery.find_session(config.AGENT_CLAUDE, REAL_CLAUDE_ID)
+        finally:
+            config.CLAUDE_PROJECTS_DIR = saved
+
+        check('a transcript that really lives outside the store is not returned',
+              found is None, str(found))
+        check('the containment check agrees',
+              not paths.is_within(projects + f'/-w/{REAL_CLAUDE_ID}.jsonl', projects)
+              and paths.is_within(planted, elsewhere))
+
+
+def test_a_found_session_is_addressed_by_the_id_its_own_record_carries() -> None:
+    with tempfile.TemporaryDirectory(prefix='claude-canonical-') as store:
+        os.makedirs(store + '/-w')
+        _write_claude_transcript(store + f'/-w/{REAL_CLAUDE_ID}.jsonl', ['Canonical'], 'hi')
+
+        saved = config.CLAUDE_PROJECTS_DIR
+        config.CLAUDE_PROJECTS_DIR = store + '/'
+        try:
+            found = discovery.find_session(config.AGENT_CLAUDE, f'  {REAL_CLAUDE_ID}  ')
+            resolved, requested = bridge._requested_session_id(
+                config.AGENT_CLAUDE, f'  {REAL_CLAUDE_ID}  ', '/w')
+        finally:
+            config.CLAUDE_PROJECTS_DIR = saved
+
+        check('an id that arrived with whitespace still finds its session',
+              found is not None and found['session_id'] == REAL_CLAUDE_ID, str(found))
+        check('and what is sent to is the id the record carries, not the string typed',
+              resolved == REAL_CLAUDE_ID and requested != resolved,
+              f'{resolved!r} from {requested!r}')
+
+
+# --------------------------------------- a name several conversations answer to is refused
+
+DUPLICATE_TITLE = 'Audit windows-infra-mcp code'
+
+TITLE_FIXTURES = [
+    {'session_id': '4d0f2d3a-1111-4a00-8000-000000000001', 'title': DUPLICATE_TITLE,
+     'mtime': 200.0, 'updated_at': '2026-09-18 10:00:00', 'age_minutes': 12.0,
+     'is_active': True, 'cwd': '/home/u/git/windows-infra-mcp'},
+    {'session_id': '4d0f2d3a-2222-4a00-8000-000000000002', 'title': DUPLICATE_TITLE,
+     'mtime': 100.0, 'updated_at': '2026-09-17 09:00:00', 'age_minutes': 1500.0,
+     'is_active': False, 'cwd': '/home/u/git/other'},
+    {'session_id': '4d0f2d3a-3333-4a00-8000-000000000003', 'title': 'Review Sophos MCP API gaps',
+     'mtime': 50.0, 'updated_at': '2026-09-16 08:00:00', 'age_minutes': 3000.0,
+     'is_active': False, 'cwd': '/home/u/git/sophos'},
+]
+
+
+@contextlib.contextmanager
+def _titled_sessions(sessions):
+    original = discovery.list_sessions
+    discovery.list_sessions = lambda agent, scope, cwd, limit=500, **kw: [dict(s) for s in sessions]
+    try:
+        yield
+    finally:
+        discovery.list_sessions = original
+
+
+def test_a_unique_title_still_resolves_and_a_missing_one_still_returns_nothing() -> None:
+    with _titled_sessions(TITLE_FIXTURES):
+        unique = discovery.find_session_by_name('codex', 'Review Sophos MCP API gaps')
+        check('a title only one conversation carries resolves as before',
+              (unique or {}).get('session_id') == '4d0f2d3a-3333-4a00-8000-000000000003',
+              str(unique))
+        check('a title nothing carries is still simply not found',
+              discovery.find_session_by_name('codex', 'nothing is called this') is None)
+
+
+def test_a_title_several_conversations_share_is_refused() -> None:
+    """Picking the freshest is a guess about which conversation the human meant."""
+    with _titled_sessions(TITLE_FIXTURES):
+        try:
+            resolved = discovery.find_session_by_name('codex', DUPLICATE_TITLE)
+            check('a duplicated title fails closed instead of choosing one', False,
+                  f'returned {resolved}')
+        except discovery.AmbiguousSessionName as e:
+            message = str(e)
+            check('a duplicated title fails closed instead of choosing one', True)
+            check('the error names every candidate session',
+                  all(s['session_id'] in message for s in TITLE_FIXTURES[:2]), message)
+            check('with how long ago each was active and where it runs',
+                  '12.0 min ago' in message and '/home/u/git/windows-infra-mcp' in message
+                  and 'idle' in message, message)
+            check('and not the session that has a different title',
+                  TITLE_FIXTURES[2]['session_id'] not in message, message)
+
+
+def test_an_ambiguous_name_sends_nothing_and_pins_nothing() -> None:
+    with _titled_sessions(TITLE_FIXTURES):
+        original = discovery.find_session
+        discovery.find_session = lambda agent, session_id: None
+        try:
+            bridge._requested_session_id('codex', DUPLICATE_TITLE, '/w')
+            check('sending to an ambiguous name is refused', False, 'no error raised')
+        except bridge.BridgeError as e:
+            message = str(e)
+            check('sending to an ambiguous name is refused',
+                  'Nothing was sent and no session was created' in message, message)
+            check('and the caller is told which ids to choose between',
+                  all(s['session_id'] in message for s in TITLE_FIXTURES[:2]), message)
+        finally:
+            discovery.find_session = original
+
+        import asyncio
+        from cross_agent_mcp import server as server_module
+        pinned = asyncio.run(server_module.pin_agent_session.fn('codex', DUPLICATE_TITLE, '/w')) \
+            if hasattr(server_module.pin_agent_session, 'fn') \
+            else asyncio.run(server_module.pin_agent_session('codex', DUPLICATE_TITLE, '/w'))
+        check('pinning an ambiguous name is refused the same way',
+              pinned.get('ok') is False and 'Nothing was pinned' in str(pinned.get('error')),
+              str(pinned))
+        check('and the pin error lists the candidates too',
+              all(s['session_id'] in str(pinned.get('error')) for s in TITLE_FIXTURES[:2]),
+              str(pinned))
+
+
 def run_all() -> None:
     test_busy_lock_is_exclusive()
     test_busy_lock_release_respects_owner()
@@ -2904,6 +3139,15 @@ def run_all() -> None:
     test_in_flight_records_expire_and_are_pruned()
     test_servers_sharing_the_delivery_directory_do_not_trip_over_each_other()
     test_servers_from_before_in_flight_records_share_the_directory_safely()
+    test_a_real_session_id_is_accepted_and_canonicalised()
+    test_a_malformed_session_id_is_refused()
+    test_a_malformed_id_never_reaches_a_glob()
+    test_a_malformed_id_never_creates_a_lock_file()
+    test_a_transcript_outside_the_store_is_not_a_session()
+    test_a_found_session_is_addressed_by_the_id_its_own_record_carries()
+    test_a_unique_title_still_resolves_and_a_missing_one_still_returns_nothing()
+    test_a_title_several_conversations_share_is_refused()
+    test_an_ambiguous_name_sends_nothing_and_pins_nothing()
 
 if __name__ == '__main__':
     # Delivery records are written by any finished job, so a test run left rows like

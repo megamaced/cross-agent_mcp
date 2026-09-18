@@ -14,7 +14,7 @@ import time
 import uuid
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
-from . import config
+from . import config, paths
 
 
 logger = logging.getLogger('cross_agent_mcp.registry')
@@ -168,7 +168,8 @@ def get_conversation(conversation_id: str) -> Dict[str, Any]:
 # --------------------------------------------------------------- busy locking
 
 def _lock_path(agent: str, session_id: str) -> str:
-    return config.LOCK_DIR + f'{agent}__{session_id}.lock'
+    """Where one session's busy lock lives. Raises rather than name a file for a bad id."""
+    return paths.lock_path(agent, session_id)
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -284,7 +285,13 @@ def list_busy_locks() -> List[Dict[str, Any]]:
         if not name.endswith('.lock'):
             continue
         agent, _, rest = name[:-5].partition('__')
-        record = read_busy_lock(agent, rest)
+        try:
+            record = read_busy_lock(agent, rest)
+        except paths.InvalidSessionId:
+            # a lock file this build would never have written; listing is a read-only report
+            # and has no business failing over one
+            logger.info(f'list_busy_locks [skipped]: {name}')
+            continue
         if record:
             locks.append(record)
     return locks
