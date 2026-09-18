@@ -188,9 +188,14 @@ repository does", or call `send_to_codex` directly. You will be asked to approve
 call. Approve it. That prompt is the bridge asking to relay a message; it is not a sign that
 anything is misconfigured, and the bridge works exactly the same with it on.
 
-What you should see: the receipt says `accepted: true`, the peer answers with its own
-conversation context intact, and its answer arrives back as a separate message in your
-session. No environment variables set. If that works, the bridge is installed correctly.
+What you should see: the receipt says `accepted: true`, the peer answers, and its answer
+arrives back as a separate message in your session. No environment variables set. If that
+works, the bridge is installed correctly.
+
+If the bridge resolved an existing peer session, that session answers with all of its earlier
+context — which is the point of resuming rather than starting over. If it found none and
+created one, the receipt says `will_create_session: true` and that conversation begins with no
+earlier context at all; there was none to keep.
 
 Without the shims from section 3.5 the exchange is appended to the peer's session history but
 is **not** drawn in its VS Code panel until that conversation is reopened — the delivery is
@@ -200,10 +205,10 @@ real either way, and `is_visible_in_panel` in the receipt says which you got.
 
 ### 3.4 Running unattended (opt-in)
 
-Everything below **removes a safety boundary**. None of it is needed for messages to be
-delivered or for a peer to keep its conversation context — get section 3.3 working first, then
-decide which of these you actually want. They are three separate things and are often
-confused for one another:
+The first two options below **remove a safety boundary**; the third does not. None of the
+three is needed for messages to be delivered or for a peer to keep its conversation context —
+get section 3.3 working first, then decide which you actually want. They are separate things
+and are often confused for one another:
 
 **a. Approving the bridge tool itself.** This only stops your own editor asking you to confirm
 each relay. It changes nothing about what the peer agent is then allowed to do. It is the
