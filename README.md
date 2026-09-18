@@ -4,14 +4,16 @@
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-**Let your Claude Code session and your Codex thread talk to each other — live, in VS Code, without either one losing its memory.**
+**Let your Claude Code session and your Codex thread talk to each other, live, without either one losing its memory.**
 
-cross-agent MCP is a relay MCP server for two coding agents that are already running side by
-side in the same VS Code window: an active **Claude Code** session and an active **Codex**
-thread. Either one can hand a message to the other through `send_to_codex` / `send_to_claude`,
-and the bridge finds each product's **currently active session** from the transcript it leaves
-on disk and **resumes it** — instead of spawning a disposable new agent — so both sides keep
-their full existing context.
+cross-agent MCP is a relay MCP server for two coding agents you already have running — an active
+**Claude Code** session and an active **Codex** thread, in a plain terminal or in VS Code, it
+doesn't matter which. Either one can hand a message to the other through `send_to_codex` /
+`send_to_claude`, and the bridge finds each product's **currently active session** from the
+transcript it leaves on disk and **resumes it** — instead of spawning a disposable new agent —
+so both sides keep their full existing context. VS Code isn't required for any of this; it only
+unlocks one extra feature, covered in [section 3](#3-registration): seeing the exchange render
+live in the real chat panel instead of just landing in the transcript.
 
 That's the difference from just running a second CLI by hand: neither side has to re-explain
 the task, and neither one loses the conversation it was already having. A few things this is
@@ -58,7 +60,7 @@ the human.
 - [License](#license)
 
 ```
-                     VS Code
+               Terminal or VS Code
                          │
      ┌────────────┬──────┴─────┬────────────┐
      │            │            │            │
@@ -211,6 +213,9 @@ Claude Code asks for approval on every MCP tool call. Add a server-level rule to
 > MCP servers connect only at session start.
 
 ### IDE panel integration (bidirectional)
+
+Everything above works the same from a plain terminal — this section is optional, and only
+matters if you also use the VS Code extensions' chat panels.
 
 The CLI resume path (`codex exec resume` / `claude -p --resume`) appends a turn to the session history, so context is preserved, but it **doesn't show up in the VS Code panel.** The panel's session lives only inside the child process the extension spawned and connected to directly over stdio, and there's no way in from outside.
 
