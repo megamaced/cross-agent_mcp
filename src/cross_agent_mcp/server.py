@@ -421,6 +421,13 @@ async def pin_agent_session(
     if not found:
         try:
             found = await _run_blocking(discovery.find_session_by_name, agent, session_id)
+        except discovery.UnprovenSessionName as e:
+            return {'ok': False, 'agent': agent, 'cwd': target_cwd,
+                    'error': f'one {agent} session named {session_id!r} was found, but only the '
+                             f'{e.scanned} most recent could be searched, so nothing rules out '
+                             'a second one with the same name. Nothing was pinned. Pin it by '
+                             f'id if this is the one you meant: '
+                             f'{discovery.describe_sessions([e.match])}'}
         except discovery.AmbiguousSessionName as e:
             # a pin points every later relay at one conversation, so an ambiguous name is
             # refused here for the same reason it is refused when sending

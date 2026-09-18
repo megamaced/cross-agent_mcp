@@ -222,15 +222,22 @@ def _claude_project_dirs(scope: str, cwd: str) -> List[str]:
 
 
 def list_claude_sessions(scope: str, cwd: str, limit: int = 20) -> List[Dict[str, Any]]:
+    return _claude_sessions(scope, cwd, limit)[0]
+
+
+def _claude_sessions(scope: str, cwd: str, limit: int = 20) -> Tuple[List[Dict[str, Any]], bool]:
+    """The sessions, and whether the scan saw every transcript or stopped at the cap."""
     paths: List[str] = []
     for project_dir in _claude_project_dirs(scope, cwd):
         paths.extend(glob.glob(project_dir + '/*.jsonl'))
 
     paths = sorted(paths, key=_safe_mtime, reverse=True)
 
+    is_complete = True
     sessions: List[Dict[str, Any]] = []
     for path in paths:
         if len(sessions) >= limit:
+            is_complete = False
             break
 
         info = _parse_claude_session(path)
@@ -243,7 +250,7 @@ def list_claude_sessions(scope: str, cwd: str, limit: int = 20) -> List[Dict[str
         info['cwd_relation'] = relation
         sessions.append(info)
 
-    return sorted(sessions, key=_sort_key)
+    return sorted(sessions, key=_sort_key), is_complete
 
 
 # ------------------------------------------------------------------- Codex
@@ -299,6 +306,11 @@ def _parse_codex_session(path: str) -> Optional[Dict[str, Any]]:
 
 def list_codex_sessions(scope: str, cwd: str, limit: int = 20,
                         since_mtime: Optional[float] = None) -> List[Dict[str, Any]]:
+    return _codex_sessions(scope, cwd, limit, since_mtime)[0]
+
+
+def _codex_sessions(scope: str, cwd: str, limit: int = 20,
+                    since_mtime: Optional[float] = None) -> Tuple[List[Dict[str, Any]], bool]:
     """Scan the Codex rollout store, newest first.
 
     Codex keeps every project's rollouts in one date-partitioned store, so a directory filter
@@ -316,15 +328,20 @@ def list_codex_sessions(scope: str, cwd: str, limit: int = 20,
     by_session: Dict[str, Dict[str, Any]] = {}
     is_filtering = scope != SCOPE_ANY
     examined = 0
+    # A `since_mtime` stop is a filter the caller asked for, not a cap that hid something:
+    # only the two count limits below leave the answer unproven.
+    is_complete = True
 
     for path in paths:
         if len(by_session) >= limit:
+            is_complete = False
             break
         if since_mtime is not None and _safe_mtime(path) < since_mtime:
             break
         if not is_filtering and examined >= config.CODEX_SCAN_LIMIT:
             logger.info(f'list_codex_sessions [truncated]: stopped after {examined} of '
                         f'{len(paths)} rollout files')
+            is_complete = False
             break
         examined += 1
 
@@ -344,17 +361,31 @@ def list_codex_sessions(scope: str, cwd: str, limit: int = 20,
         info['cwd_relation'] = relation
         by_session[info['session_id']] = info
 
-    return sorted(by_session.values(), key=_sort_key)[:limit]
+    return sorted(by_session.values(), key=_sort_key)[:limit], is_complete
 
 
 # ------------------------------------------------------------------ shared
 
 def list_sessions(agent: str, scope: str, cwd: str, limit: int = 20,
                   since_mtime: Optional[float] = None) -> List[Dict[str, Any]]:
+    return list_sessions_complete(agent, scope, cwd, limit, since_mtime)[0]
+
+
+def list_sessions_complete(agent: str, scope: str, cwd: str, limit: int = 20,
+                           since_mtime: Optional[float] = None
+                           ) -> Tuple[List[Dict[str, Any]], bool]:
+    """The sessions, and whether the scan proved it saw all of them.
+
+    Both stores are scanned under a count cap, because "open every transcript ever written" is
+    not a thing to do on every call. For listing that is fine - a listing is a sample, and the
+    newest are the ones worth showing. For deciding whether a name identifies *one*
+    conversation it is not fine at all: a cap can hide the second session with that name, and
+    the answer "unique" would then mean "unique among the ones I got to".
+    """
     if agent == config.AGENT_CLAUDE:
-        return list_claude_sessions(scope, cwd, limit)
+        return _claude_sessions(scope, cwd, limit)
     if agent == config.AGENT_CODEX:
-        return list_codex_sessions(scope, cwd, limit, since_mtime)
+        return _codex_sessions(scope, cwd, limit, since_mtime)
     raise ValueError(f'unknown agent: {agent}')
 
 
@@ -402,7 +433,14 @@ def find_session(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
     raise ValueError(f'unknown agent: {agent}')
 
 
-def find_session_by_name(agent: str, name: str, limit: int = 500) -> Optional[Dict[str, Any]]:
+# How many sessions a name search will look at before it gives up on proving uniqueness. Much
+# larger than a listing's limit, because the cost here is one head-read per transcript and the
+# alternative to paying it is delivering into a conversation that merely matched first.
+NAME_SEARCH_LIMIT = 2000
+
+
+def find_session_by_name(agent: str, name: str,
+                         limit: int = NAME_SEARCH_LIMIT) -> Optional[Dict[str, Any]]:
     """Look one session up by the title the user sees, not by its uuid.
 
     A conversation the human named answers to that name; one they did not falls back to a
@@ -424,14 +462,20 @@ def find_session_by_name(agent: str, name: str, limit: int = 500) -> Optional[Di
     if not wanted:
         return None
 
+    sessions, is_complete = list_sessions_complete(agent, SCOPE_ANY, os.getcwd(), limit=limit)
     matches = [
-        candidate for candidate in list_sessions(agent, SCOPE_ANY, os.getcwd(), limit=limit)
+        candidate for candidate in sessions
         if ' '.join(str(candidate.get('title') or '').split()).casefold() == wanted
     ]
     if not matches:
+        # Nothing matched, and a truncated scan cannot promise nothing would have. That is
+        # already the safe way round: the caller is told no session has that name and nothing
+        # is sent, rather than being handed one that merely matched first.
         return None
     if len(matches) > 1:
         raise AmbiguousSessionName(agent, name, sorted(matches, key=lambda s: -s['mtime']))
+    if not is_complete:
+        raise UnprovenSessionName(agent, name, matches[0], len(sessions))
 
     best = matches[0]
     best['source'] = 'name'
@@ -452,6 +496,27 @@ class AmbiguousSessionName(LookupError):
         self.matches = matches
         super().__init__(f'{len(matches)} {agent} sessions are titled {name!r}: '
                          f'{describe_sessions(matches)}')
+
+
+class UnprovenSessionName(LookupError):
+    """One session carries this name, out of the ones the scan got to.
+
+    Kept apart from "no match" and from "several matches" because it is neither: the name may
+    well identify exactly this conversation, and the search simply cannot say so. Delivering
+    on it would be choosing the first match found under a cap, which is the same guess
+    AmbiguousSessionName exists to refuse - only harder to notice, because from the outside it
+    looks like an ordinary successful lookup.
+    """
+
+    def __init__(self, agent: str, name: str, match: Dict[str, Any], scanned: int) -> None:
+        self.agent = agent
+        self.name = name
+        self.match = match
+        self.scanned = scanned
+        super().__init__(
+            f'one {agent} session named {name!r} was found among the {scanned} most recent, '
+            f'but the scan stopped at that limit, so it cannot be shown to be the only one: '
+            f'{describe_sessions([match])}')
 
 
 def describe_sessions(sessions: List[Dict[str, Any]]) -> str:

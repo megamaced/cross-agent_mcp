@@ -1136,14 +1136,14 @@ def test_a_conversations_own_name_is_what_it_is_called_by() -> None:
         check('but is not marked as named', parsed is not None and parsed['is_named'] is False)
 
         # the fallback title is not a name: it must not answer to a word inside it
-        originals = discovery.list_sessions
-        discovery.list_sessions = lambda agent, scope, cwd, limit=500, **kw: [
-            discovery._parse_claude_session(unnamed)]
+        originals = discovery.list_sessions_complete
+        discovery.list_sessions_complete = lambda agent, scope, cwd, limit=500, **kw: (
+            [discovery._parse_claude_session(unnamed)], True)
         try:
             check('a word quoted in an unnamed conversation is still not a name',
                   discovery.find_session_by_name('claude', 'koppa_studio') is None)
         finally:
-            discovery.list_sessions = originals
+            discovery.list_sessions_complete = originals
 
 
 def test_a_session_name_matches_exactly_or_not_at_all() -> None:
@@ -1159,8 +1159,10 @@ def test_a_session_name_matches_exactly_or_not_at_all() -> None:
         {'session_id': 'audit', 'title': 'Codex 감사 — koppa_studio_v4 결함', 'mtime': 100.0},
         {'session_id': 'named', 'title': 'Studio primer', 'mtime': 50.0},
     ]
-    original = discovery.list_sessions
+    original = (discovery.list_sessions, discovery.list_sessions_complete)
     discovery.list_sessions = lambda agent, scope, cwd, limit=500, **kw: list(sessions)
+    discovery.list_sessions_complete = lambda agent, scope, cwd, limit=500, **kw: (
+        list(sessions), True)
 
     try:
         check('a name that only appears inside a title does not match',
@@ -1175,7 +1177,7 @@ def test_a_session_name_matches_exactly_or_not_at_all() -> None:
         near = discovery.suggest_session_names('claude', 'koppa_studio')
         check('the near misses are offered as suggestions instead', len(near) == 2, str(near))
     finally:
-        discovery.list_sessions = original
+        (discovery.list_sessions, discovery.list_sessions_complete) = original
 
 
 def test_a_named_session_is_never_silently_created() -> None:
@@ -3001,13 +3003,16 @@ TITLE_FIXTURES = [
 
 
 @contextlib.contextmanager
-def _titled_sessions(sessions):
-    original = discovery.list_sessions
-    discovery.list_sessions = lambda agent, scope, cwd, limit=500, **kw: [dict(s) for s in sessions]
+def _titled_sessions(sessions, is_complete=True):
+    original = (discovery.list_sessions, discovery.list_sessions_complete)
+    discovery.list_sessions = lambda agent, scope, cwd, limit=500, **kw: [
+        dict(s) for s in sessions]
+    discovery.list_sessions_complete = lambda agent, scope, cwd, limit=500, **kw: (
+        [dict(s) for s in sessions], is_complete)
     try:
         yield
     finally:
-        discovery.list_sessions = original
+        (discovery.list_sessions, discovery.list_sessions_complete) = original
 
 
 def test_a_unique_title_still_resolves_and_a_missing_one_still_returns_nothing() -> None:
@@ -3066,6 +3071,95 @@ def test_an_ambiguous_name_sends_nothing_and_pins_nothing() -> None:
         check('and the pin error lists the candidates too',
               all(s['session_id'] in str(pinned.get('error')) for s in TITLE_FIXTURES[:2]),
               str(pinned))
+
+
+def test_a_name_whose_uniqueness_could_not_be_proven_is_refused() -> None:
+    """A cap can hide the second session with that name, and then "unique" only ever meant
+    "unique among the ones I got to"."""
+    with _titled_sessions(TITLE_FIXTURES, is_complete=False):
+        try:
+            resolved = discovery.find_session_by_name('codex', 'Review Sophos MCP API gaps')
+            check('a single match from a truncated scan is not delivered on', False,
+                  f'returned {resolved}')
+        except discovery.UnprovenSessionName as e:
+            check('a single match from a truncated scan is not delivered on', True)
+            check('the error says what was searched and what was found',
+                  str(e.scanned) in str(e) and e.match['session_id'] in str(e), str(e))
+
+    with _titled_sessions(TITLE_FIXTURES, is_complete=True):
+        check('while the same match from a complete scan resolves normally',
+              (discovery.find_session_by_name('codex', 'Review Sophos MCP API gaps') or {})
+              .get('session_id') == '4d0f2d3a-3333-4a00-8000-000000000003')
+
+    with _titled_sessions(TITLE_FIXTURES, is_complete=False):
+        try:
+            discovery.find_session_by_name('codex', DUPLICATE_TITLE)
+            check('two matches still refuse as ambiguous, not as unproven', False, 'no error')
+        except discovery.AmbiguousSessionName:
+            check('two matches still refuse as ambiguous, not as unproven', True)
+        except discovery.UnprovenSessionName as e:
+            check('two matches still refuse as ambiguous, not as unproven', False, str(e))
+
+        check('and nothing matching at all is still simply not found, which is already safe',
+              discovery.find_session_by_name('codex', 'nothing is called this') is None)
+
+
+def test_an_unproven_name_sends_nothing_and_pins_nothing() -> None:
+    with _titled_sessions(TITLE_FIXTURES, is_complete=False):
+        original = discovery.find_session
+        discovery.find_session = lambda agent, session_id: None
+        try:
+            bridge._requested_session_id('codex', 'Review Sophos MCP API gaps', '/w')
+            check('sending on an unproven name is refused', False, 'no error raised')
+        except bridge.BridgeError as e:
+            message = str(e)
+            check('sending on an unproven name is refused',
+                  'Nothing was sent and no session was created' in message, message)
+            check('and the caller is told to use the id instead',
+                  'session id' in message and '4d0f2d3a-3333' in message, message)
+        finally:
+            discovery.find_session = original
+
+        import asyncio
+        from cross_agent_mcp import server as server_module
+        call = getattr(server_module.pin_agent_session, 'fn', server_module.pin_agent_session)
+        pinned = asyncio.run(call('codex', 'Review Sophos MCP API gaps', '/w'))
+        check('pinning on an unproven name is refused too',
+              pinned.get('ok') is False and 'Nothing was pinned' in str(pinned.get('error')),
+              str(pinned))
+
+
+def test_a_real_scan_reports_when_it_stopped_short() -> None:
+    """The completeness flag has to come from the scan itself, not from a stub."""
+    with tempfile.TemporaryDirectory(prefix='claude-truncation-') as store:
+        os.makedirs(store + '/-w')
+        for index in range(6):
+            _write_claude_transcript(
+                store + f'/-w/00000000-0000-4000-8000-00000000000{index}.jsonl',
+                ['Shared title' if index in (0, 5) else f'Session {index}'], 'hello')
+
+        saved = config.CLAUDE_PROJECTS_DIR
+        config.CLAUDE_PROJECTS_DIR = store + '/'
+        try:
+            all_sessions, is_complete = discovery.list_sessions_complete(
+                'claude', discovery.SCOPE_ANY, '/w', limit=50)
+            check('a scan that saw every transcript says so',
+                  is_complete and len(all_sessions) == 6, f'{is_complete} {len(all_sessions)}')
+
+            capped, is_complete = discovery.list_sessions_complete(
+                'claude', discovery.SCOPE_ANY, '/w', limit=3)
+            check('and one that stopped at its cap says that instead',
+                  not is_complete and len(capped) == 3, f'{is_complete} {len(capped)}')
+
+            # both sessions titled "Shared title" are inside a full scan, so it can refuse
+            try:
+                discovery.find_session_by_name('claude', 'Shared title', limit=50)
+                check('a full scan finds both duplicates and refuses', False, 'no error')
+            except discovery.AmbiguousSessionName as e:
+                check('a full scan finds both duplicates and refuses', len(e.matches) == 2,
+                      str(e))
+        finally:
+            config.CLAUDE_PROJECTS_DIR = saved
 
 
 def run_all() -> None:
@@ -3148,6 +3242,9 @@ def run_all() -> None:
     test_a_unique_title_still_resolves_and_a_missing_one_still_returns_nothing()
     test_a_title_several_conversations_share_is_refused()
     test_an_ambiguous_name_sends_nothing_and_pins_nothing()
+    test_a_name_whose_uniqueness_could_not_be_proven_is_refused()
+    test_an_unproven_name_sends_nothing_and_pins_nothing()
+    test_a_real_scan_reports_when_it_stopped_short()
 
 if __name__ == '__main__':
     # Delivery records are written by any finished job, so a test run left rows like

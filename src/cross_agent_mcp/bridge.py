@@ -711,6 +711,13 @@ def _requested_session_id(target_agent: str, session_id: Optional[str],
                 f'{len(e.matches)} {target_agent} sessions are named {session_id!r}, so it does '
                 'not identify one conversation. Nothing was sent and no session was created. '
                 f'Send again with one of these ids: {discovery.describe_sessions(e.matches)}')
+        except discovery.UnprovenSessionName as e:
+            raise BridgeError(
+                f'one {target_agent} session named {session_id!r} was found, but only the '
+                f'{e.scanned} most recent could be searched, so nothing rules out a second one '
+                'with the same name. Nothing was sent and no session was created. Send again '
+                f'with the session id if this is the one you meant: '
+                f'{discovery.describe_sessions([e.match])}')
         if named:
             logger.info(f'_requested_session_id [resolved by name]: '
                         f'{session_id!r} -> {named["session_id"]}')
