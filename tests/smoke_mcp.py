@@ -50,8 +50,10 @@ def _server(agent: str, ambient: Optional[str] = None) -> StdioServerParameters:
     env.pop('CROSS_AGENT_SELF', None)
     if ambient is None:
         env['CROSS_AGENT_SELF'] = agent
-    return StdioServerParameters(command=ROOT_DIR + '/.venv/bin/python',
-                                 args=['-m', 'cross_agent_mcp'], env=env, cwd=ROOT_DIR)
+    # sys.executable, not a .venv path: a fresh checkout has no .venv, and the interpreter
+    # running this file is by definition one that can import mcp
+    return StdioServerParameters(command=sys.executable, args=['-m', 'cross_agent_mcp'],
+                                 env=env, cwd=ROOT_DIR)
 
 
 def _delivery_records() -> list:
@@ -156,12 +158,14 @@ async def main() -> int:
         return 1
     print('[ok] no delivery record was created by any of it')
 
-    for label, path in (('bridge', config.HOME_DIR), ('claude', config.CLAUDE_PROJECTS_DIR),
-                        ('codex', config.CODEX_SESSIONS_DIR)):
-        if not os.path.realpath(path).startswith(os.path.realpath(STATE_DIR)):
-            print(f'[FAIL] the {label} store was not isolated: {path}')
+    for label, path, wanted in (
+            ('bridge', config.HOME_DIR, STATE_DIR + '/bridge'),
+            ('claude', config.CLAUDE_PROJECTS_DIR, STATE_DIR + '/claude/projects'),
+            ('codex', config.CODEX_SESSIONS_DIR, STATE_DIR + '/codex/sessions')):
+        if os.path.realpath(path) != os.path.realpath(wanted):
+            print(f'[FAIL] the {label} store was not the isolated one: {path}')
             return 1
-    print(f'[ok] bridge, claude and codex state all stayed in {STATE_DIR}')
+    print(f'[ok] bridge, claude and codex state were all the ones under {STATE_DIR}')
 
     print('\nALL CHECKS PASSED')
     return 0
