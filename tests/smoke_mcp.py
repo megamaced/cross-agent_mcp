@@ -2,24 +2,36 @@
 
     PYTHONPATH=src .venv/bin/python tests/smoke_mcp.py
 
-Verifies the handshake, the advertised tool list, and the read-only tools.
-`send_to_*` is deliberately not exercised here: it would spend real agent turns.
+Verifies the handshake, the advertised tool list, and the read-only tools. Runs against a
+throwaway CROSS_AGENT_HOME and forces the agent identity with CROSS_AGENT_SELF, so no
+`send_to_*` call here can resolve a real session whoever runs it.
 """
 
 import asyncio
 import json
 import os
+import shutil
 import sys
+import tempfile
+
+from typing import Optional
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + '/src')
 
-from cross_agent_mcp import config, registry  # noqa: E402
-
-
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# set before the import: config reads all three at import time
+STATE_DIR = tempfile.mkdtemp(prefix='cross-agent-smoke-')
+os.environ['CROSS_AGENT_HOME'] = STATE_DIR + '/bridge'
+os.environ['CLAUDE_CONFIG_DIR'] = STATE_DIR + '/claude'
+os.environ['CODEX_HOME'] = STATE_DIR + '/codex'
+for _empty in ('/claude/projects', '/codex/sessions'):
+    os.makedirs(STATE_DIR + _empty, exist_ok=True)
+
+from cross_agent_mcp import config, registry  # noqa: E402
 
 
 def _text_of(result) -> str:
@@ -29,15 +41,47 @@ def _text_of(result) -> str:
     return ''
 
 
-async def main() -> int:
-    params = StdioServerParameters(
-        command=ROOT_DIR + '/.venv/bin/python',
-        args=['-m', 'cross_agent_mcp'],
-        env={**os.environ, 'PYTHONPATH': ROOT_DIR + '/src'},
-        cwd=ROOT_DIR,
-    )
+def _server(agent: str, ambient: Optional[str] = None) -> StdioServerParameters:
+    """A bridge server told which agent it is, rather than inferring it from its parent.
 
-    async with stdio_client(params) as (read, write):
+    `ambient` drops the override, to prove the isolation holds without it.
+    """
+    env = {**os.environ, 'PYTHONPATH': ROOT_DIR + '/src'}
+    env.pop('CROSS_AGENT_SELF', None)
+    if ambient is None:
+        env['CROSS_AGENT_SELF'] = agent
+    # sys.executable, not a .venv path: a fresh checkout has no .venv, and the interpreter
+    # running this file is by definition one that can import mcp
+    return StdioServerParameters(command=sys.executable, args=['-m', 'cross_agent_mcp'],
+                                 env=env, cwd=ROOT_DIR)
+
+
+def _delivery_records() -> list:
+    """Every delivery record in the throwaway state, finished or in flight."""
+    found = []
+    for current, _, files in os.walk(config.DELIVERY_DIR):
+        found += [os.path.join(current, name) for name in files if name.endswith('.json')]
+    return found
+
+
+async def _refuses_its_own_agent(agent: str) -> int:
+    """A send aimed at the caller's own agent is refused before anything is resolved."""
+    tool = f'send_to_{agent}'
+    async with stdio_client(_server(agent)) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            refused = json.loads(_text_of(await session.call_tool(
+                tool, {'message': f'self-call guard check ({agent})'})))
+
+    if refused.get('ok') or 'refusing to relay' not in refused.get('error', ''):
+        print(f'[FAIL] self-call guard did not trigger for {agent}: {refused}')
+        return 1
+    print(f'[ok] self-call guard ({agent}) -> refused as expected')
+    return 0
+
+
+async def main() -> int:
+    async with stdio_client(_server('claude')) as (read, write):
         async with ClientSession(read, write) as session:
             init = await session.initialize()
             print(f'[ok] initialize -> {init.server_info.name} v{init.server_info.version}')
@@ -65,14 +109,7 @@ async def main() -> int:
             print(f'[ok] list_agent_sessions -> claude={len(listing["claude"])} '
                   f'codex={len(listing["codex"])}')
 
-            refused = json.loads(_text_of(await session.call_tool(
-                'send_to_claude', {'message': 'self-call guard check'})))
-            if refused.get('ok') or 'refusing to relay' not in refused.get('error', ''):
-                print(f'[FAIL] self-call guard did not trigger: {refused}')
-                return 1
-            print('[ok] self-call guard -> refused as expected')
-
-            # exhaust the hop budget up front so no agent turn is ever spent
+            # the hop check runs before the target is resolved, so nothing is ever addressed
             conversation_id = 'conv_smoke_hop_guard'
             for _ in range(config.MAX_HOPS):
                 registry.bump_conversation(conversation_id, 'claude', 'codex')
@@ -97,9 +134,45 @@ async def main() -> int:
             # delivers - so exercising it here would spend a real agent turn. That behaviour
             # is covered without any turn by unit_guards.test_a_busy_session_is_waited_out.
 
+    # both identities: under ambient detection exactly one of these was a real send
+    for agent in ('claude', 'codex'):
+        if await _refuses_its_own_agent(agent):
+            return 1
+
+    # the case that used to send for real: a Codex runner reaching for Claude. Nothing here
+    # forces the identity, so this is the ambient path, and the isolated stores are what has
+    # to keep it harmless.
+    async with stdio_client(_server('claude', ambient='codex')) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            listing = json.loads(_text_of(await session.call_tool(
+                'list_agent_sessions', {'agent': 'both', 'scope': 'any'})))
+    if listing['claude'] or listing['codex']:
+        print(f'[FAIL] the isolated stores were not empty: {listing}')
+        return 1
+    print('[ok] ambient identity sees no real session to reach for')
+
+    records = _delivery_records()
+    if records:
+        print(f'[FAIL] the run created delivery records: {records}')
+        return 1
+    print('[ok] no delivery record was created by any of it')
+
+    for label, path, wanted in (
+            ('bridge', config.HOME_DIR, STATE_DIR + '/bridge'),
+            ('claude', config.CLAUDE_PROJECTS_DIR, STATE_DIR + '/claude/projects'),
+            ('codex', config.CODEX_SESSIONS_DIR, STATE_DIR + '/codex/sessions')):
+        if os.path.realpath(path) != os.path.realpath(wanted):
+            print(f'[FAIL] the {label} store was not the isolated one: {path}')
+            return 1
+    print(f'[ok] bridge, claude and codex state were all the ones under {STATE_DIR}')
+
     print('\nALL CHECKS PASSED')
     return 0
 
 
 if __name__ == '__main__':
-    sys.exit(asyncio.run(main()))
+    try:
+        sys.exit(asyncio.run(main()))
+    finally:
+        shutil.rmtree(STATE_DIR, ignore_errors=True)
