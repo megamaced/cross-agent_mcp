@@ -3,6 +3,8 @@
     PYTHONPATH=src .venv/bin/python tests/unit_guards.py
 """
 
+import contextlib
+import errno
 import json
 import os
 import shutil
@@ -2872,6 +2874,305 @@ def uuid_hex() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def test_the_busy_lock_survives_a_sustained_race() -> None:
+    """One round of six threads let the old claim through about one run in five. This runs the
+    race often enough that a claim which is only nearly exclusive cannot pass it."""
+    rounds, racers = 40, 8
+    bad_rounds = []
+
+    for round_number in range(rounds):
+        session_id = f'unit-race-{round_number}-' + os.urandom(3).hex()
+        outcomes = []
+        guard = threading.Lock()
+        barrier = threading.Barrier(racers)
+
+        def worker() -> None:
+            barrier.wait()
+            try:
+                with registry.busy_lock(config.AGENT_CODEX, session_id, 'conv_race'):
+                    with guard:
+                        outcomes.append('won')
+                    time.sleep(0.01)
+            except registry.SessionBusyError:
+                with guard:
+                    outcomes.append('refused')
+
+        threads = [threading.Thread(target=worker) for _ in range(racers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        if outcomes.count('won') != 1 or len(outcomes) != racers:
+            bad_rounds.append((round_number, list(outcomes)))
+        check_lock = registry.read_busy_lock(config.AGENT_CODEX, session_id)
+        if check_lock is not None:
+            bad_rounds.append((round_number, 'lock left behind'))
+
+    check(f'exactly one of {racers} claimers wins, in every one of {rounds} rounds',
+          not bad_rounds, str(bad_rounds[:3]))
+
+
+def test_a_lock_being_written_is_never_mistaken_for_debris() -> None:
+    """The mechanism of the race: the loser read a file the winner had not finished writing."""
+    session_id = 'unit-halfwritten-' + os.urandom(4).hex()
+    path = registry._lock_path(config.AGENT_CODEX, session_id)
+    config.ensure_dirs()
+
+    # exactly what the old claim left on disk between its create and its write
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('')
+    try:
+        check('an unreadable lock that has just appeared is left alone',
+              registry.read_busy_lock(config.AGENT_CODEX, session_id) is None
+              and os.path.exists(path))
+
+        os.utime(path, (time.time() - registry.UNREADABLE_LOCK_GRACE_SECONDS - 5,) * 2)
+        check('while one old enough to be real debris is cleared',
+              registry.read_busy_lock(config.AGENT_CODEX, session_id) is None
+              and not os.path.exists(path))
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(path)
+
+
+def test_a_claimed_lock_is_readable_the_instant_it_exists() -> None:
+    """Whatever a concurrent claimer sees, it sees a whole record."""
+    session_id = 'unit-whole-' + os.urandom(4).hex()
+    path = registry._lock_path(config.AGENT_CODEX, session_id)
+    seen = []
+    stop = threading.Event()
+
+    def reader() -> None:
+        while not stop.is_set():
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    seen.append(json.load(f).get('conversation_id'))
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                seen.append(f'torn: {type(e).__name__}')
+
+    watcher = threading.Thread(target=reader, daemon=True)
+    watcher.start()
+    try:
+        for _ in range(200):
+            with registry.busy_lock(config.AGENT_CODEX, session_id, 'conv_whole'):
+                pass
+    finally:
+        stop.set()
+        watcher.join(timeout=5)
+
+    torn = [s for s in seen if s != 'conv_whole']
+    check('a reader racing 200 claims never sees a partial lock file', not torn,
+          str(torn[:3]) + f' of {len(seen)} reads')
+    check('and it did actually observe the lock', len(seen) > 0, str(len(seen)))
+
+
+def test_a_stale_clear_cannot_delete_the_lock_that_replaced_it() -> None:
+    """The second race, in the other direction: a reader decides a lock is abandoned, somebody
+    else clears and reclaims it first, and the reader's unlink then deletes their good lock."""
+    session_id = 'unit-replace-' + os.urandom(4).hex()
+    path = registry._lock_path(config.AGENT_CODEX, session_id)
+    config.ensure_dirs()
+    dead_pid = 2 ** 22 - 1
+
+    # a lock whose holder is long gone: the reader will decide to clear it
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump({'pid': dead_pid, 'token': 'ghost', 'agent': config.AGENT_CODEX,
+                   'session_id': session_id, 'conversation_id': 'conv_ghost',
+                   'started_at': time.time(), 'ttl_seconds': 1}, f)
+
+    reader_is_inside = threading.Event()
+    let_reader_finish = threading.Event()
+    claimed = threading.Event()
+    may_release = threading.Event()
+    held = {}
+
+    original_is_alive = registry._is_pid_alive
+    pause_once = threading.Lock()
+    has_paused = []
+
+    def pausing_is_alive(pid: int) -> bool:
+        # Pause the FIRST reader mid-decision and nobody else. Pausing every caller would stop
+        # the claimer inside this patch rather than on the guard, and the test would then pass
+        # with no guard at all - which is what it did before this line existed.
+        if pid == dead_pid:
+            with pause_once:
+                is_first = not has_paused
+                has_paused.append(pid)
+            if is_first:
+                reader_is_inside.set()
+                let_reader_finish.wait(timeout=10)
+            return False
+        return original_is_alive(pid)
+
+    def reader() -> None:
+        registry.read_busy_lock(config.AGENT_CODEX, session_id)
+
+    def claimer() -> None:
+        try:
+            with registry.busy_lock(config.AGENT_CODEX, session_id, 'conv_real'):
+                with open(path, 'r', encoding='utf-8') as f:
+                    held['token'] = json.load(f).get('token')
+                claimed.set()
+                # keep holding it until the assertions below have looked
+                may_release.wait(timeout=10)
+        except Exception as e:
+            held['error'] = f'{type(e).__name__}: {e}'
+            claimed.set()
+
+    registry._is_pid_alive = pausing_is_alive
+    reading = threading.Thread(target=reader)
+    claiming = threading.Thread(target=claimer)
+    try:
+        reading.start()
+        check('the reader reached its decision about the stale lock',
+              reader_is_inside.wait(timeout=10))
+
+        claiming.start()
+        # the reader is holding the transition, so the claimer cannot act on the same lock yet
+        check('a claimer cannot slip in while a stale clear is half-done',
+              not claimed.wait(timeout=1.0), str(held))
+
+        let_reader_finish.set()
+        reading.join(timeout=10)
+        check('and once the clear is finished the claim goes through',
+              claimed.wait(timeout=10) and 'error' not in held, str(held))
+
+        # read while the claimer is still inside its `with`, and after the reader has done
+        # whatever unlinking it was going to do
+        survivor = None
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                survivor = json.load(f).get('token')
+        check("the new holder's lock is still on disk, not deleted by the older reader",
+              survivor is not None and survivor == held.get('token'),
+              f'on_disk={survivor} held={held.get("token")}')
+    finally:
+        may_release.set()
+        let_reader_finish.set()
+        claiming.join(timeout=10)
+        reading.join(timeout=10)
+        registry._is_pid_alive = original_is_alive
+        with contextlib.suppress(OSError):
+            os.remove(path)
+
+
+def test_the_no_hard_link_fallback_is_still_exclusive_under_contention() -> None:
+    """A filesystem without hard links takes the older claim; the guard has to carry it."""
+    original_link = os.link
+
+    def no_links(src, dst):
+        raise OSError(errno.EPERM, 'hard links not supported here')
+
+    rounds, racers = 12, 6
+    bad_rounds = []
+    os.link = no_links
+    try:
+        for round_number in range(rounds):
+            session_id = f'unit-nolink-{round_number}-' + os.urandom(3).hex()
+            outcomes = []
+            guard = threading.Lock()
+            barrier = threading.Barrier(racers)
+
+            def worker() -> None:
+                barrier.wait()
+                try:
+                    with registry.busy_lock(config.AGENT_CODEX, session_id, 'conv_nolink'):
+                        with guard:
+                            outcomes.append('won')
+                        time.sleep(0.01)
+                except registry.SessionBusyError:
+                    with guard:
+                        outcomes.append('refused')
+
+            threads = [threading.Thread(target=worker) for _ in range(racers)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+            if outcomes.count('won') != 1 or len(outcomes) != racers:
+                bad_rounds.append((round_number, list(outcomes)))
+    finally:
+        os.link = original_link
+
+    check('the fallback claim admits exactly one winner too', not bad_rounds,
+          str(bad_rounds[:3]))
+    check('and hard links are back for everything else', os.link is original_link)
+
+
+def test_the_transition_guard_cannot_be_held_hostage_by_another_account() -> None:
+    """flock is granted on any open descriptor, whatever its access mode. A world-readable
+    guard is one any account on the machine can hold exclusively and never release, which
+    stops every delivery without touching anything else."""
+    import stat as stat_module
+    previous_umask = os.umask(0o022)
+    try:
+        config.ensure_dirs()
+        guard = registry._guard_path()
+        with contextlib.suppress(OSError):
+            os.remove(guard)
+
+        with registry.busy_lock(config.AGENT_CODEX, 'unit-guardmode-' + os.urandom(3).hex(),
+                                'conv_guard'):
+            pass
+
+        mode = stat_module.S_IMODE(os.lstat(guard).st_mode)
+        check('the guard is created owner-only under a permissive umask', mode == 0o600,
+              oct(mode))
+
+        # a guard left behind by a build that created it with the umask
+        os.chmod(guard, 0o644)
+        with registry.busy_lock(config.AGENT_CODEX, 'unit-guardrepair-' + os.urandom(3).hex(),
+                                'conv_guard'):
+            pass
+        mode = stat_module.S_IMODE(os.lstat(guard).st_mode)
+        check('and one left open by an earlier build is repaired on the next use',
+              mode == 0o600, oct(mode))
+
+        # a filesystem that will not tighten it must stop the bridge, not be worked around
+        original_fchmod = os.fchmod
+
+        def refuse_fchmod(fd, mode_):
+            raise OSError(1, 'operation not permitted')
+
+        os.fchmod = refuse_fchmod
+        try:
+            with registry.busy_lock(config.AGENT_CODEX, 'unit-guardfail-' + os.urandom(3).hex(),
+                                    'conv_guard'):
+                pass
+            check('a guard that cannot be made owner-only refuses to be used', False,
+                  'the lock was taken anyway')
+        except OSError as e:
+            check('a guard that cannot be made owner-only refuses to be used',
+                  'not permitted' in str(e) or 'owner-only' in str(e), str(e))
+        finally:
+            os.fchmod = original_fchmod
+
+        # and one that silently ignores the chmod is caught by reading the mode back
+        def lying_fchmod(fd, mode_):
+            return None
+
+        os.chmod(guard, 0o644)
+        os.fchmod = lying_fchmod
+        try:
+            with registry.busy_lock(config.AGENT_CODEX, 'unit-guardlie-' + os.urandom(3).hex(),
+                                    'conv_guard'):
+                pass
+            check('a filesystem that ignores the chmod is caught by reading it back', False,
+                  'the lock was taken anyway')
+        except OSError as e:
+            check('a filesystem that ignores the chmod is caught by reading it back',
+                  'after being set to 0600' in str(e), str(e))
+        finally:
+            os.fchmod = original_fchmod
+            with contextlib.suppress(OSError):
+                os.chmod(guard, 0o600)
+    finally:
+        os.umask(previous_umask)
+
+
 def run_all() -> None:
     test_the_suite_writes_nowhere_near_the_real_bridge()
     test_busy_lock_is_exclusive()
@@ -2944,6 +3245,12 @@ def run_all() -> None:
     test_in_flight_records_expire_and_are_pruned()
     test_servers_sharing_the_delivery_directory_do_not_trip_over_each_other()
     test_servers_from_before_in_flight_records_share_the_directory_safely()
+    test_the_busy_lock_survives_a_sustained_race()
+    test_a_lock_being_written_is_never_mistaken_for_debris()
+    test_a_claimed_lock_is_readable_the_instant_it_exists()
+    test_a_stale_clear_cannot_delete_the_lock_that_replaced_it()
+    test_the_no_hard_link_fallback_is_still_exclusive_under_contention()
+    test_the_transition_guard_cannot_be_held_hostage_by_another_account()
 
 if __name__ == '__main__':
     # The delivery directory used to be redirected here on its own, because finished jobs left

@@ -10,6 +10,7 @@ import fcntl
 import json
 import logging
 import os
+import stat
 import time
 import uuid
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -27,6 +28,10 @@ CONVERSATION_TTL_SECONDS = 24 * 3600
 # an auto-created pin is only dropped once its directory has been gone for this long, so a
 # momentary stat failure on a network share or a briefly relinked symlink cannot erase it
 PIN_GRACE_SECONDS = 3600
+
+# how old an unreadable lock file must be before it is treated as debris rather than as
+# somebody else's claim being written right now
+UNREADABLE_LOCK_GRACE_SECONDS = 30
 
 
 class SessionBusyError(Exception):
@@ -171,6 +176,71 @@ def _lock_path(agent: str, session_id: str) -> str:
     return config.LOCK_DIR + f'{agent}__{session_id}.lock'
 
 
+def _guard_path() -> str:
+    """The file whose flock serialises every decision about a busy lock.
+
+    One guard for the whole lock directory rather than one per session. Everything held under
+    it is a single small filesystem operation - read a record, link a file, unlink a file -
+    with no waiting of any kind inside, so the contention it adds is not measurable, and a
+    guard per session would leave a file behind for every session ever locked.
+    """
+    return config.LOCK_DIR + '.transitions.guard'
+
+
+@contextlib.contextmanager
+def _lock_transition() -> Iterator[None]:
+    """Hold the lock directory still for one read-decide-write.
+
+    Making the claim atomic stopped a loser corrupting a winner's lock, but left a second race
+    in the other direction, between a reader and a claimer:
+
+      1. A reads a lock whose holder is dead and decides to clear it;
+      2. B clears it first and claims the session for itself;
+      3. A, still acting on what it read, unlinks B's perfectly good lock.
+
+    The session is then unlocked while B believes it holds it, which is the same ending by a
+    different road. Neither step is atomic on its own and no amount of care inside one of them
+    helps, because the decision and the act are separated by whatever the scheduler does in
+    between. The guard puts them back together.
+
+    The kernel drops an flock when the holder exits, so a process dying in here cannot wedge
+    the directory. Another *user* could, though, which is why the mode is explicit: flock is
+    granted on any open descriptor regardless of access mode, so a world-readable guard is one
+    any account on the machine can hold exclusively and never release, stopping every delivery
+    without touching anything else. It is created 0600, and fchmod'd on every open so a guard
+    left behind by a build that created it with the umask is repaired rather than trusted.
+    """
+    config.ensure_dirs()
+    fd = os.open(_guard_path(), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        # Not best-effort. A guard that stays group- or world-writable is one anyone on the
+        # machine can hold exclusively and never release, so failing to set the mode means
+        # the protection is not there - and carrying on would take the lock anyway and call
+        # it safe. Verified after the fact rather than assumed, because a filesystem that
+        # ignores fchmod reports success.
+        os.fchmod(fd, 0o600)
+        mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        if mode & 0o077:
+            raise OSError(
+                f'{_guard_path()} is {oct(mode)} after being set to 0600. The bridge '
+                'serialises its lock decisions through that file, so a filesystem that will '
+                'not make it owner-only leaves every delivery stoppable by any account here.')
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
 def _is_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -181,6 +251,12 @@ def _is_pid_alive(pid: int) -> bool:
 
 def read_busy_lock(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
     """Return the live lock record for a session, clearing it when it is stale."""
+    with _lock_transition():
+        return _read_busy_lock_held(agent, session_id)
+
+
+def _read_busy_lock_held(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
+    """As read_busy_lock, for a caller that is already holding the transition guard."""
     path = _lock_path(agent, session_id)
     try:
         with open(path, 'r', encoding='utf-8') as f:
@@ -188,8 +264,14 @@ def read_busy_lock(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
     except FileNotFoundError:
         return None
     except Exception:
-        with contextlib.suppress(OSError):
-            os.remove(path)
+        # A lock that cannot be read is a leftover from a crash mid-write, and clearing it is
+        # what stops one poisoning a session forever. It is only ever cleared once it is too
+        # old to be anybody's live claim: the atomic claim above means a current build cannot
+        # produce one of these, and the age is the second lock on that door - not the first.
+        if time.time() - _mtime(path) > UNREADABLE_LOCK_GRACE_SECONDS:
+            logger.info(f'read_busy_lock [unreadable]: clearing {path}')
+            with contextlib.suppress(OSError):
+                os.remove(path)
         return None
 
     # The holder says how long it may legitimately hold on; a lock without that field was
@@ -206,19 +288,59 @@ def read_busy_lock(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _claim_lock_file(path: str, payload: str) -> bool:
-    """Create the lock file, or report that somebody else already owns it."""
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        return False
+    """Create the lock file whole, or report that somebody else already owns it.
 
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        f.write(payload)
-    return True
+    The claim used to be an O_EXCL create followed by a separate write, which left the lock
+    file existing and empty for as long as that took. Another claimer arriving in that window
+    read it, failed to parse it, and - taking it for a corrupt leftover - deleted it. Its
+    retry then won a lock somebody else was already holding: with six threads racing for one
+    session, three of them have been seen to win.
+
+    Writing the record to a temporary and linking it into place closes that window rather than
+    narrowing it. `link` fails outright if the name is taken, so it is the same all-or-nothing
+    claim O_EXCL gave; the difference is that the file is complete at the instant it appears,
+    so there is no state another process can misread.
+    """
+    tmp = f'{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp'
+    try:
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(payload)
+
+        try:
+            os.link(tmp, path)
+            return True
+        except FileExistsError:
+            return False
+        except OSError as e:
+            # A filesystem without hard links. Fall back to the create-then-write claim, which
+            # is exclusive but leaves the window above; the age check in read_busy_lock is what
+            # covers it there. Every store either agent keeps its sessions in supports links,
+            # so this is for an unusual CROSS_AGENT_HOME rather than for the normal case.
+            logger.warning(f'_claim_lock_file [no hard links]: {e}; falling back')
+            try:
+                with os.fdopen(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600),
+                               'w', encoding='utf-8') as f:
+                    f.write(payload)
+                return True
+            except FileExistsError:
+                return False
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
 
 
 def _release_lock_file(path: str, token: str) -> None:
-    """Remove the lock only while we still own it, never somebody else's fresh claim."""
+    """Remove the lock only while we still own it, never somebody else's fresh claim.
+
+    Under the transition guard for the same reason the stale clear is: checking the token and
+    acting on it are two steps, and between them the lock can become somebody else's.
+    """
+    with _lock_transition():
+        _release_lock_file_held(path, token)
+
+
+def _release_lock_file_held(path: str, token: str) -> None:
     try:
         with open(path, 'r', encoding='utf-8') as f:
             record = json.load(f)
@@ -259,14 +381,17 @@ def busy_lock(agent: str, session_id: str, conversation_id: str,
     })
 
     is_claimed = False
-    # one retry: read_busy_lock clears an abandoned record, and the retry re-races for it
-    for _ in range(2):
-        if _claim_lock_file(path, payload):
-            is_claimed = True
-            break
-        holder = read_busy_lock(agent, session_id)
-        if holder:
-            raise SessionBusyError(holder)
+    # One transition: claim, or read what is there and clear it if it is abandoned, then claim
+    # what we just cleared. Split across two guarded steps, the window between them is exactly
+    # where somebody else's fresh claim would get deleted by our retry.
+    with _lock_transition():
+        for _ in range(2):
+            if _claim_lock_file(path, payload):
+                is_claimed = True
+                break
+            holder = _read_busy_lock_held(agent, session_id)
+            if holder:
+                raise SessionBusyError(holder)
 
     if not is_claimed:
         raise SessionBusyError({'agent': agent, 'session_id': session_id})
