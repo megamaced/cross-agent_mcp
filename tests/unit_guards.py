@@ -1633,6 +1633,70 @@ def test_a_session_name_matches_exactly_or_not_at_all() -> None:
         discovery.list_sessions = original
 
 
+def test_a_session_id_is_recognised_by_its_shape_and_never_used_as_a_pattern() -> None:
+    """`find_session` spliced whatever it was given into a glob, so `*` found some other session.
+
+    A session is looked up by file name, and a name, a wildcard or a path is not an id. Answering
+    a wildcard with whichever session the glob listed first sent a relay to a conversation nobody
+    named, and the receipt reported it as the caller's own address.
+    """
+    from cross_agent_mcp import uihook
+
+    real_id = '6c09c546-1111-4222-8333-444455556666'
+    other_id = '01a0c298-aaaa-4bbb-8ccc-ddddeeeeffff'
+    not_ids = ['*', '????????-*', '[0-9a-f]*', real_id[:8] + '*', '*' + real_id[-12:],
+               '', ' ' + real_id, real_id + '\n', real_id[:-1],
+               '../projects/-w/' + real_id, None]
+
+    saved = (config.CLAUDE_PROJECTS_DIR, config.CODEX_SESSIONS_DIR, uihook.is_enabled)
+    with tempfile.TemporaryDirectory(prefix='claude-id-shape-') as root, \
+            tempfile.TemporaryDirectory(prefix='codex-id-shape-') as codex_store:
+        project = root + '/projects/-w'
+        os.makedirs(project)
+        _write_claude_transcript(project + f'/{real_id}.jsonl', ['The named one'], 'hello')
+        _write_claude_transcript(project + f'/{other_id}.jsonl', [], 'something else')
+        now = time.time()
+        _write_rollout(codex_store, real_id, '/w', now)
+        _write_rollout(codex_store, other_id, '/w', now - 5)
+
+        config.CLAUDE_PROJECTS_DIR = root + '/projects/'
+        config.CODEX_SESSIONS_DIR = codex_store + '/'
+        uihook.is_enabled = lambda: False
+        try:
+            for agent in (config.AGENT_CLAUDE, config.AGENT_CODEX):
+                found = discovery.find_session(agent, real_id)
+                check(f'{agent}: an id is looked up exactly',
+                      (found or {}).get('session_id') == real_id,
+                      str(found and found.get('session_id')))
+
+                capitals = discovery.find_session(agent, real_id.upper())
+                check(f'{agent}: the same id in capitals finds the same session',
+                      (capitals or {}).get('session_id') == real_id,
+                      str(capitals and capitals.get('session_id')))
+
+                leaked = [(value, discovery.find_session(agent, value)['session_id'])
+                          for value in not_ids if discovery.find_session(agent, value)]
+                check(f'{agent}: a wildcard, a path, or anything else that is not an id finds '
+                      'nothing', not leaked, str(leaked[:3]))
+
+                for value in ('*', '????????-*'):
+                    try:
+                        target = bridge._resolve_target(agent, value, 'cwd', '/w', False, [])
+                        check(f'{agent}: session_id={value!r} is refused, not resolved to '
+                              'another session', False, str(target and target.get('session_id')))
+                    except bridge.BridgeError:
+                        check(f'{agent}: session_id={value!r} is refused, not resolved to '
+                              'another session', True)
+
+            by_id = bridge._requested_session_id(config.AGENT_CLAUDE, real_id, '/w')
+            check('an exact id still resolves to itself', by_id == (real_id, real_id), str(by_id))
+            by_name = bridge._requested_session_id(config.AGENT_CLAUDE, 'The named one', '/w')
+            check('and a conversation name still resolves to its session',
+                  by_name == (real_id, 'The named one'), str(by_name))
+        finally:
+            (config.CLAUDE_PROJECTS_DIR, config.CODEX_SESSIONS_DIR, uihook.is_enabled) = saved
+
+
 def test_a_named_session_is_never_silently_created() -> None:
     originals = (discovery.find_session, discovery.find_session_by_name,
                  discovery.suggest_session_names)
@@ -4019,6 +4083,7 @@ def run_all() -> None:
     test_a_record_cut_off_by_the_search_bound_is_not_half_read()
     test_a_name_further_back_than_the_search_bound_is_not_found()
     test_a_session_name_matches_exactly_or_not_at_all()
+    test_a_session_id_is_recognised_by_its_shape_and_never_used_as_a_pattern()
     test_a_named_session_is_never_silently_created()
     test_naming_a_session_and_forcing_a_new_one_is_refused()
     test_a_delivery_does_not_outlive_the_server_that_started_it()

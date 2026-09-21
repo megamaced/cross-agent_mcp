@@ -365,8 +365,32 @@ def list_sessions(agent: str, scope: str, cwd: str, limit: int = 20,
     raise ValueError(f'unknown agent: {agent}')
 
 
+# Both agents name a session with a uuid, in the file name and everywhere else the id appears.
+# The id is spliced into a glob below, so what counts as one is decided by its shape rather than
+# by whether a lookup happens to succeed: a `*` would otherwise match some other session's file
+# and be answered with that session, reported to the caller as the one they named.
+SESSION_ID_PATTERN = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.IGNORECASE | re.ASCII)
+
+
+def is_session_id(value: Any) -> bool:
+    """Whether `value` is shaped like a session id: a uuid, and nothing a glob would read."""
+    return isinstance(value, str) and SESSION_ID_PATTERN.fullmatch(value) is not None
+
+
 def find_session(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
-    """Look up one session by id. Both stores encode the id in the file name."""
+    """Look up one session by id. Both stores encode the id in the file name.
+
+    Only something shaped like an id is looked up. Anything else - a conversation name, a
+    wildcard, a path - is not an id and finds nothing here; naming a session is
+    `find_session_by_name`'s job.
+    """
+    if agent not in (config.AGENT_CLAUDE, config.AGENT_CODEX):
+        raise ValueError(f'unknown agent: {agent}')
+    if not is_session_id(session_id):
+        return None
+    session_id = session_id.lower()
+
     if agent == config.AGENT_CLAUDE:
         for path in glob.glob(config.CLAUDE_PROJECTS_DIR + f'*/{session_id}.jsonl'):
             info = _parse_claude_session(path)
@@ -374,17 +398,14 @@ def find_session(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
                 return info
         return None
 
-    if agent == config.AGENT_CODEX:
-        paths = glob.glob(config.CODEX_SESSIONS_DIR + f'**/rollout-*-{session_id}.jsonl',
-                          recursive=True)
-        for path in sorted(paths, key=_safe_mtime, reverse=True):
-            info = _parse_codex_session(path)
-            if info:
-                info['title'] = _load_codex_thread_names().get(session_id, '')
-                return info
-        return None
-
-    raise ValueError(f'unknown agent: {agent}')
+    paths = glob.glob(config.CODEX_SESSIONS_DIR + f'**/rollout-*-{session_id}.jsonl',
+                      recursive=True)
+    for path in sorted(paths, key=_safe_mtime, reverse=True):
+        info = _parse_codex_session(path)
+        if info:
+            info['title'] = _load_codex_thread_names().get(session_id, '')
+            return info
+    return None
 
 
 def find_session_by_name(agent: str, name: str, limit: int = 500) -> Optional[Dict[str, Any]]:
