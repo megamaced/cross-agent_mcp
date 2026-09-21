@@ -296,6 +296,15 @@ Whether by name or id, if what was specified **doesn't exist, it errors instead 
 
 When a new conversation is opened, the response's `warning` field carries that fact and the reason.
 
+#### Name your sessions
+
+Addressing by name is only as reliable as the names are. To target the right session every time:
+
+- **Give every session that another session will send to a name of its own.** Don't rely on the title generated from its first message: that is a description, not an address, and it isn't unique — the same opening prompt produces the same title, so one generated title can be shared by hundreds of sessions. A session the bridge creates has no name either, so name it as soon as it exists.
+- **Never use the same name for two sessions or threads.** The bridge cannot tell them apart. Today it takes the most recently active one and only writes a line to the log (`find_session_by_name [ambiguous]`), so a message can reach a conversation you did not mean, with no error.
+- **When a session is retired or replaced — for example because its context is full — rename the old one to something different, and give the replacement the name.** For instance, rename `billing-api` to `billing-api-old-1` and name its successor `billing-api`. A retired session stays on disk and a lookup by name still finds it, so for as long as it keeps the live session's name, that name means two conversations.
+- Lookup by name only considers the 500 most recently active sessions, so an old session may not be found by name at all. If a name can't be kept unique and current, address the session by its id, or pin it (`pin_agent_session`).
+
 #### When the panel has no conversation open
 
 Even when the panel is only showing a conversation list, there's a live process behind it. Falling back to the CLI here means the requester gets an answer, but **the panel stays empty**, making it look like the bridge did nothing. So the shim **opens a new conversation in the panel** and puts the message there instead.
