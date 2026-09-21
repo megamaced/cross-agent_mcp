@@ -5,8 +5,10 @@ tuned from the MCP client configuration (Claude Code `.mcp.json`, Codex `config.
 without touching the code.
 """
 
+import contextlib
 import os
-from typing import Optional
+import stat
+from typing import IO, Optional
 
 
 def get_env_str(name: str, default: str) -> str:
@@ -102,6 +104,166 @@ AGENT_CLAUDE: str = 'claude'
 AGENT_CODEX: str = 'codex'
 
 
+# Everything the bridge writes is owner-only. The state tree names the sessions being
+# bridged, the directories they run in, and a one-line summary of every message relayed; the
+# logs add the routing around them. None of that is another account's business, and the
+# user's umask is not a safe place to decide it - a default 0022 leaves it all world-readable.
+DIR_MODE: int = 0o700
+FILE_MODE: int = 0o600
+
+# whether this process has already repaired a state tree created before those modes
+_is_repaired: bool = False
+
+# Places the bridge must never re-mode, however CROSS_AGENT_HOME is set. Two different rules,
+# because the home directory is both the thing to protect and the thing the state tree
+# normally lives inside:
+#
+#   equality  - the state root may not BE one of these. `/` and `~` are here only: the normal
+#               `~/.cross-agent` is inside the home directory and must keep working.
+#   inside    - the state root may not be, or contain, one of these. Both agents' stores are
+#               here, so a state root pointed at one, symlinked to one, or merely sitting
+#               above one is refused, and a store nested under a legitimate root is walked
+#               past rather than into.
+_PROTECTED_EXACTLY = {os.path.realpath(p) for p in ('/', os.path.expanduser('~'))}
+_PROTECTED_TREES = {os.path.realpath(p) for p in (
+    CLAUDE_HOME_DIR, CLAUDE_PROJECTS_DIR, CODEX_HOME_DIR, CODEX_SESSIONS_DIR)}
+_PROTECTED_ROOTS = _PROTECTED_EXACTLY | _PROTECTED_TREES
+
+
+def _within(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def is_protected_path(path: str) -> bool:
+    """Whether this path is one the bridge must not create, follow into, or re-mode.
+
+    Answered on the *resolved* path, so a symlink pointing into a protected store is refused
+    as firmly as the store itself - `chmod` follows symlinks, so a state root that is a link
+    to `~/.claude` would otherwise re-mode the real thing.
+    """
+    real = os.path.realpath(path)
+    if real in _PROTECTED_EXACTLY:
+        return True
+    # Only "is, or is inside, a store". A directory that merely *contains* one is a legitimate
+    # state root - the walk prunes the store out of it rather than refusing the whole tree.
+    return any(_within(real, root) for root in _PROTECTED_TREES)
+
+
+# What the bridge owns inside its state root, by name. The repair walk visits only these,
+# because CROSS_AGENT_HOME can be pointed at a directory that already has things in it -
+# `~/git` would do - and "tighten everything I find" would then re-mode the user's own files
+# for the crime of being in the wrong directory. Anything the bridge writes is either one of
+# these files or inside one of these directories.
+MANAGED_FILES: tuple = ('registry.json', 'registry.json.lock', 'registry.json.tmp')
+MANAGED_SUBDIRS: tuple = ('locks', 'logs', 'deliveries', 'panels')
+
+
+def secure_makedirs(path: str) -> None:
+    """Create a state directory nobody else can read, whatever the umask says.
+
+    The resolved path is checked first. `chmod` follows symlinks, so a state directory that is
+    a link into one of the agents' stores would otherwise tighten the real store - and it is
+    the user's own configuration doing it, which makes it neither an attack nor a reason to
+    let it happen.
+    """
+    if is_protected_path(path):
+        raise ValueError(
+            f'{path} resolves to {os.path.realpath(path)}, which is the home directory or one '
+            'of the agents\' session stores. The bridge will not keep its state there or '
+            'change its permissions; point CROSS_AGENT_HOME somewhere of its own.')
+
+    os.makedirs(path, mode=DIR_MODE, exist_ok=True)
+    # makedirs applies the umask to `mode`, and says nothing at all about a directory that
+    # already existed; chmod is what actually settles both cases. A failure here is raised
+    # rather than swallowed: this is state being created to be used, and carrying on would
+    # mean the bridge writing sessions and messages into a directory it has just failed to
+    # make private, while every other part of it assumes otherwise. Best-effort belongs in
+    # the migration walk, where the alternative to skipping a path is not starting at all.
+    try:
+        os.chmod(path, DIR_MODE)
+    except OSError as e:
+        raise OSError(
+            f'cannot make {path} owner-only ({e}). The bridge keeps session ids, working '
+            'directories and message summaries there, so it will not use a directory whose '
+            'permissions it could not set. Point CROSS_AGENT_HOME at a filesystem that '
+            'supports it.') from e
+
+
+def secure_open(path: str, mode: str = 'w') -> IO[str]:
+    """Open a state file for writing, created owner-only from the first byte.
+
+    The mode is given to `open(2)` rather than applied afterwards, so the file is never
+    briefly readable by anyone else - which matters most for the temporary a delivery record
+    is written to before it is renamed into place.
+    """
+    flags = os.O_WRONLY | os.O_CREAT
+    if 'x' in mode:
+        flags |= os.O_EXCL
+    elif 'a' in mode:
+        flags |= os.O_APPEND
+    else:
+        flags |= os.O_TRUNC
+    if '+' in mode:
+        flags = (flags & ~os.O_WRONLY) | os.O_RDWR
+    return os.fdopen(os.open(path, flags, FILE_MODE), mode, encoding='utf-8')
+
+
+def repair_state_permissions(root: Optional[str] = None) -> int:
+    """Tighten a state tree written before these modes were enforced. Returns what it changed.
+
+    New files are created owner-only, but an installation that predates that keeps whatever
+    the umask gave it - so the modes have to be repaired, not merely applied from here on.
+    Only paths that grant something to group or other are touched, symlinks are never
+    followed, and a failure on one path never stops the walk: this runs at startup and must
+    not be able to stop the bridge from working.
+    """
+    base = root if root is not None else HOME_DIR
+    # CROSS_AGENT_HOME is user-supplied. Pointed at a home directory or a transcript store it
+    # would walk the user's own files and tighten them, so a root that is not a directory of
+    # the bridge's own is left alone.
+    if is_protected_path(base):
+        return 0
+
+    repaired = _repair_path(base, DIR_MODE)
+    for name in MANAGED_FILES:
+        repaired += _repair_path(os.path.join(base, name), FILE_MODE)
+
+    for name in MANAGED_SUBDIRS:
+        directory = os.path.join(base, name)
+        if not os.path.isdir(directory) or is_protected_path(directory):
+            continue
+        for current, dirs, files in os.walk(directory, followlinks=False):
+            # Prune rather than only refuse at the top: a store can sit *beneath* a state
+            # directory - nothing stops CLAUDE_CONFIG_DIR being set there - and a walk that
+            # only checked where it started would march straight into it.
+            for protected in [d for d in dirs if is_protected_path(os.path.join(current, d))]:
+                dirs.remove(protected)
+
+            repaired += _repair_path(current, DIR_MODE)
+            for filename in files:
+                repaired += _repair_path(os.path.join(current, filename), FILE_MODE)
+    return repaired
+
+
+def _repair_path(path: str, wanted: int) -> int:
+    """Tighten one path if it is open to anyone else. Never follows a symlink, never raises."""
+    try:
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_IMODE(info.st_mode) & 0o077:
+            return 0
+        os.chmod(path, wanted)
+        return 1
+    except OSError:
+        return 0
+
+
 def ensure_dirs() -> None:
+    global _is_repaired
     for path in (HOME_DIR, LOCK_DIR, LOG_DIR, DELIVERY_DIR):
-        os.makedirs(path, exist_ok=True)
+        secure_makedirs(path)
+
+    if not _is_repaired:
+        # once per process, on the first thing that needs the state tree - so every entry
+        # point repairs an old installation without each one having to remember to
+        _is_repaired = True
+        repair_state_permissions()

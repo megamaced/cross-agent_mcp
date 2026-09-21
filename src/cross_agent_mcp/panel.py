@@ -90,6 +90,27 @@ def request_token_in(text: Optional[str]) -> Optional[str]:
     return match.group(0) if match else None
 
 
+class SecureRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """A rotating log whose every generation is owner-only, including after a rollover.
+
+    Rotation opens the next file itself, so setting the mode once on the first one would
+    leave every later generation at whatever the umask gives it.
+    """
+
+    def _open(self):
+        flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if 'w' in self.mode else os.O_APPEND)
+        fd = os.open(self.baseFilename, flags, config.FILE_MODE)
+        try:
+            # open(2)'s mode argument applies only when it creates the file, so a log that
+            # already exists keeps whatever it had - which is how a log written before any of
+            # this stayed 0644 while being appended to through a handler that looks secure.
+            os.fchmod(fd, config.FILE_MODE)
+        except OSError:
+            os.close(fd)
+            raise
+        return os.fdopen(fd, self.mode, encoding=self.encoding)
+
+
 def shim_logger(agent: str) -> logging.Logger:
     """A per-process log for the shim, so a turn it lost track of can be reconstructed later.
 
@@ -103,8 +124,11 @@ def shim_logger(agent: str) -> logging.Logger:
     log.setLevel(logging.INFO)
     log.propagate = False
     try:
-        os.makedirs(config.LOG_DIR, exist_ok=True)
-        handler = logging.handlers.RotatingFileHandler(
+        # ensure_dirs rather than secure_makedirs: it also runs the once-per-process repair,
+        # and a shim is a separate process that otherwise never calls it - which left the
+        # shim logs as the one part of the state tree an upgrade never reached.
+        config.ensure_dirs()
+        handler = SecureRotatingFileHandler(
             config.LOG_DIR + f'shim-{agent}.log', maxBytes=1_000_000, backupCount=2,
             encoding='utf-8')
         handler.setFormatter(logging.Formatter(
@@ -264,7 +288,7 @@ class PanelShim:
     # --------------------------------------------------------------- registry
 
     def register(self) -> None:
-        os.makedirs(REGISTRY_DIR, exist_ok=True)
+        config.secure_makedirs(REGISTRY_DIR)
         record = {
             'agent': self.agent,
             'pid': os.getpid(),
@@ -273,7 +297,7 @@ class PanelShim:
             'started_at': time.time(),
             'argv': self.argv,
         }
-        with open(self.registry_path, 'w', encoding='utf-8') as f:
+        with config.secure_open(self.registry_path) as f:
             json.dump(record, f)
 
     def unregister(self) -> None:
