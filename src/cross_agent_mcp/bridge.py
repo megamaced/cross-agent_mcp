@@ -1108,6 +1108,49 @@ def _own_session_id(sender_agent: str) -> Optional[str]:
     return found['session_id'] if found else None
 
 
+# A CLI session that has not been touched for this long, and is not open in a panel, is more
+# likely retired than resting; resuming it starts a turn nobody is watching.
+STALE_TARGET_SECONDS = 24 * 3600
+
+QUEUED_NOTE = (
+    'Queued, not answered. This result carries no reply: the peer\'s answer arrives later as a '
+    'separate message in this session. Do not invent, predict or wait for it - finish what you '
+    'are doing and report that the message was sent. If the delivery fails later, a DELIVERY '
+    'FAILED notice arrives here the same way. Check bridge_status(delivery_id=...) for delivery '
+    'state and the peer\'s progress.')
+
+# Said instead of the note above to a session the bridge started itself, because there "finish
+# what you are doing" is the one thing that loses the delivery.
+QUEUED_NOTE_IN_A_BRIDGE_TURN = (
+    'Queued, not answered. This result carries no reply. Unlike a session in an editor panel, '
+    'this one is a turn the bridge started, and its server is what carries the delivery: when '
+    'the turn ends the server exits, and nothing is left to bring the answer back or to report '
+    'a failure. Read the warning before you finish. Check bridge_status(delivery_id=...) for '
+    'delivery state and the peer\'s progress.')
+
+
+def _is_bridge_started_turn() -> bool:
+    """Whether this server runs inside a CLI turn the bridge started for somebody's request.
+
+    Such a turn ends when its work does, and takes its server - and every delivery the server is
+    carrying - with it. The bridge hands these variables only to the children it starts.
+    """
+    return bool(os.environ.get(config.ENV_CONVERSATION_ID))
+
+
+def _short_lived_carrier_warning(target_agent: str, delivery: str) -> str:
+    if delivery == 'cli-resume':
+        return ('This session is a turn the bridge started, and the peer\'s turn is a child of '
+                'it. When this turn ends, the peer\'s turn is stopped mid-work and no answer or '
+                'DELIVERY FAILED notice can reach you. Keep this turn going until '
+                'bridge_status(delivery_id=...) shows the peer has finished, or have the '
+                'request sent from an editor-panel session, which outlives its turns.')
+    return (f'This session is a turn the bridge started, so the {target_agent} answer cannot be '
+            'pushed back to you once this turn ends. The peer keeps working in its panel; read '
+            'its answer later with bridge_status(delivery_id=...), or keep this turn going '
+            'until it has finished.')
+
+
 def send_message(target_agent: str, message: str, session_id: Optional[str] = None,
                  is_new_session: bool = False, scope: Optional[str] = None,
                  cwd: Optional[str] = None, timeout: Optional[int] = None,
@@ -1285,6 +1328,22 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
             'turn, not your wait - this call already returned - so a shorter value only '
             'aborts work that would have finished. Pass a larger one to allow more time.')
 
+    delivery = 'ide-panel' if (target or {}).get('ui_shim') else 'cli-resume'
+    is_carried_by_a_turn = _is_bridge_started_turn()
+    if is_carried_by_a_turn:
+        warnings.append(_short_lived_carrier_warning(target_agent, delivery))
+
+    last_seen = (target or {}).get('mtime')
+    idle_seconds = (int(max(time.time() - float(last_seen), 0))
+                    if target_id and isinstance(last_seen, (int, float)) else None)
+    is_stale = idle_seconds is not None and idle_seconds > STALE_TARGET_SECONDS
+    if delivery == 'cli-resume' and is_stale:
+        warnings.append(
+            f'{target_agent} session {target_id} was last active {idle_seconds // 3600}h ago and '
+            'is not open in a panel, so this message resumes it in a new process. If that '
+            'conversation was retired, this starts a turn nobody is watching: check the session '
+            'id before relying on an answer.')
+
     return {
         'ok': True,
         'accepted': True,
@@ -1293,20 +1352,16 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         # in the queue or for the peer to finish another turn
         'is_in_peer_hands': job.accepted_at is not None,
         'state': job.state,
-        'note': ('Queued, not answered. This result carries no reply: the peer\'s answer '
-                 'arrives later as a separate message in this session. Do not invent, predict '
-                 'or wait for it - finish what you are doing and report that the message was '
-                 'sent. If the delivery fails later, a DELIVERY FAILED notice arrives here the '
-                 'same way. Check bridge_status(delivery_id=...) for delivery state and the '
-                 'peer\'s progress.'),
+        'note': QUEUED_NOTE_IN_A_BRIDGE_TURN if is_carried_by_a_turn else QUEUED_NOTE,
         'warning': ' '.join(warnings) or None,
         'target_agent': target_agent,
         'target_session_id': target_id,
+        'target_last_activity_seconds_ago': idle_seconds,
         'session_origin': 'created' if is_new_target else (target or {}).get('source', 'unknown'),
         'target_selected_by': selected_by,
         'caller_supplied_session_id': selected_by == SELECTED_CALLER,
         'will_create_session': is_new_target,
-        'delivery': 'ide-panel' if (target or {}).get('ui_shim') else 'cli-resume',
+        'delivery': delivery,
         'is_visible_in_panel': bool((target or {}).get('ui_shim')),
         'queue_depth': outbox.OUTBOX.depth(job.key()),
         'sender_agent': sender_agent,

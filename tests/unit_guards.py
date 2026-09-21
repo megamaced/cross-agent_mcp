@@ -550,6 +550,75 @@ def _environ(**changes):
                 os.environ[name] = value
 
 
+def _send_receipt(ui_shim=None, mtime=None, target_id='peer-sid') -> dict:
+    """What send_message hands back for a target it has already resolved to."""
+    originals = (bridge.caller.detect_caller, bridge._own_session_id, bridge._resolve_target,
+                 outbox.OUTBOX.submit, outbox.OUTBOX.await_outcome)
+    bridge.caller.detect_caller = lambda: {'agent': config.AGENT_CLAUDE, 'chain': []}
+    bridge._own_session_id = lambda agent: 'sender-sid'
+    bridge._resolve_target = lambda *a, **kw: {
+        'agent': config.AGENT_CODEX, 'session_id': target_id, 'cwd': None, 'source': 'stub',
+        'ui_shim': ui_shim, 'selected_by': bridge.SELECTED_CALLER, 'mtime': mtime}
+    outbox.OUTBOX.submit = lambda job: 'dlv_receipt'
+    outbox.OUTBOX.await_outcome = lambda job: None
+    try:
+        return bridge.send_message(config.AGENT_CODEX, 'hello')
+    finally:
+        (bridge.caller.detect_caller, bridge._own_session_id, bridge._resolve_target,
+         outbox.OUTBOX.submit, outbox.OUTBOX.await_outcome) = originals
+
+
+def test_a_bridge_started_turn_is_told_its_delivery_ends_with_it() -> None:
+    """The receipt told every sender to finish and report - the one thing that loses the delivery
+    for a turn the bridge started, whose server carries it and exits when the turn ends. An
+    incident: a request sent from such a turn was accepted, the turn ended fourteen seconds
+    later, and the peer's turn was stopped mid-work with nobody told."""
+    panel_shim = {'socket': '/s', 'agent': 'codex', 'pid': 1}
+    with _environ(**{config.ENV_CONVERSATION_ID: 'conv_bridge_turn'}):
+        by_cli = _send_receipt()
+        by_panel = _send_receipt(ui_shim=panel_shim)
+    editor = _send_receipt()
+
+    warning = by_cli.get('warning') or ''
+    check('a bridge-started turn delivering by CLI resume is warned the peer stops with it',
+          'child of it' in warning and 'stopped mid-work' in warning, warning[:90])
+    check('and is no longer told to finish what it is doing and report',
+          'finish what you are doing' not in by_cli['note']
+          and 'Read the warning' in by_cli['note'], by_cli['note'][:90])
+    panel_warning = by_panel.get('warning') or ''
+    check('delivering into a panel, it is warned the answer cannot be pushed back instead',
+          'cannot be pushed back' in panel_warning and 'child of it' not in panel_warning,
+          panel_warning[:90])
+    check('a session in an editor panel gets neither the warning nor the changed note',
+          'turn the bridge started' not in (editor.get('warning') or '')
+          and 'finish what you are doing' in editor['note'], str(editor.get('warning')))
+
+
+def test_the_receipt_says_how_long_the_target_has_been_idle() -> None:
+    """A CLI resume of a session nobody has touched for days starts a turn nobody is watching."""
+    now = time.time()
+    panel_shim = {'socket': '/s', 'agent': 'codex', 'pid': 1}
+    stale_cli = _send_receipt(mtime=now - 3 * 86400)
+    stale_panel = _send_receipt(ui_shim=panel_shim, mtime=now - 3 * 86400)
+    recent = _send_receipt(mtime=now - 60)
+    unknown = _send_receipt(mtime=None)
+
+    idle = stale_cli.get('target_last_activity_seconds_ago')
+    check('the receipt reports how long the target has been idle',
+          idle is not None and abs(idle - 3 * 86400) < 30, str(idle))
+    check('a session idle for days, resumed over the CLI, is flagged',
+          'last active 72h ago' in (stale_cli.get('warning') or ''), str(stale_cli.get('warning')))
+    check('one open in a panel is not: it is plainly alive',
+          'last active' not in (stale_panel.get('warning') or '')
+          and stale_panel.get('target_last_activity_seconds_ago') is not None)
+    check('and a recently active one is reported without a warning',
+          55 <= (recent.get('target_last_activity_seconds_ago') or 0) <= 90
+          and 'last active' not in (recent.get('warning') or ''),
+          str(recent.get('target_last_activity_seconds_ago')))
+    check('an unknown time is reported as unknown, not as zero',
+          unknown.get('target_last_activity_seconds_ago') is None)
+
+
 def test_a_bridge_started_turn_knows_which_session_it_is() -> None:
     """Sender identity came from the most recently active session in the server's directory when
     no panel hosted it - so a turn the bridge started was reported as whoever else was busy
@@ -4148,6 +4217,8 @@ def run_all() -> None:
     test_the_receipt_says_who_chose_the_conversation()
     test_an_unaddressed_relay_says_it_was_aimed_by_the_human()
     test_the_resolver_labels_a_pin_a_disk_find_and_a_fresh_start()
+    test_a_bridge_started_turn_is_told_its_delivery_ends_with_it()
+    test_the_receipt_says_how_long_the_target_has_been_idle()
     test_a_bridge_started_turn_knows_which_session_it_is()
     test_panel_session_selection()
     test_another_window_is_reachable_only_when_named()
