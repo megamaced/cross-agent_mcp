@@ -234,6 +234,15 @@ def _build_notice_envelope(job: outbox.Job, remaining: int) -> str:
         else:
             advice = ('- If the request still matters, send it again; check `bridge_status` '
                       f'(delivery_id="{job.delivery_id}") first if the reason is unclear.\n')
+    elif job.is_stopped_with_carrier:
+        headline = (f'Your message reached {target_label} (session {session}), but its turn was '
+                    'STOPPED before it finished: the server carrying the delivery exited, and the '
+                    'bridge stops the turns it started when that happens.')
+        standing = (f'- {target_label} will not answer, and may have done part of the work. Check '
+                    'the files and repository it was working in before sending again, or a second '
+                    'run starts on top of the first.\n')
+        advice = (f'- Call `bridge_status` with delivery_id="{job.delivery_id}" to read the '
+                  f'{target_label} transcript and see how far it got.\n')
     else:
         headline = (f'Your message reached {target_label} (session {session}), but no answer '
                     f'came back in {round((job.finished_at or time.time()) - (job.started_at or time.time()))}s.')
@@ -318,18 +327,24 @@ def _terminate_group(process: subprocess.Popen) -> None:
 # Deliveries this process started and has not finished. A CLI runs in its own process group
 # so a timeout can take down the whole tool tree with it - which also means it survives us.
 _LIVE_CHILDREN: List[subprocess.Popen] = []
+# the delivery each of them is carrying, by pid: what has to be closed when one is stopped
+_CHILD_JOBS: Dict[int, outbox.Job] = {}
 _CHILDREN_GUARD = threading.Lock()
 
 
 def _track_child(process: subprocess.Popen) -> None:
+    job = outbox.current_job()
     with _CHILDREN_GUARD:
         _LIVE_CHILDREN.append(process)
+        if job is not None:
+            _CHILD_JOBS[process.pid] = job
 
 
 def _untrack_child(process: subprocess.Popen) -> None:
     with _CHILDREN_GUARD:
         with contextlib.suppress(ValueError):
             _LIVE_CHILDREN.remove(process)
+        _CHILD_JOBS.pop(process.pid, None)
 
 
 def terminate_live_children() -> None:
@@ -342,15 +357,58 @@ def terminate_live_children() -> None:
     concurrently on one session after the window that started the first was reloaded.
     """
     with _CHILDREN_GUARD:
-        children = list(_LIVE_CHILDREN)
+        children = [(process, _CHILD_JOBS.get(process.pid)) for process in _LIVE_CHILDREN]
         _LIVE_CHILDREN.clear()
 
-    for process in children:
+    for process, job in children:
         if process.poll() is not None:
             continue
         logger.info(f'terminate_live_children [killing]: pid={process.pid}')
+        if job is not None:
+            # marked before the child goes: the worker waiting on it must not record the exit
+            # code of a process we are about to kill as the reason the delivery ended
+            job.is_stopped_with_carrier = True
         with contextlib.suppress(Exception):
             _terminate_group(process)
+        if job is not None:
+            _settle_stopped_delivery(job, process)
+
+
+def _settle_stopped_delivery(job: outbox.Job, process: subprocess.Popen) -> None:
+    """Say on the record why a delivery ended with its carrier, and tell a sender who can hear it.
+
+    Stopping the peer is deliberate, so the record used to be left exactly as it was last
+    written: delivering, no error. It read as a delivery still in progress for as long as nobody
+    asked, and nobody was told.
+    """
+    try:
+        reason = (f'the server carrying this delivery (pid {os.getpid()}) exited, so the bridge '
+                  f"stopped the peer's turn (pid {process.pid}) before it finished")
+        if outbox.settle_stopped(job, reason) and job.kind == outbox.KIND_REQUEST:
+            _announce_stopped_delivery(job)
+    except Exception as e:
+        logger.error(f'_settle_stopped_delivery [exception]: {job.delivery_id} {e}')
+
+
+def _announce_stopped_delivery(job: outbox.Job) -> None:
+    """Tell the sender its request was stopped - if that can be done without starting anything.
+
+    A panel takes a message over a socket. Any other session would have to be resumed as a new
+    process, and the senders of a stopped delivery are mostly turns that ended long ago or
+    sessions nobody uses any more: waking one to report something nobody is waiting for costs a
+    turn and reaches no one.
+    """
+    if not job.sender_session_id or not uihook.is_enabled():
+        return
+    panel = _panel_session(job.sender_agent, job.sender_session_id, [])
+    if not panel or not panel.get('ui_shim'):
+        logger.info(f'_announce_stopped_delivery [skipped]: {job.delivery_id} its sender has no '
+                    'live panel to tell')
+        return
+    hop = int(registry.get_conversation(job.conversation_id).get('hops', job.hop))
+    text = _build_notice_envelope(job, max(config.MAX_HOPS - hop, 0))
+    # short waits: this runs while the server is exiting
+    uihook.send(text, panel['ui_shim'], job.sender_session_id, timeout=4, accept_timeout=3)
 
 
 def install_shutdown_guard() -> None:

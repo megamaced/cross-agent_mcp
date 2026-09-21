@@ -331,6 +331,44 @@ def describe_origin(record: Dict[str, Any], is_carried_here: bool = False) -> Di
     return described
 
 
+# The delivery the calling thread is carrying out. A CLI child is started deep inside the
+# transport, which has no delivery to hand it; this is how the bridge knows, when it stops the
+# child, whose delivery it was.
+_current = threading.local()
+
+
+def current_job() -> Optional['Job']:
+    return getattr(_current, 'job', None)
+
+
+def settle_stopped(job: 'Job', reason: str) -> bool:
+    """Close a delivery whose carrier is going away, with the reason on the record.
+
+    Called by the server as it stops the peer's turn on the way out. The worker that would
+    normally write the outcome dies with the process, so without this the record stays where
+    it was last written - delivering, no error - and reads as a delivery still in progress for
+    as long as nobody looks. Returns whether it changed anything.
+
+    The record guard is taken with a timeout: this runs from a signal handler, on a thread that
+    may already hold it, and a plain acquire would then wait for itself.
+    """
+    job.is_stopped_with_carrier = True
+    if job.finished_at is not None:
+        return False
+    job.state = STATE_FAILED
+    job.error = reason
+    job.finished_at = time.time()
+    got_guard = job.record_guard.acquire(timeout=2)
+    try:
+        if not job.is_record_final:
+            _write_record(job.describe(), is_finished=True)
+            job.is_record_final = True
+    finally:
+        if got_guard:
+            job.record_guard.release()
+    return True
+
+
 class PeerBusyError(Exception):
     """The peer could not take the message yet — but it will.
 
@@ -409,6 +447,8 @@ class Job:
         # serialises this delivery's record writes, see persist()
         self.record_guard = threading.Lock()
         self.is_record_final = False
+        # the server carrying this delivery stopped the peer's turn as it exited
+        self.is_stopped_with_carrier = False
 
     def key(self) -> str:
         """Deliveries sharing this key are serialised."""
@@ -466,6 +506,9 @@ class Job:
             'is_reply_confirmed_by_transcript': self.is_reply_confirmed_by_transcript or None,
             # true when the peer provably never received the message
             'is_undelivered': self.is_undelivered or None,
+            # true when the peer's turn was stopped because the server carrying it exited: it
+            # may have done part of the work, and it will not answer
+            'is_stopped_with_carrier': self.is_stopped_with_carrier or None,
             'error': self.error,
         }
 
@@ -577,9 +620,11 @@ class Outbox:
 
             with self._guard:
                 self._running[key] = job
+            _current.job = job
             try:
                 self._run(job)
             finally:
+                _current.job = None
                 with self._guard:
                     self._running.pop(key, None)
 
@@ -611,7 +656,10 @@ class Outbox:
             logger.error(f'_run [not delivered]: {job.delivery_id} {job.error}')
         except Exception as e:
             job.state = STATE_FAILED
-            job.error = f'{type(e).__name__}: {e}'
+            # a stopped delivery already says why; the exit code of the child that was killed
+            # would only replace that with less
+            if not job.is_stopped_with_carrier:
+                job.error = f'{type(e).__name__}: {e}'
             logger.error(f'_run [exception]: {job.delivery_id} {job.error}')
 
         # The peer may have answered even when we did not receive it - a transport that broke
@@ -620,7 +668,7 @@ class Outbox:
         # has an answer to look for: a reply is complete the moment it lands, and reading the
         # sender's transcript after one would only pull its own words back as a "reply".
         if (job.wants_reply and not job.reply and job.state == STATE_FAILED
-                and not job.is_undelivered):
+                and not job.is_undelivered and not job.is_stopped_with_carrier):
             recovered = self._recover_with_patience(job)
             if recovered:
                 job.reply = recovered
@@ -630,9 +678,13 @@ class Outbox:
                             f'{job.target_agent} transcript ({len(recovered)} chars)')
 
         # the outcome is settled here; what follows only tells people about it
-        job.finished_at = time.time()
+        job.finished_at = job.finished_at or time.time()
         try:
-            if job.wants_reply and job.reply:
+            if job.is_stopped_with_carrier:
+                # the server is exiting: whoever can hear about it was told as it stopped the
+                # peer, and starting a delivery now would start a process nobody will stop
+                logger.info(f'_run [stopped with its carrier]: {job.delivery_id}')
+            elif job.wants_reply and job.reply:
                 self._send_reply(job, job.reply)
             elif job.wants_reply:
                 self._send_notice(job)

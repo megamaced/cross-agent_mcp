@@ -696,6 +696,110 @@ def test_a_bridge_started_turn_knows_which_session_it_is() -> None:
           from_panel == 'panel-sid' and guessed == 'guessed-sid', f'{from_panel} {guessed}')
 
 
+def _stop_a_carried_delivery(kind_wants_reply: bool, sender_panel):
+    """Start a real child under a delivery, stop it the way a server exiting does, and report
+    what happened to the delivery and who was told."""
+    import subprocess
+    from cross_agent_mcp import uihook
+
+    job = outbox.Job(
+        target_agent=config.AGENT_CLAUDE, target_session_id='66666666-7777-4888-8999-000000000000',
+        payload='p', run_cwd='/w', pin_cwd='/w', env={}, timeout=60, ui_shim=None, title=None,
+        conversation_id='conv_stopped', hop=2, sender_agent=config.AGENT_CLAUDE,
+        sender_session_id='sender-sid', wants_reply=kind_wants_reply, summary='dispatch the work')
+    job.state = outbox.STATE_DELIVERING
+    job.started_at = time.time()
+    outbox.persist(job)
+
+    told = []
+    originals = (bridge._panel_session, uihook.send, uihook.is_enabled)
+    bridge._panel_session = lambda agent, session_id, exclude: sender_panel
+    uihook.send = lambda text, shim, session_id, timeout, **kw: told.append(
+        (session_id, text)) or {'ok': True}
+    uihook.is_enabled = lambda: True
+
+    def carry() -> None:
+        outbox._current.job = job
+        try:
+            bridge._run_cli(['sleep', '60'], '/tmp', dict(os.environ), 60)
+        finally:
+            outbox._current.job = None
+
+    worker = threading.Thread(target=carry, daemon=True)
+    try:
+        worker.start()
+        deadline = time.time() + 10
+        while time.time() < deadline and not bridge._LIVE_CHILDREN:
+            time.sleep(0.02)
+        child = bridge._LIVE_CHILDREN[0] if bridge._LIVE_CHILDREN else None
+        bridge.terminate_live_children()
+        worker.join(timeout=10)
+    finally:
+        (bridge._panel_session, uihook.send, uihook.is_enabled) = originals
+    return job, child, told
+
+
+def test_a_delivery_stopped_with_its_carrier_is_closed_on_the_record() -> None:
+    """Stopping the peer on the way out is deliberate, and used to leave the record exactly as it
+    was last written - delivering, no error - so it read as still in progress, to nobody's
+    knowledge, for as long as nobody asked."""
+    panel = {'ui_shim': {'socket': '/s', 'agent': 'claude', 'pid': 1}}
+    job, child, told = _stop_a_carried_delivery(True, panel)
+    record = outbox.read_record(job.delivery_id) or {}
+
+    check('the peer\'s turn was stopped', child is not None and child.poll() is not None)
+    check('the delivery is closed as failed, with the reason on it',
+          job.state == outbox.STATE_FAILED and 'exited' in (job.error or '')
+          and job.finished_at is not None, f'{job.state} {job.error}')
+    check('and the record on disk says so, and says the peer was stopped',
+          record.get('state') == outbox.STATE_FAILED
+          and record.get('is_stopped_with_carrier') is True
+          and 'exited' in (record.get('error') or ''), str(record)[:160])
+    check('it no longer counts as in flight',
+          not os.path.exists(outbox._record_path(job.delivery_id, is_finished=False))
+          and outbox.describe_origin(record).get('is_orphaned') is False)
+    check('a sender with a live panel is told, once, with the delivery id and the word stopped',
+          len(told) == 1 and told[0][0] == 'sender-sid' and job.delivery_id in told[0][1]
+          and 'STOPPED' in told[0][1], str([(sid, text[:60]) for sid, text in told]))
+
+    _, _, told_nobody = _stop_a_carried_delivery(True, None)[0:3]
+    check('a sender with no live panel is not told: reaching it would resume a session',
+          told_nobody == [])
+    reply_job, _, told_reply = _stop_a_carried_delivery(False, panel)
+    check('a reply that was stopped is closed too, but announces nothing',
+          reply_job.state == outbox.STATE_FAILED and told_reply == [])
+
+
+def test_a_worker_does_not_overwrite_why_a_delivery_was_stopped() -> None:
+    """The worker waiting on the child sees only that it exited. Recording that would replace the
+    reason with less, and its recovery and notice would start work in a process on its way out."""
+    box = outbox.Outbox()
+    notices = []
+    replies = []
+    box.build_notice = lambda job: notices.append(job) or None
+    box.build_reply = lambda job, reply: replies.append(job) or None
+    reason = 'the server carrying this delivery (pid 1) exited, so the bridge stopped the peer'
+
+    def deliver(job):
+        outbox.settle_stopped(job, reason)
+        raise RuntimeError('claude CLI returned no result (exit=-15)')
+
+    box.deliver = deliver
+    job = outbox.Job(
+        target_agent=config.AGENT_CLAUDE, target_session_id=None, payload='p', run_cwd='/w',
+        pin_cwd='/w', env={}, timeout=60, ui_shim=None, title=None,
+        conversation_id='conv_worker', hop=1, sender_agent=config.AGENT_CLAUDE,
+        sender_session_id='sender-sid', wants_reply=True, summary='work')
+    box._run(job)
+
+    check('the reason the delivery was stopped survives the worker', job.error == reason,
+          str(job.error))
+    check('the record on disk still carries it',
+          (outbox.read_record(job.delivery_id) or {}).get('error') == reason)
+    check('and no notice or reply is started from a process that is exiting',
+          notices == [] and replies == [], f'{len(notices)} {len(replies)}')
+
+
 def test_panel_session_selection() -> None:
     from cross_agent_mcp import uihook
 
@@ -4220,6 +4324,8 @@ def run_all() -> None:
     test_a_bridge_started_turn_is_told_its_delivery_ends_with_it()
     test_the_receipt_says_how_long_the_target_has_been_idle()
     test_a_bridge_started_turn_knows_which_session_it_is()
+    test_a_delivery_stopped_with_its_carrier_is_closed_on_the_record()
+    test_a_worker_does_not_overwrite_why_a_delivery_was_stopped()
     test_panel_session_selection()
     test_another_window_is_reachable_only_when_named()
     test_the_caller_identifies_its_own_session_exactly()
