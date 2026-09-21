@@ -99,6 +99,10 @@ ENV_CONVERSATION_ID: str = 'CROSS_AGENT_CONVERSATION_ID'
 ENV_HOP: str = 'CROSS_AGENT_HOP'
 ENV_BUSY: str = 'CROSS_AGENT_BUSY'
 ENV_SENDER: str = 'CROSS_AGENT_SENDER'
+# The session a bridge-started CLI turn is running as, `<agent>:<session id>`. The bridge chose
+# that session when it started the turn, so the server inside can say who it is exactly
+# instead of guessing from whatever was last active in its directory.
+ENV_SELF_SESSION: str = 'CROSS_AGENT_SELF_SESSION'
 
 AGENT_CLAUDE: str = 'claude'
 AGENT_CODEX: str = 'codex'

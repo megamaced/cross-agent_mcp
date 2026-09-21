@@ -529,6 +529,104 @@ def test_the_resolver_labels_a_pin_a_disk_find_and_a_fresh_start() -> None:
           f"{created and created.get('source')} {forced and forced.get('source')}")
 
 
+# ------------------------------- a delivery lives and dies with the server that carries it
+
+@contextlib.contextmanager
+def _environ(**changes):
+    """Set (or, given None, remove) environment variables for the block, then put them back."""
+    saved = {name: os.environ.get(name) for name in changes}
+    try:
+        for name, value in changes.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def test_a_bridge_started_turn_knows_which_session_it_is() -> None:
+    """Sender identity came from the most recently active session in the server's directory when
+    no panel hosted it - so a turn the bridge started was reported as whoever else was busy
+    there, and the peer's answer was addressed to that session instead."""
+    import subprocess
+    from cross_agent_mcp import uihook
+
+    resumed = '11111111-2222-4333-8444-555555555555'
+    captured = {}
+
+    class _Captured(Exception):
+        pass
+
+    def fake_run_cli(command, cwd, env, timeout):
+        captured['command'], captured['env'] = command, env
+        result = {'type': 'result', 'result': 'ok', 'session_id': resumed}
+        return subprocess.CompletedProcess(command, 0, json.dumps(result) + '\n', '')
+
+    def capture_only(command, cwd, env, timeout):
+        captured['env'] = env
+        raise _Captured()
+
+    originals = (bridge._run_cli, uihook.is_enabled, uihook.find_own_session,
+                 discovery.find_active_session)
+    try:
+        bridge._run_cli = fake_run_cli
+        bridge._call_claude('hi', resumed, '/w', {'KEEP': '1'}, 30)
+        told_id = captured['env'].get(config.ENV_SELF_SESSION)
+        check('a resumed Claude turn is told which session it is running as',
+              told_id == f'claude:{resumed}' and captured['env'].get('KEEP') == '1', str(told_id))
+
+        bridge._call_claude('hi', None, '/w', {}, 30)
+        created = captured['command'][captured['command'].index('--session-id') + 1]
+        check('and so is one the bridge creates, under the id it chose for it',
+              captured['env'].get(config.ENV_SELF_SESSION) == f'claude:{created}', created)
+
+        bridge._run_cli = capture_only
+        for session_id, expected in ((resumed, f'codex:{resumed}'), (None, None)):
+            try:
+                bridge._call_codex('hi', session_id, '/w', {}, 30)
+            except _Captured:
+                pass
+            check(f'a Codex turn resuming {session_id!r} is told '
+                  f'{expected!r}', captured['env'].get(config.ENV_SELF_SESSION) == expected,
+                  str(captured['env'].get(config.ENV_SELF_SESSION)))
+
+        with _environ(**{config.ENV_SELF_SESSION: f'claude:{resumed}'}):
+            inherited = bridge._child_env('conv_x', 1, 'claude', [])
+        check('a child never inherits its parent\'s identity',
+              config.ENV_SELF_SESSION not in inherited)
+
+        uihook.is_enabled = lambda: True
+        uihook.find_own_session = lambda agent: {'session_id': 'panel-sid'}
+        discovery.find_active_session = lambda *a, **kw: {'session_id': 'guessed-sid'}
+        with _environ(**{config.ENV_SELF_SESSION: f'claude:{resumed}'}):
+            declared = bridge._own_session_id('claude')
+        with _environ(**{config.ENV_SELF_SESSION: f'codex:{resumed}'}):
+            other_agent = bridge._own_session_id('claude')
+        with _environ(**{config.ENV_SELF_SESSION: 'claude:*'}):
+            wildcard = bridge._own_session_id('claude')
+        with _environ(**{config.ENV_SELF_SESSION: None}):
+            from_panel = bridge._own_session_id('claude')
+            uihook.is_enabled = lambda: False
+            guessed = bridge._own_session_id('claude')
+    finally:
+        (bridge._run_cli, uihook.is_enabled, uihook.find_own_session,
+         discovery.find_active_session) = originals
+
+    check('the session the bridge started it as wins over the panel and over a guess',
+          declared == resumed, str(declared))
+    check('a codex started inside a Claude turn is not that Claude session',
+          other_agent == 'panel-sid', str(other_agent))
+    check('a value that is not a session id is ignored', wildcard == 'panel-sid', str(wildcard))
+    check('with nothing declared, the panel still answers, then the guess',
+          from_panel == 'panel-sid' and guessed == 'guessed-sid', f'{from_panel} {guessed}')
+
+
 def test_panel_session_selection() -> None:
     from cross_agent_mcp import uihook
 
@@ -4050,6 +4148,7 @@ def run_all() -> None:
     test_the_receipt_says_who_chose_the_conversation()
     test_an_unaddressed_relay_says_it_was_aimed_by_the_human()
     test_the_resolver_labels_a_pin_a_disk_find_and_a_fresh_start()
+    test_a_bridge_started_turn_knows_which_session_it_is()
     test_panel_session_selection()
     test_another_window_is_reachable_only_when_named()
     test_the_caller_identifies_its_own_session_exactly()

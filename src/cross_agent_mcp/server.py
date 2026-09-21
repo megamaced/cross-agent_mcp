@@ -365,6 +365,7 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
             'conversation_id': os.environ.get(config.ENV_CONVERSATION_ID),
             'hop': os.environ.get(config.ENV_HOP),
             'sender': os.environ.get(config.ENV_SENDER),
+            'self_session': os.environ.get(config.ENV_SELF_SESSION),
             'busy': os.environ.get(config.ENV_BUSY),
         },
         'deliveries': {

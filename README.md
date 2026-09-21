@@ -464,6 +464,9 @@ It's blocked in three layers.
      a same-agent relay can't be routed back into itself.
 4. **A delivery doesn't outlive the server** — since the CLI runs in its own process group, it survives even if the server dies. It would then keep writing to the peer session and store with nobody watching, and since the busy lock **decides life or death by the server's pid**, it can no longer protect that session. If a re-request comes in, a second agent attaches to the same file — in practice, two `claude -p --resume` processes once ran concurrently against the same session after a window reload. On server shutdown (atexit, SIGTERM, SIGINT, SIGHUP), the process groups of any in-flight deliveries are cleaned up together with it.
 
+   What that means for the two ends of a delivery:
+   - **A session started by the bridge knows which session it is.** The bridge passes `CROSS_AGENT_SELF_SESSION=<agent>:<session id>` to the CLI turns it starts, so the reply address is exact. Without it, a process outside any panel could only be identified by the most recently active session in its directory, which is whoever else happened to be busy there.
+
 Every delivered message carries a header with the sender, conversation ID, and hops remaining. The peer's final message is delivered back to the sender's session with a `BRIDGE REPLY` header, and **this reply doesn't consume a hop** — it's closing out a hop the request already paid for. Only new requests spend from the budget.
 
 ## 7. Environment variables

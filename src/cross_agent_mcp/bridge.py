@@ -280,7 +280,16 @@ def _child_env(conversation_id: str, hop: int, sender: str, busy: List[str]) -> 
     env[config.ENV_HOP] = str(hop)
     env[config.ENV_SENDER] = sender
     env[config.ENV_BUSY] = json.dumps(busy)
+    # the child is a different session from this one; the transport says which once it knows
+    env.pop(config.ENV_SELF_SESSION, None)
     return env
+
+
+def _running_as(env: Dict[str, str], agent: str, session_id: Optional[str]) -> Dict[str, str]:
+    """`env` for a CLI turn that will run as `session_id`: the server inside knows who it is."""
+    if not session_id:
+        return env
+    return {**env, config.ENV_SELF_SESSION: f'{agent}:{session_id}'}
 
 
 # ----------------------------------------------------------------- CLI calls
@@ -536,7 +545,7 @@ def _call_claude(message: str, session_id: Optional[str], cwd: str, env: Dict[st
         command += ['--model', config.CLAUDE_MODEL]
     command.append(message)
 
-    completed = _run_cli(command, cwd, env, timeout)
+    completed = _run_cli(command, cwd, _running_as(env, config.AGENT_CLAUDE, target_id), timeout)
 
     payload: Optional[Dict[str, Any]] = None
     for line in completed.stdout.splitlines():
@@ -591,7 +600,7 @@ def _call_codex(message: str, session_id: Optional[str], cwd: str, env: Dict[str
         command = [config.CODEX_BIN, 'exec', 'resume', session_id, '--json', '--skip-git-repo-check']
     command.append(message)
 
-    completed = _run_cli(command, cwd, env, timeout)
+    completed = _run_cli(command, cwd, _running_as(env, config.AGENT_CODEX, session_id), timeout)
 
     thread_id: Optional[str] = None
     reply = ''
@@ -1059,6 +1068,19 @@ def panel_state(agent: str, session_id: str) -> Dict[str, Any]:
     }
 
 
+def _declared_session(sender_agent: str) -> Optional[str]:
+    """The session the bridge started this process as, if it did.
+
+    The bridge chose the session when it started the turn, so nothing has to be inferred. Only
+    a turn of `sender_agent` counts: a `codex` started from inside a Claude turn inherits the
+    variable and is not that session.
+    """
+    agent, _, session_id = (os.environ.get(config.ENV_SELF_SESSION) or '').partition(':')
+    if agent == sender_agent and discovery.is_session_id(session_id):
+        return session_id.lower()
+    return None
+
+
 def _own_session_id(sender_agent: str) -> Optional[str]:
     """The caller's own session - the return address the peer's answer is delivered to.
 
@@ -1069,6 +1091,10 @@ def _own_session_id(sender_agent: str) -> Optional[str]:
     """
     if sender_agent not in CALLERS:
         return None
+
+    declared = _declared_session(sender_agent)
+    if declared:
+        return declared
 
     if uihook.is_enabled():
         own = uihook.find_own_session(sender_agent)
