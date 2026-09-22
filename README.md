@@ -212,6 +212,34 @@ Claude Code asks for approval on every MCP tool call. Add a server-level rule to
 > Right after registering, you need to **reload the VS Code window** or start a new session for the tool to be picked up.
 > MCP servers connect only at session start.
 
+### Cross-session inbound approval (native `SendMessage`, not this bridge)
+
+Separate from the `mcp__cross-agent__*` tools above, Claude Code also ships its own built-in
+cross-session messaging (`SendMessage` / `ListAgents`), unrelated to this repo's code. When one
+Claude Code session messages another this way, the **recipient** applies a permission-mode check:
+
+- Unset (default): the message auto-delivers only when the sender's permission-mode class
+  matches the recipient's (`bypassPermissions`↔`bypassPermissions` or prompting↔prompting).
+  A mismatch — e.g. the recipient runs `bypassPermissions` (as this bridge tells Claude Code
+  to run, see the registration commands above) but the sender doesn't — holds the message for
+  the recipient's human to approve before Claude ever sees it.
+- To skip that hold, set on the **recipient** session, in its `.claude/settings.json`:
+
+  ```json
+  {
+    "crossSessionInbound": "accept"
+  }
+  ```
+
+  Other values: `"hold"` (always require approval, even on a mode match) and `"refuse"`
+  (opt the session out of inbound cross-session messages entirely).
+
+> [!WARNING]
+> `"accept"` delivers inbound messages from *any* sending session regardless of its permission
+> mode, straight to a session that (per the registration above) is running `bypassPermissions` —
+> i.e. it acts without confirmation. Only set this where every session able to reach this one is
+> already trusted.
+
 ### IDE panel integration (bidirectional)
 
 Everything above works the same from a plain terminal — this section is optional, and only
