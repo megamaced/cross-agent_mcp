@@ -284,7 +284,15 @@ def _summary(text: str) -> str:
 
 
 def _child_env(conversation_id: str, hop: int, sender: str, busy: List[str]) -> Dict[str, str]:
-    env = dict(os.environ)
+    """The environment a resumed or freshly created peer CLI is started with.
+
+    Not this process's environment. An editor passes its own down to every MCP server it
+    starts, and what a desktop session has collected by then - API keys, tokens, whatever a
+    shell profile exports - would otherwise reach the peer agent and every command the peer
+    runs. `config.child_env` names what a CLI actually needs; the chain state below is the
+    only thing this function adds.
+    """
+    env = config.child_env()
     env[config.ENV_CONVERSATION_ID] = conversation_id
     env[config.ENV_HOP] = str(hop)
     env[config.ENV_SENDER] = sender
@@ -302,6 +310,46 @@ def _running_as(env: Dict[str, str], agent: str, session_id: Optional[str]) -> D
 
 
 # ----------------------------------------------------------------- CLI calls
+
+# Variables that carry an agent CLI's own credentials or endpoint. They are deliberately not
+# in the child baseline - the panel path never spawns a CLI at all, and a headless resume that
+# needs one should say so rather than have it forwarded silently. Naming them in the error is
+# what makes the opt-in findable at the moment it is needed.
+AUTH_ENV_HINTS = (
+    'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
+    'CLAUDE_CODE_OAUTH_TOKEN', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_API_KEY',
+)
+
+
+def _auth_hint(env: Dict[str, str]) -> str:
+    """A note naming what this process has that the child was not given, and how to pass it.
+
+    Two kinds end up here: an agent CLI's own credentials, which were never on the baseline,
+    and a proxy setting that turned out to carry a username and password in its URL, which is
+    on the baseline but withheld for exactly that reason. Both look the same to whoever is
+    reading the failure - something that works in their shell does not work through the
+    bridge - so both are named, and neither value is ever printed.
+    """
+    withheld = [name for name in AUTH_ENV_HINTS if name in os.environ and name not in env]
+    proxies = [name for name in config.withheld_proxy_vars() if name not in env]
+    if not withheld and not proxies:
+        return ''
+
+    parts = []
+    if withheld:
+        parts.append(f'{", ".join(withheld)} (never passed to a child: the bridge starts one '
+                     'with a named baseline rather than its own environment)')
+    if proxies:
+        parts.append(f'{", ".join(proxies)} (withheld because the URL contains a username and '
+                     'password; it is passed whole or not at all, never with the credential '
+                     'stripped out)')
+    names = withheld + proxies
+    return (f' This process has {"; ".join(parts)}. If the peer CLI needs '
+            f'{"them" if len(names) > 1 else "it"}, name '
+            f'{"them" if len(names) > 1 else "it"} in '
+            f'{config.ENV_CHILD_PASSTHROUGH}={",".join(names)} - each name listed there is '
+            'visible to the peer agent and to everything it runs.')
+
 
 def _terminate_group(process: subprocess.Popen) -> None:
     """Kill the CLI *and* the tool-call subprocesses it spawned.
@@ -619,10 +667,12 @@ def _call_claude(message: str, session_id: Optional[str], cwd: str, env: Dict[st
 
     if payload is None:
         detail = (completed.stderr or completed.stdout or '').strip()[-800:]
-        raise BridgeError(f'claude CLI returned no result (exit={completed.returncode}): {detail}')
+        raise BridgeError(f'claude CLI returned no result (exit={completed.returncode}): '
+                          f'{detail}{_auth_hint(env)}')
 
     if payload.get('is_error'):
-        raise BridgeError(f'claude CLI error: {str(payload.get("result"))[:800]}')
+        # an authentication failure usually arrives here rather than as a missing result
+        raise BridgeError(f'claude CLI error: {str(payload.get("result"))[:800]}{_auth_hint(env)}')
 
     return {
         'session_id': payload.get('session_id') or target_id,
@@ -685,7 +735,8 @@ def _call_codex(message: str, session_id: Optional[str], cwd: str, env: Dict[str
 
     if not reply:
         detail = '; '.join(errors) or (completed.stderr or completed.stdout or '').strip()[-800:]
-        raise BridgeError(f'codex CLI returned no agent message (exit={completed.returncode}): {detail}')
+        raise BridgeError(f'codex CLI returned no agent message (exit={completed.returncode}): '
+                          f'{detail}{_auth_hint(env)}')
 
     return {
         'session_id': thread_id or session_id or '',

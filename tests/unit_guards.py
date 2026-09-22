@@ -5056,6 +5056,241 @@ def test_state_that_cannot_be_made_private_is_refused_rather_than_used() -> None
 
         check('while the migration walk stays best-effort and never raises',
               config.repair_state_permissions(home) >= 0)
+# --------------------------------- a spawned agent inherits a baseline, not our environment
+
+SENTINEL = 'FAKE_VENDOR_API_TOKEN'
+SENTINEL_VALUE = 'sk-live-this-must-not-reach-the-peer'
+
+
+@contextlib.contextmanager
+def _parent_environment(**variables):
+    saved = {name: os.environ.get(name) for name in variables}
+    try:
+        for name, value in variables.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def test_a_secret_in_this_process_does_not_reach_the_peer() -> None:
+    """The whole point: an editor hands its MCP servers everything the desktop session has."""
+    with _parent_environment(**{SENTINEL: SENTINEL_VALUE, 'AWS_SECRET_ACCESS_KEY': 'wCe/xyz',
+                                'GITHUB_TOKEN': 'ghp_xyz'}):
+        env = bridge._child_env('conv_env', 1, 'claude', [])
+
+        leaked = [name for name in (SENTINEL, 'AWS_SECRET_ACCESS_KEY', 'GITHUB_TOKEN')
+                  if name in env]
+        check('no unnamed variable of this process reaches the child', not leaked, str(leaked))
+        check('and its value appears nowhere in the child environment',
+              SENTINEL_VALUE not in ' '.join(env.values()))
+        named = (set(config.CHILD_ENV_BASELINE) | set(config.CHILD_ENV_BRIDGE)
+                 | {config.ENV_CONVERSATION_ID, config.ENV_HOP, config.ENV_SENDER,
+                    config.ENV_BUSY})
+        check('every variable the child has was named somewhere, not swept up',
+              set(env) <= named, str(sorted(set(env) - named)))
+
+
+def test_the_baseline_a_cli_needs_is_still_passed() -> None:
+    with _parent_environment(PATH='/usr/bin:/bin', HOME='/home/someone', LANG='en_GB.UTF-8',
+                             TERM='xterm-256color', HTTPS_PROXY='http://proxy:3128',
+                             NODE_EXTRA_CA_CERTS='/etc/ssl/corp.pem',
+                             CLAUDE_CONFIG_DIR='/home/someone/.claude',
+                             CODEX_HOME='/home/someone/.codex'):
+        env = bridge._child_env('conv_env', 1, 'claude', [])
+        wanted = {'PATH': '/usr/bin:/bin', 'HOME': '/home/someone', 'LANG': 'en_GB.UTF-8',
+                  'TERM': 'xterm-256color', 'HTTPS_PROXY': 'http://proxy:3128',
+                  'NODE_EXTRA_CA_CERTS': '/etc/ssl/corp.pem',
+                  'CLAUDE_CONFIG_DIR': '/home/someone/.claude',
+                  'CODEX_HOME': '/home/someone/.codex'}
+        missing = {k: v for k, v in wanted.items() if env.get(k) != v}
+        check('the CLI still gets its path, home, locale, terminal, proxy and CA bundle',
+              not missing, str(missing))
+        check('and the session stores the bridge itself resolves against',
+              env.get('CLAUDE_CONFIG_DIR') and env.get('CODEX_HOME'))
+
+
+def test_the_bridges_own_settings_are_passed_on_whole() -> None:
+    """A child of this bridge runs a bridge configured like it - same state, same budgets."""
+    with _parent_environment(CROSS_AGENT_HOME='/tmp/state', CROSS_AGENT_MAX_HOPS='9'):
+        env = bridge._child_env('conv_env', 3, 'codex', ['claude:sid-a'])
+        check('the bridge settings it names are inherited',
+              env.get('CROSS_AGENT_HOME') == '/tmp/state'
+              and env.get('CROSS_AGENT_MAX_HOPS') == '9', str(env.get('CROSS_AGENT_HOME')))
+        check('and the chain state is set on top',
+              env[config.ENV_CONVERSATION_ID] == 'conv_env' and env[config.ENV_HOP] == '3'
+              and env[config.ENV_SENDER] == 'codex'
+              and json.loads(env[config.ENV_BUSY]) == ['claude:sid-a'])
+
+
+def test_an_extra_variable_can_be_opted_into_by_name() -> None:
+    with _parent_environment(**{SENTINEL: SENTINEL_VALUE,
+                                config.ENV_CHILD_PASSTHROUGH: f' {SENTINEL} , '}):
+        env = bridge._child_env('conv_env', 1, 'claude', [])
+        check('a variable named in the opt-in is passed through',
+              env.get(SENTINEL) == SENTINEL_VALUE, str(env.get(SENTINEL)))
+        check('and a blank entry in the list is ignored', '' not in env)
+
+    with _parent_environment(**{SENTINEL: SENTINEL_VALUE,
+                                config.ENV_CHILD_PASSTHROUGH: 'SOMETHING_ELSE'}):
+        check('opting one variable in does not let another through',
+              SENTINEL not in bridge._child_env('conv_env', 1, 'claude', []))
+
+    with _parent_environment(**{'CROSS_AGENT_NOT_A_SETTING': 'x'}):
+        check('and the bridge namespace is not a way in either',
+              'CROSS_AGENT_NOT_A_SETTING' not in bridge._child_env('conv_env', 1, 'claude', []))
+
+
+def test_a_cli_that_cannot_authenticate_is_told_where_the_opt_in_is() -> None:
+    """A silently unauthenticated peer would look like a broken bridge."""
+    with _parent_environment(ANTHROPIC_API_KEY='sk-ant-xyz'):
+        hint = bridge._auth_hint(bridge._child_env('conv_env', 1, 'claude', []))
+        check('the failure names the variable that was withheld',
+              'ANTHROPIC_API_KEY' in hint, hint)
+        check('and how to pass it', config.ENV_CHILD_PASSTHROUGH in hint, hint)
+    with _parent_environment(ANTHROPIC_API_KEY=None, OPENAI_API_KEY=None,
+                             ANTHROPIC_AUTH_TOKEN=None, ANTHROPIC_BASE_URL=None,
+                             CLAUDE_CODE_OAUTH_TOKEN=None, OPENAI_BASE_URL=None,
+                             CODEX_API_KEY=None):
+        check('and nothing is said when there was nothing to withhold',
+              bridge._auth_hint({}) == '')
+
+
+def test_the_child_environment_is_never_written_down() -> None:
+    with _parent_environment(**{SENTINEL: SENTINEL_VALUE,
+                                config.ENV_CHILD_PASSTHROUGH: SENTINEL}):
+        job = outbox.Job(
+            target_agent='codex', target_session_id='sid-env', payload='hello',
+            run_cwd='/w', pin_cwd='/w', env=bridge._child_env('conv_env', 1, 'claude', []),
+            timeout=600, ui_shim=None, title=None, conversation_id='conv_env', hop=1,
+            sender_agent='claude', sender_session_id='sid-me', wants_reply=True,
+            summary='hello')
+        check('the delivery record carries no environment at all',
+              not any('env' in key for key in job.describe()), str(sorted(job.describe())))
+
+        with tempfile.TemporaryDirectory(prefix='cross-agent-test-env-') as store:
+            original = outbox.config.DELIVERY_DIR
+            outbox.config.DELIVERY_DIR = store + '/'
+            try:
+                outbox.persist(job)
+                written = ''
+                for current, _, files in os.walk(store):
+                    for name in files:
+                        with open(os.path.join(current, name), encoding='utf-8') as f:
+                            written += f.read()
+            finally:
+                outbox.config.DELIVERY_DIR = original
+        check('and the record on disk does not contain the opted-in secret either',
+              SENTINEL_VALUE not in written and SENTINEL not in written)
+
+
+PROXY_WITH_CREDENTIALS = (
+    'https://alice:super-secret@proxy.corp:3128',
+    'http://token:abc123@proxy.corp:3128',
+    'user:pass@proxy.corp:8080',                       # no scheme at all
+    '//alice:secret@proxy.corp:3128',                  # scheme-relative
+    'http://user%40corp:p%40ssw0rd@proxy.corp:3128',   # percent-encoded userinfo
+    'HTTP://ALICE:SECRET@PROXY.CORP:3128',
+    'http://token@proxy.corp:3128',                    # username, no password
+    'http://proxy.corp:3128,https://bob:hunter2@other.corp:3128',
+)
+
+PROXY_WITHOUT_CREDENTIALS = (
+    'http://proxy.corp:3128',
+    'https://proxy.corp:3128',
+    'proxy.corp:3128',
+    '//proxy.corp:3128',
+    'http://[::1]:3128',
+    'localhost,127.0.0.1,.corp.example',
+    'http://proxy.corp:3128?notify=a@b',               # an @ in the query is not userinfo
+    'http://proxy.corp:3128/pac@file',                 # nor is one in the path
+)
+
+
+def test_a_proxy_url_carrying_a_password_is_withheld() -> None:
+    """A proxy variable is on the baseline because a CLI behind one needs it - and a proxy URL
+    is also a perfectly ordinary place to keep a username and password."""
+    caught = [v for v in PROXY_WITH_CREDENTIALS if not config.has_embedded_credentials(v)]
+    check('every shape of embedded credential is recognised', not caught, str(caught))
+    missed = [v for v in PROXY_WITHOUT_CREDENTIALS if config.has_embedded_credentials(v)]
+    check('and an ordinary proxy setting is not mistaken for one', not missed, str(missed))
+    check('a value too malformed to parse is treated as one rather than waved through',
+          config.has_embedded_credentials('http://[::1'))
+
+    with _parent_environment(HTTPS_PROXY='https://alice:super-secret@proxy.corp:3128',
+                             HTTP_PROXY='http://proxy.corp:3128',
+                             all_proxy='user:pass@proxy.corp:8080',
+                             no_proxy='localhost,.corp.example'):
+        env = bridge._child_env('conv_proxy', 1, 'claude', [])
+        check('the proxy that carries a password is not passed to the child',
+              'HTTPS_PROXY' not in env and 'all_proxy' not in env, str(sorted(env)))
+        check('and its password appears nowhere in the child environment',
+              'super-secret' not in ' '.join(env.values()))
+        check('while a credential-free proxy is still passed automatically',
+              env.get('HTTP_PROXY') == 'http://proxy.corp:3128'
+              and env.get('no_proxy') == 'localhost,.corp.example')
+
+        hint = bridge._auth_hint(env)
+        check('the failure hint names the withheld proxy variables',
+              'HTTPS_PROXY' in hint and 'all_proxy' in hint, hint)
+        check('says why, and does not print the credential',
+              'username and password' in hint and 'super-secret' not in hint, hint)
+        check('and names the opt-in that would pass them',
+              f'{config.ENV_CHILD_PASSTHROUGH}=HTTPS_PROXY,all_proxy' in hint, hint)
+
+
+def test_a_proxy_password_is_never_stripped_out_and_forwarded() -> None:
+    """Half a proxy URL is worse than none: it fails at the proxy, not at the bridge."""
+    with _parent_environment(HTTPS_PROXY='https://alice:super-secret@proxy.corp:3128'):
+        env = bridge._child_env('conv_proxy', 1, 'claude', [])
+        check('no rewritten, credential-free copy is passed instead',
+              not any('proxy.corp' in value for value in env.values()), str(env))
+
+
+def test_a_credential_bearing_proxy_can_still_be_opted_into() -> None:
+    with _parent_environment(HTTPS_PROXY='https://alice:super-secret@proxy.corp:3128',
+                             **{config.ENV_CHILD_PASSTHROUGH: 'HTTPS_PROXY'}):
+        env = bridge._child_env('conv_proxy', 1, 'claude', [])
+        check('naming it passes it whole',
+              env.get('HTTPS_PROXY') == 'https://alice:super-secret@proxy.corp:3128')
+        check('and it is no longer reported as withheld',
+              'HTTPS_PROXY' not in bridge._auth_hint(env))
+
+    with _parent_environment(HTTPS_PROXY='https://alice:super-secret@proxy.corp:3128',
+                             **{config.ENV_CHILD_PASSTHROUGH: 'http_proxy'}):
+        check('naming a different proxy variable does not pass this one',
+              'HTTPS_PROXY' not in bridge._child_env('conv_proxy', 1, 'claude', []))
+
+
+def test_a_claude_error_result_carries_the_hint_too() -> None:
+    """An authentication failure usually arrives as is_error, not as a missing result."""
+    original = bridge._run_cli
+    result = json.dumps({'type': 'result', 'is_error': True,
+                         'result': 'Invalid API key - please run /login'})
+    bridge._run_cli = lambda command, cwd, env, timeout: __import__('subprocess').CompletedProcess(
+        command, 1, result + '\n', '')
+    try:
+        with _parent_environment(ANTHROPIC_API_KEY='sk-ant-xyz'):
+            env = bridge._child_env('conv_err', 1, 'codex', [])
+            try:
+                bridge._call_claude('hello', 'sid-err', '/w', env, 600)
+                check('a claude error result is raised', False, 'no error raised')
+            except bridge.BridgeError as e:
+                message = str(e)
+                check('a claude error result is raised', 'Invalid API key' in message, message)
+                check('and it says which auth variable was withheld',
+                      'ANTHROPIC_API_KEY' in message
+                      and config.ENV_CHILD_PASSTHROUGH in message, message)
+                check('without printing its value', 'sk-ant-xyz' not in message, message)
+    finally:
+        bridge._run_cli = original
 
 
 def run_all() -> None:
@@ -5177,6 +5412,16 @@ def run_all() -> None:
     test_the_repair_only_touches_what_the_bridge_owns()
     test_a_shim_log_written_before_this_is_tightened_when_it_is_next_opened()
     test_state_that_cannot_be_made_private_is_refused_rather_than_used()
+    test_a_secret_in_this_process_does_not_reach_the_peer()
+    test_the_baseline_a_cli_needs_is_still_passed()
+    test_the_bridges_own_settings_are_passed_on_whole()
+    test_an_extra_variable_can_be_opted_into_by_name()
+    test_a_cli_that_cannot_authenticate_is_told_where_the_opt_in_is()
+    test_the_child_environment_is_never_written_down()
+    test_a_proxy_url_carrying_a_password_is_withheld()
+    test_a_proxy_password_is_never_stripped_out_and_forwarded()
+    test_a_credential_bearing_proxy_can_still_be_opted_into()
+    test_a_claude_error_result_carries_the_hint_too()
 
 if __name__ == '__main__':
     # The delivery directory used to be redirected here on its own, because finished jobs left
