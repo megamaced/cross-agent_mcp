@@ -22,7 +22,7 @@ import subprocess
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import caller, config, discovery, outbox, registry, uihook
 
@@ -538,6 +538,38 @@ def _raise_for_panel_failure(response: Dict[str, Any]) -> None:
     raise BridgeError(f'IDE panel relay failed: {error}')
 
 
+def _raise_unless_really_new(response: Dict[str, Any], existing: Set[str]) -> bool:
+    """Check that a fresh conversation was actually opened, rather than one being reused.
+
+    True once the answer names a session that did not exist before the request, False while it
+    cannot name one yet. A Claude panel whose CLI has not announced its id learns it from the
+    CLI's own output, which comes after the message is written - so the hand-over can name no
+    session, and neither can any answer until the turn ends. Only the turn's end without an id
+    is an answer that says nothing.
+
+    The shim refuses what it cannot do, so this should never fire. It is here because the
+    failure it guards against is silent by nature: a message landing in a conversation that
+    was already running looks, from the receipt, exactly like one landing in a new one.
+    """
+    landed = response.get('sessionId')
+    if landed in existing:
+        reason = 'was already running'
+    elif not response.get('wasCreated'):
+        reason = 'the shim did not report as new'
+    elif landed:
+        return True
+    elif response.get('pending'):
+        return False
+    else:
+        reason = 'the shim never identified'
+
+    raise BridgeError(
+        'a new conversation was requested but the panel did not open one: the message went to '
+        f'{landed or "an unnamed session"}, which {reason}. '
+        'Nothing further was sent. Address an existing session by id, or send without '
+        'new_session to let the bridge resume one.')
+
+
 def _transcript_answer(target_agent: Optional[str], session_id: Optional[str],
                        after: float, token: Optional[str]) -> Optional[str]:
     """The peer's finished answer to *this* request, read from its transcript - or None.
@@ -555,16 +587,34 @@ def _transcript_answer(target_agent: Optional[str], session_id: Optional[str],
         return None
 
     answer = (progress or {}).get('answer')
-    if answer and discovery.request_token_in(answer) == token:
+    if answer and token in discovery.request_tokens_in(answer):
         return answer
     return None
+
+
+def _live_session_ids(agent: Optional[str]) -> Set[str]:
+    """Every panel conversation of this agent that exists right now, this window or another.
+
+    A panel process can know its session id before it has a conversation - the CLI announces
+    it while running startup hooks - and opening a conversation there is exactly what a fresh
+    one looks like, so such an id is not counted as a conversation that already existed.
+    """
+    if not agent:
+        return set()
+    try:
+        sessions = uihook.find_live_sessions(agent) + uihook.find_foreign_sessions(agent)
+        return {s['session_id'] for s in sessions if s.get('has_conversation', True)}
+    except Exception as e:
+        logger.debug(f'_live_session_ids [exception]: {agent} {e}')
+        return set()
 
 
 def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, Any],
                     timeout: int, cwd: str, title: Optional[str] = None,
                     on_accepted: Optional[Any] = None, wants_result: bool = True,
                     patience: Optional[float] = None, target_agent: Optional[str] = None,
-                    request_token: Optional[str] = None) -> Dict[str, Any]:
+                    request_token: Optional[str] = None,
+                    is_new_session: bool = False) -> Dict[str, Any]:
     """Deliver through the editor panel shim, so the exchange shows up in the panel.
 
     The hand-over and the answer are two waits, not one. The shim answers the first as soon as
@@ -583,9 +633,23 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
     """
     started = time.time()
     budget = patience if patience is not None else timeout
+    # A panel is handed no session id only when it was chosen to host a new conversation -
+    # because one was asked for, or because nothing existed to resume. One that was asked for
+    # must be new or the delivery fails. One that was only the last resort need not be: a
+    # Claude panel holds a single conversation, and if the human has started one there since
+    # the panel was chosen, that is the conversation the user is working in - the one
+    # resolution would pick now - so the message waits for the panel to be free and goes in.
+    # A Codex panel can always open a thread, and unless told to, it hands the message to its
+    # newest one, which resolution may have passed over on purpose.
+    create_new = is_new_session or (session_id is None and target_agent != config.AGENT_CLAUDE)
+    # Recorded before the message goes anywhere: "a new conversation" means one that did not
+    # exist a moment ago, and that is only checkable against the sessions that did.
+    existing = _live_session_ids(target_agent) if create_new else set()
+
     response = uihook.send(message, ui_shim, session_id, timeout, cwd, title,
-                           accept_timeout=PANEL_ACCEPT_SECONDS)
+                           accept_timeout=PANEL_ACCEPT_SECONDS, create_new=create_new)
     _raise_for_panel_failure(response)
+    is_new_unconfirmed = create_new and not _raise_unless_really_new(response, existing)
 
     is_accepted_reported = False
     while response.get('pending'):
@@ -622,6 +686,8 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
         response = uihook.await_turn(ui_shim, str(response.get('injectionId')),
                                      int(min(PANEL_AWAIT_CHUNK_SECONDS, max(remaining, 1))))
         _raise_for_panel_failure(response)
+        if is_new_unconfirmed:
+            is_new_unconfirmed = not _raise_unless_really_new(response, existing)
 
     return {
         'session_id': response.get('sessionId') or session_id or '',
@@ -640,7 +706,9 @@ def _call_claude(message: str, session_id: Optional[str], cwd: str, env: Dict[st
     if ui_shim:
         return _call_via_panel(message, session_id, ui_shim, timeout, cwd, title, **panel)
 
-    is_new = session_id is None
+    # `is_new_session` is the caller having asked for a fresh conversation, which the bridge
+    # may already have allocated an id for; without it, having no id at all means the same.
+    is_new = bool(panel.get('is_new_session')) or session_id is None
     target_id = session_id or str(uuid.uuid4())
 
     command = [config.CLAUDE_BIN, '-p', '--output-format', 'json']
@@ -695,7 +763,8 @@ def _call_codex(message: str, session_id: Optional[str], cwd: str, env: Dict[str
     if ui_shim:
         return _call_via_panel(message, session_id, ui_shim, timeout, cwd, title, **panel)
 
-    is_new = session_id is None
+    # Codex issues the thread id itself, so a forced new session arrives here without one.
+    is_new = bool(panel.get('is_new_session')) or session_id is None
 
     if is_new:
         command = [config.CODEX_BIN, 'exec', '--json', '--skip-git-repo-check',
@@ -896,7 +965,15 @@ def _resolve_target(target_agent: str, session_id: Optional[str], scope: str, cw
         return target
 
     if is_new_forced:
-        return chosen(_new_panel_conversation(target_agent), SELECTED_FORCED_NEW)
+        host = _new_panel_conversation(target_agent)
+        if host is None and config.UI_HOOK_MODE == uihook.UI_HOOK_REQUIRE:
+            raise BridgeError(
+                f'CROSS_AGENT_UI_HOOK=require and no {target_agent} panel in this editor window '
+                'can open a new conversation - every one of them is already driving a session. '
+                'Nothing was sent. The headless CLI would start a genuinely fresh session but '
+                'the panel would not show it, which is what require rules out; close or open a '
+                f'{target_agent} panel, or send without new_session to resume an existing one.')
+        return chosen(host, SELECTED_FORCED_NEW)
 
     wanted_id, requested = _requested_session_id(target_agent, session_id, cwd)
 
@@ -955,6 +1032,8 @@ def _deliver(job: outbox.Job) -> Dict[str, Any]:
         # turn the shim lost track of. A reply carries none, and wants no answer anyway.
         target_agent=job.target_agent,
         request_token=job.delivery_id if job.wants_reply else None,
+        # a fresh conversation was asked for, so the transport has to say it opened one
+        is_new_session=job.is_new_session,
     )
 
     if result['is_new_session'] and result['session_id']:
@@ -1219,10 +1298,14 @@ def delivery_report(delivery_id: str) -> Dict[str, Any]:
         else:
             report['peer_transcript'] = {
                 **progress,
-                'note': ('Read from the peer transcript just now. `answer` is the text of the '
-                         'last turn the peer FINISHED after this request went out (matched by '
-                         'the echoed request id when there is one); null while it has not '
-                         'finished one. `is_working` is true while a turn is open. '
+                'note': ('Read from the peer transcript just now. `answer` is the turn that '
+                         'echoed this delivery id back, and nothing else: a request asks the '
+                         'peer to end its answer with that id, so a turn without it answers '
+                         'something else however recent it is. It is null until the peer '
+                         'finishes one that does. `unmatched_turn` is the peer\'s latest '
+                         'finished turn that did NOT echo it - shown so you can see what that '
+                         'session has been doing, never as an answer to this. `is_working` is '
+                         'true while a turn is open. '
                          + ('' if after else 'This record predates the request time being '
                                              'kept, so the answer is not filtered by time; check '
                                              'it against the request yourself.')),
@@ -1430,6 +1513,15 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
     target = _resolve_target(target_agent, session_id, scope, cwd, is_new_session, exclude_ids)
     target_id = target['session_id'] if target else None
 
+    # A fresh conversation with no panel to host it goes to the CLI, which starts one under an
+    # id of our choosing. Allocating it here rather than inside the call is what lets the
+    # receipt say which session the answer will come from - the caller can address it by id
+    # from the next message on, instead of waiting to see what appears.
+    is_new_over_cli = is_new_session and not (target or {}).get('ui_shim')
+    if is_new_over_cli and target_agent == config.AGENT_CLAUDE:
+        target_id = str(uuid.uuid4())
+        logger.info(f'send_message [new cli session]: claude {target_id}')
+
     record = registry.bump_conversation(conversation_id, sender_agent, target_agent)
     hop = int(record.get('hops', 1))
     remaining = max(config.MAX_HOPS - hop, 0)
@@ -1469,6 +1561,7 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         summary=_summary(message),
         delivery_id=request_id,
         kind=outbox.KIND_REQUEST,
+        is_new_session=is_new_session,
     )
     # Stay on the line for a moment. A message the worker cannot hand over at all fails within
     # a second, and the caller who is still here is the right one to hear it - three requests
@@ -1502,9 +1595,17 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
                 f'session={target_id or "NEW"} conv={conversation_id} hop={hop} '
                 f'delivery={delivery_id} state={job.state}')
 
-    is_new_target = target_id is None
+    is_new_target = is_new_session or target_id is None
+    resolved_session_id = job.resolved_session_id or target_id
     warnings: List[str] = []
-    if is_new_target:
+    if is_new_over_cli:
+        warnings.append(
+            'A NEW conversation was requested and no panel in this window could open one, so '
+            f'it is being started through the headless {target_agent} CLI. It is genuinely '
+            'fresh - no existing session was reused - but the editor panel will not show it '
+            'while it runs; it appears in the conversation list afterwards. Set '
+            'CROSS_AGENT_UI_HOOK=require to have this refused instead.')
+    elif is_new_target:
         warnings.append(
             f'No existing {target_agent} session was reachable for {run_cwd}, so a NEW '
             'conversation will be started. It has none of the earlier context. Tell the user '
@@ -1548,7 +1649,12 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
             'turn, not your wait - this call already returned - so a shorter value only '
             'aborts work that would have finished. Pass a larger one to allow more time.')
 
-    delivery = 'ide-panel' if (target or {}).get('ui_shim') else 'cli-resume'
+    # `is_new_target`, not `is_new_over_cli`: a fresh CLI session is started whenever nothing
+    # was resolved to resume, and that is not only the forced case. Ordinary resolution that
+    # finds no session and no panel starts one too, and calling that a resume misreports it -
+    # and would let the stale-target warning fire about a conversation that does not exist yet.
+    delivery = ('ide-panel' if (target or {}).get('ui_shim')
+                else 'cli-new-session' if is_new_target else 'cli-resume')
     is_carried_by_a_turn = _is_bridge_started_turn()
     if is_carried_by_a_turn:
         warnings.append(_short_lived_carrier_warning(target_agent, delivery))
@@ -1576,8 +1682,14 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
                  else QUEUED_NOTE if has_return_panel_now else QUEUED_NOTE_WITH_NO_RETURN_PANEL),
         'warning': ' '.join(warnings) or None,
         'target_agent': target_agent,
-        'target_session_id': target_id,
+        # What the delivery actually resolved to, when the worker got that far before this
+        # returned - a panel that opened a conversation reports its id on acceptance, and
+        # throwing that away to print the id we started with would be a worse answer.
+        'target_session_id': resolved_session_id,
         'target_last_activity_seconds_ago': idle_seconds,
+        # the id the fresh session will have, when it is ours to choose; null only while it is
+        # genuinely unknown, and bridge_status reports it once the peer issues one
+        'new_session_id': resolved_session_id if is_new_target else None,
         'session_origin': 'created' if is_new_target else (target or {}).get('source', 'unknown'),
         'target_selected_by': selected_by,
         'caller_supplied_session_id': selected_by == SELECTED_CALLER,

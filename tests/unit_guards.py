@@ -443,6 +443,23 @@ def test_the_receipt_says_who_chose_the_conversation() -> None:
         check('while a conversation nobody asked for is created',
               ordinary.get('target_selected_by') == bridge.SELECTED_CREATED,
               str(ordinary.get('target_selected_by')))
+
+        # `delivery` says how the message travels, and a fresh CLI session is not a resume.
+        # Forcing one is not the only way to get one: ordinary resolution that finds no
+        # session and no panel starts one too, and reporting that as `cli-resume` describes a
+        # conversation being continued when none existed - which is also what the stale-target
+        # warning keys on, so it could then warn that a session yet to exist looks retired.
+        check('a forced-new conversation with no panel travels as a new CLI session',
+              receipt(bridge.SELECTED_FORCED_NEW, is_new_session=True,
+                      no_target=True).get('delivery') == 'cli-new-session',
+              str(receipt(bridge.SELECTED_FORCED_NEW, is_new_session=True,
+                          no_target=True).get('delivery')))
+        unforced = receipt(bridge.SELECTED_CREATED, no_target=True)
+        check('and so does one nobody forced, where nothing existed to resume',
+              unforced.get('delivery') == 'cli-new-session', str(unforced.get('delivery')))
+        check('while a session that does exist is still a resume',
+              receipt(bridge.SELECTED_CALLER).get('delivery') == 'cli-resume',
+              str(receipt(bridge.SELECTED_CALLER).get('delivery')))
     finally:
         (bridge.caller.detect_caller, bridge._own_session_id, bridge._resolve_target,
          outbox.OUTBOX.submit, outbox.OUTBOX.await_outcome) = originals
@@ -1225,14 +1242,23 @@ def test_an_echoed_token_identifies_which_request_was_answered() -> None:
               discovery.last_agent_message(
                   'claude', 'sid', after=spoke_at.timestamp() - 999, token=mine) is None)
 
-        # If the peer omits the token, it falls back to the old timing rule — cooperation is a bonus, not a requirement.
+        # A request asks the peer to end its answer with the token, so when there is one the
+        # echo is the only evidence. A turn written afterwards may answer a question the human
+        # asked in the same session a minute later - fresh, and not ours.
         discovery.find_session = lambda a, s: {'path': transcript('토큰 없이 답합니다.')}
-        check('a peer that ignored the token still falls back to the clock',
+        check('a peer that ignored the token does not have the clock answer for it',
               discovery.last_agent_message(
-                  'claude', 'sid', after=spoke_at.timestamp() - 1, token=mine) is not None)
-        check('and the clock still refuses what predates the request',
+                  'claude', 'sid', after=spoke_at.timestamp() - 1, token=mine) is None)
+        check('but the turn is kept as context for whoever reads the report',
+              (discovery.peer_progress('claude', 'sid', after=spoke_at.timestamp() - 1,
+                                       token=mine) or {}).get('unmatched_turn')
+              == '토큰 없이 답합니다.')
+        check('a reply, which carries no token, still falls back to the clock',
               discovery.last_agent_message(
-                  'claude', 'sid', after=spoke_at.timestamp() + 1, token=mine) is None)
+                  'claude', 'sid', after=spoke_at.timestamp() - 1, token=None) is not None)
+        check('and the clock still refuses what predates it',
+              discovery.last_agent_message(
+                  'claude', 'sid', after=spoke_at.timestamp() + 1, token=None) is None)
     finally:
         discovery.find_session = original
 
@@ -2736,12 +2762,16 @@ def test_a_later_human_turn_does_not_hide_the_echoed_answer() -> None:
                   (discovery.last_agent_message('claude', 'sid', after=sent_at, token=mine) or '')
                   .startswith('등록 완료했습니다.'))
 
-            # a peer that echoes nothing: timing decides, as before
+            # a peer that echoes nothing has not answered *this* request, however fresh
             lines = [_claude_line('토큰 없이 답합니다.', 'end_turn', 'r1', sent_at + 100)]
             open(path, 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
-            check('a peer that echoed nothing still falls back to the clock',
+            check('a turn that echoes nothing is not reported as the answer',
                   discovery.last_agent_message('claude', 'sid', after=sent_at, token=mine)
-                  == '토큰 없이 답합니다.')
+                  is None)
+            progress = discovery.peer_progress('claude', 'sid', after=sent_at, token=mine)
+            check('it is offered as context instead',
+                  progress.get('unmatched_turn') == '토큰 없이 답합니다.'
+                  and progress.get('answer') is None, str(progress)[:200])
         finally:
             discovery.find_session = original
 
@@ -3050,6 +3080,7 @@ def _claude_shim(session_id: str = 'sess-1'):
     from cross_agent_mcp.claude_shim import ClaudeStreamShim
     shim = ClaudeStreamShim.__new__(ClaudeStreamShim)
     shim.session_id = session_id
+    shim.has_conversation = session_id is not None
     shim.cwd = '/w'
     shim.is_turn_active = False
     shim.injection = None
@@ -3159,6 +3190,7 @@ def test_the_claude_shim_hands_over_and_reports_later() -> None:
     from cross_agent_mcp.claude_shim import ClaudeStreamShim
     shim = ClaudeStreamShim.__new__(ClaudeStreamShim)
     shim.session_id = 'sess-1'
+    shim.has_conversation = True
     shim.cwd = '/w'
     shim.is_turn_active = False
     shim.injection = None
@@ -5341,6 +5373,570 @@ def test_a_claude_error_result_carries_the_hint_too() -> None:
                 check('without printing its value', 'sk-ant-xyz' not in message, message)
     finally:
         bridge._run_cli = original
+# ------------------------------------ new_session=true means a new conversation, or nothing
+
+def _claude_panel_shim(session_id):
+    """A Claude stream shim driving `session_id`, or none at all when it is None."""
+    from cross_agent_mcp.claude_shim import ClaudeStreamShim
+    shim = ClaudeStreamShim.__new__(ClaudeStreamShim)
+    shim.agent = config.AGENT_CLAUDE
+    shim.session_id = session_id
+    shim.has_conversation = session_id is not None
+    shim.cwd = '/w'
+    shim.is_turn_active = False
+    shim.injection = None
+    shim.turns = {}
+    shim.awaiting_approval = None
+    shim.state_lock = threading.Lock()
+    shim.stdin_lock = threading.Lock()
+    shim.last_seen = time.time()
+    shim.last_user_activity = 0.0
+    shim.argv = ['--resume=' + (session_id or 'none')]
+    shim.real_binary = '/usr/bin/claude'
+    shim.log = _quiet_log()
+    shim.writes = []
+    shim.write_to_child = lambda payload: shim.writes.append(json.loads(payload))
+    return shim
+
+
+def test_a_busy_claude_panel_refuses_to_host_a_new_conversation() -> None:
+    """The reported bug: a null session id skipped the guard and the message went to whatever
+    conversation that panel was already driving."""
+    shim = _claude_panel_shim('9a2c4cd1-0000-4000-8000-00000000cafe')
+
+    refusal = shim.inject('fresh reviewer please', None, timeout=600, accept_timeout=2,
+                          create_new=True)
+    check('a fresh conversation is refused by a panel that already has one',
+          refusal.get('ok') is False and refusal.get('accepted') is False, str(refusal)[:200])
+    check('the refusal names the session it would otherwise have interrupted',
+          '9a2c4cd1-0000-4000-8000-00000000cafe' in str(refusal.get('error')),
+          str(refusal.get('error')))
+    check('and nothing at all was written into that conversation', shim.writes == [],
+          str(shim.writes))
+    check('while the session stays free for its own user',
+          shim.is_turn_active is False and shim.injection is None)
+
+    check('a panel driving a session does not offer to host a new one',
+          shim.status().get('can_create_session') is False)
+
+
+def test_an_idle_claude_panel_still_opens_one() -> None:
+    shim = _claude_panel_shim(None)
+    check('a panel with no conversation offers to host one',
+          shim.status().get('can_create_session') is True)
+
+    receipt = shim.inject('fresh reviewer please', None, timeout=600, accept_timeout=2,
+                          create_new=True)
+    check('and accepts a fresh conversation',
+          receipt.get('accepted') is True and receipt.get('wasCreated') is True,
+          str(receipt)[:200])
+    check('writing the message that opens it', len(shim.writes) == 1, str(shim.writes))
+
+
+def test_a_panel_that_cannot_create_is_not_chosen_to_create() -> None:
+    from cross_agent_mcp import uihook
+    busy_shim = {'agent': 'claude', 'pid': 101, 'socket': '/tmp/busy.sock', 'started_at': 200.0}
+    free_shim = {'agent': 'claude', 'pid': 102, 'socket': '/tmp/free.sock', 'started_at': 100.0}
+    statuses = {
+        '/tmp/busy.sock': {'ok': True, 'can_create_session': False,
+                           'sessions': [{'session_id': 'sid-busy'}]},
+        '/tmp/free.sock': {'ok': True, 'can_create_session': True, 'sessions': []},
+        # a shim from before this field existed cannot answer the question
+        '/tmp/old.sock': {'ok': True, 'sessions': [{'session_id': 'sid-old'}]},
+    }
+    old_shim = {'agent': 'claude', 'pid': 103, 'socket': '/tmp/old.sock', 'started_at': 300.0}
+
+    originals = (uihook.find_local_shims, uihook.read_status)
+    uihook.read_status = lambda shim: statuses[shim['socket']]
+    try:
+        uihook.find_local_shims = lambda agent: [busy_shim, free_shim]
+        host = uihook.find_panel_host('claude')
+        check('the newest panel is skipped when it cannot open a conversation',
+              (host or {}).get('shim', {}).get('pid') == 102, str(host))
+
+        uihook.find_local_shims = lambda agent: [busy_shim]
+        check('and when none can, no panel host is offered at all',
+              uihook.find_panel_host('claude') is None)
+
+        uihook.find_local_shims = lambda agent: [old_shim]
+        check('a shim too old to answer is not chosen either',
+              uihook.find_panel_host('claude') is None)
+    finally:
+        (uihook.find_local_shims, uihook.read_status) = originals
+
+
+def test_a_forced_new_session_never_resolves_to_an_existing_one() -> None:
+    from cross_agent_mcp import uihook
+    existing = {'agent': 'claude', 'session_id': 'sid-in-use', 'cwd': '/w',
+                'shim': {'pid': 1, 'socket': '/tmp/x.sock'}, 'is_active': True, 'mtime': 1.0}
+    originals = (uihook.is_enabled, uihook.find_live_session, uihook.find_panel_host,
+                 discovery.find_active_session)
+    uihook.is_enabled = lambda: True
+    uihook.find_live_session = lambda agent, session_id=None: dict(existing)
+    discovery.find_active_session = lambda *a, **kw: dict(existing)
+    try:
+        uihook.find_panel_host = lambda agent: None
+        target = bridge._resolve_target('claude', None, 'cwd', '/w', True, [])
+        check('with no panel able to create one, no session is resolved at all',
+              target is None, str(target))
+
+        uihook.find_panel_host = lambda agent: {'session_id': None, 'cwd': None,
+                                                'shim': {'pid': 9}, 'opens_new_session': True}
+        target = bridge._resolve_target('claude', None, 'cwd', '/w', True, [])
+        check('and a panel that can create one is targeted with no session id',
+              (target or {}).get('session_id') is None
+              and (target or {}).get('source') == 'ide-panel-new', str(target))
+    finally:
+        (uihook.is_enabled, uihook.find_live_session, uihook.find_panel_host,
+         discovery.find_active_session) = originals
+
+
+def test_a_reused_session_is_caught_even_if_a_shim_claims_otherwise() -> None:
+    """Belt and braces: the shim refuses what it cannot do, this catches it saying it did."""
+    before = {'sid-already-running', 'sid-other'}
+
+    def outcome(response):
+        try:
+            return 'accepted' if bridge._raise_unless_really_new(response, before) else 'not yet'
+        except bridge.BridgeError as e:
+            return str(e)
+
+    check('a session that existed before the request is not a new one',
+          'was already running' in outcome({'wasCreated': True,
+                                            'sessionId': 'sid-already-running'}))
+    check('not even while the turn is still running',
+          'was already running' in outcome({'wasCreated': True, 'pending': True,
+                                            'sessionId': 'sid-already-running'}))
+    check('nor is one the shim did not report as created',
+          'did not report as new' in outcome({'wasCreated': False, 'sessionId': 'sid-fresh'}))
+    check('a genuinely new session passes',
+          outcome({'wasCreated': True, 'sessionId': 'sid-fresh'}) == 'accepted')
+    check('and the refusal says nothing further was sent',
+          'Nothing further was sent' in outcome({'wasCreated': False, 'sessionId': 'x'}))
+
+    # A Claude CLI that has not announced its id names a new conversation only in its output
+    # after the write. That hand-over names no session, and is not yet an answer either way.
+    check('a hand-over that cannot name the new session yet is waited on, not refused',
+          outcome({'wasCreated': True, 'pending': True, 'sessionId': None}) == 'not yet')
+    unnamed = outcome({'wasCreated': True, 'sessionId': None})
+    check('but a turn that ended without ever naming one is refused',
+          'an unnamed session' in unnamed and 'never identified' in unnamed, unnamed)
+
+
+def test_the_codex_shim_opens_a_thread_rather_than_reusing_one() -> None:
+    from cross_agent_mcp.appserver_shim import CodexAppServerShim
+    shim = CodexAppServerShim.__new__(CodexAppServerShim)
+    shim.agent = config.AGENT_CODEX
+    shim.threads = {'thread-existing': {'thread_id': 'thread-existing', 'last_seen': 10.0}}
+    shim.state_lock = threading.Lock()
+    check('an existing thread is what it would normally pick',
+          shim._pick_thread(None) == 'thread-existing')
+
+    asked = []
+    shim._open_thread = lambda cwd, timeout: asked.append(('open', cwd)) or _ThreadOpened('new-1')
+    shim._note_thread = lambda *a, **kw: None
+    shim._name_thread = lambda *a, **kw: None
+    shim._is_loaded = lambda thread_id: True
+    shim._start_turn = lambda thread_id, text, is_created, timeout, accept: asked.append(
+        ('turn', thread_id, is_created)) or _AcceptedTurn(thread_id, is_created)
+    shim.settle = lambda turn: {'ok': True, 'accepted': True, 'sessionId': turn.session_id,
+                                'wasCreated': turn.is_created}
+
+    result = shim.inject('hello', None, timeout=60, create_new=True)
+    check('asked for a fresh thread, it opens one instead of picking that thread',
+          ('open', None) in asked and ('turn', 'new-1', True) in asked, str(asked))
+    check('and reports the new thread as created',
+          result.get('sessionId') == 'new-1' and result.get('wasCreated') is True, str(result))
+
+    check('asking for a new thread and naming one at once is refused',
+          shim.inject('hello', 'thread-existing', timeout=60,
+                      create_new=True).get('accepted') is False)
+
+
+class _ThreadOpened:
+    def __init__(self, thread_id):
+        self.thread_id = thread_id
+        self.error = None
+
+
+class _AcceptedTurn:
+    def __init__(self, session_id, is_created):
+        self.session_id = session_id
+        self.is_created = is_created
+        self.error = None
+
+
+def test_a_recovered_answer_must_echo_the_request_it_answers() -> None:
+    """Recovery reads a transcript the human is also using. Freshness is not evidence."""
+    sent_at = 1_788_500_000.0
+    mine = 'req_1788500000000_abcdef'
+
+    def job_for(target_session_id='sid-peer'):
+        return outbox.Job(
+            target_agent='claude', target_session_id=target_session_id, payload='q',
+            run_cwd='/w', pin_cwd='/w', env={}, timeout=600, ui_shim=None, title=None,
+            conversation_id='conv_recover', hop=1, sender_agent='codex',
+            sender_session_id='sid-me', wants_reply=True, summary='q', delivery_id=mine)
+
+    with tempfile.TemporaryDirectory(prefix='claude-recover-') as store:
+        path = store + '/session.jsonl'
+        original = discovery.find_session
+        discovery.find_session = lambda agent, sid: {'path': path}
+        try:
+            # the human asked the same session something else while we waited
+            open(path, 'w', encoding='utf-8').write(
+                _claude_line('네, 소라 세트로 하겠습니다.', 'end_turn', 'r1', sent_at + 300) + '\n')
+            job = job_for()
+            job.started_at = sent_at
+            check('an unrelated later turn is not recovered as our answer',
+                  bridge._recover_reply(job) is None)
+
+            progress = discovery.peer_progress('claude', 'sid-peer', after=sent_at, token=mine)
+            check('and it is reported as context, under its own name',
+                  progress.get('unmatched_turn') == '네, 소라 세트로 하겠습니다.'
+                  and progress.get('answer') is None, str(progress)[:200])
+
+            # the peer's real answer arrives, ending with the id it was asked to echo
+            open(path, 'a', encoding='utf-8').write(
+                _claude_line(f'검토 끝났습니다.\n{mine}', 'end_turn', 'r2', sent_at + 600) + '\n')
+            recovered = bridge._recover_reply(job)
+            check('the turn that echoes the request is recovered',
+                  (recovered or '').startswith('검토 끝났습니다.'), str(recovered)[:120])
+            check('and nothing is left dangling as context once it is found',
+                  discovery.peer_progress('claude', 'sid-peer', after=sent_at,
+                                          token=mine).get('unmatched_turn') is None)
+        finally:
+            discovery.find_session = original
+
+
+def test_require_refuses_a_fresh_conversation_the_panel_cannot_open() -> None:
+    """`require` exists so a delivery never silently becomes invisible; a new conversation is
+    no exception."""
+    from cross_agent_mcp import uihook
+    original = (uihook.find_panel_host, config.UI_HOOK_MODE)
+    uihook.find_panel_host = lambda agent: None
+    try:
+        config.UI_HOOK_MODE = uihook.UI_HOOK_REQUIRE
+        try:
+            bridge._resolve_target('claude', None, 'cwd', '/w', True, [])
+            check('require refuses when no panel can open a conversation', False,
+                  'no error raised')
+        except bridge.BridgeError as e:
+            check('require refuses when no panel can open a conversation',
+                  'Nothing was sent' in str(e), str(e))
+            check('and says the headless CLI is what it is ruling out',
+                  'headless' in str(e) and 'CROSS_AGENT_UI_HOOK=require' in str(e), str(e))
+
+        config.UI_HOOK_MODE = uihook.UI_HOOK_AUTO
+        check('auto falls through to the CLI instead of failing',
+              bridge._resolve_target('claude', None, 'cwd', '/w', True, []) is None)
+    finally:
+        (uihook.find_panel_host, config.UI_HOOK_MODE) = original
+
+
+def test_a_fresh_cli_session_is_created_under_the_id_the_caller_was_given() -> None:
+    """The receipt names the session, so the caller can address it from its next message."""
+    seen = {}
+
+    def fake_run(command, cwd, env, timeout):
+        seen['command'] = command
+        payload = json.dumps({'type': 'result', 'session_id': command[command.index(
+            '--session-id') + 1] if '--session-id' in command else None, 'result': 'hi'})
+        return __import__('subprocess').CompletedProcess(command, 0, payload + '\n', '')
+
+    original = bridge._run_cli
+    bridge._run_cli = fake_run
+    try:
+        result = bridge._call_claude('hello', 'a4f1c2d0-1111-4000-8000-000000000001', '/w', {},
+                                     600, None, None, is_new_session=True)
+        check('an allocated id creates a session rather than resuming one',
+              '--session-id' in seen['command'] and '--resume' not in seen['command'],
+              str(seen['command']))
+        check('the session it created is the one the caller was told about',
+              result['session_id'] == 'a4f1c2d0-1111-4000-8000-000000000001'
+              and result['is_new_session'] is True, str(result))
+
+        bridge._call_claude('hello', 'a4f1c2d0-1111-4000-8000-000000000001', '/w', {}, 600)
+        check('without that flag the same id still resumes, as before',
+              '--resume' in seen['command'], str(seen['command']))
+    finally:
+        bridge._run_cli = original
+
+
+def test_a_forced_new_codex_session_is_not_resumed() -> None:
+    seen = {}
+
+    def fake_run(command, cwd, env, timeout):
+        seen['command'] = command
+        event = json.dumps({'type': 'item.completed',
+                            'item': {'type': 'agent_message', 'text': 'hi'}})
+        started = json.dumps({'type': 'thread.started', 'thread_id': 'thread-brand-new'})
+        return __import__('subprocess').CompletedProcess(command, 0, started + '\n' + event, '')
+
+    original = bridge._run_cli
+    bridge._run_cli = fake_run
+    try:
+        result = bridge._call_codex('hello', None, '/w', {}, 600, None, None,
+                                    is_new_session=True)
+        check('a forced new codex session is started, never resumed',
+              'resume' not in seen['command'], str(seen['command']))
+        check('and the thread the CLI issued is reported back',
+              result['session_id'] == 'thread-brand-new'
+              and result['is_new_session'] is True, str(result))
+    finally:
+        bridge._run_cli = original
+
+
+def test_an_answer_that_mentions_two_requests_is_matched_by_the_right_one() -> None:
+    """Agents quote ids. An answer that refers back to an earlier request and then ends with
+    this one - exactly the shape the envelope asks for - was read as answering the other."""
+    sent_at = 1_788_600_000.0
+    mine = 'req_1788600000000_aaaaaa'
+    older = 'req_1788500000000_bbbbbb'
+    answer = (f'Picking up where {older} left off - the registry change is done and the '
+              f'tests pass.\n{mine}')
+
+    with tempfile.TemporaryDirectory(prefix='claude-two-tokens-') as store:
+        path = store + '/session.jsonl'
+        original = discovery.find_session
+        discovery.find_session = lambda agent, sid: {'path': path}
+        try:
+            open(path, 'w', encoding='utf-8').write(
+                _claude_line(answer, 'end_turn', 'r1', sent_at + 100) + '\n')
+
+            check('every id a message mentions is found, not just the first',
+                  discovery.request_tokens_in(answer) == [older, mine],
+                  str(discovery.request_tokens_in(answer)))
+            check('an answer quoting an older request still answers this one',
+                  discovery.last_agent_message('claude', 'sid', after=sent_at, token=mine)
+                  == answer)
+            check('and it is not filed as an unrelated turn',
+                  discovery.peer_progress('claude', 'sid', after=sent_at,
+                                          token=mine).get('unmatched_turn') is None)
+            check('while a request it only quotes is still not answered by it',
+                  discovery.last_agent_message('claude', 'sid', after=sent_at - 1000,
+                                               token='req_1788400000000_cccccc') is None)
+            check('the transcript check agrees',
+                  bridge._transcript_answer('claude', 'sid', sent_at, mine) == answer)
+        finally:
+            discovery.find_session = original
+
+
+def test_a_busy_panel_and_an_old_shim_are_handled_the_same_under_both_modes() -> None:
+    """The two ways a panel can fail to host a fresh conversation, against both hook modes."""
+    from cross_agent_mcp import uihook
+    busy = {'agent': 'claude', 'pid': 201, 'socket': '/tmp/busy2.sock', 'started_at': 200.0}
+    old = {'agent': 'claude', 'pid': 202, 'socket': '/tmp/old2.sock', 'started_at': 100.0}
+    statuses = {
+        # a panel already driving a conversation says so
+        '/tmp/busy2.sock': {'ok': True, 'can_create_session': False,
+                            'sessions': [{'session_id': 'sid-busy'}]},
+        # a shim from before the field existed cannot answer at all
+        '/tmp/old2.sock': {'ok': True, 'sessions': [{'session_id': 'sid-old'}]},
+    }
+    originals = (uihook.find_local_shims, uihook.read_status, config.UI_HOOK_MODE,
+                 uihook.is_enabled, discovery.find_active_session)
+    uihook.read_status = lambda shim: statuses[shim['socket']]
+    uihook.is_enabled = lambda: True
+    # an active session exists on disk, so falling back would land in a real conversation
+    discovery.find_active_session = lambda *a, **kw: {
+        'agent': 'claude', 'session_id': 'sid-active', 'cwd': '/w', 'is_active': True,
+        'mtime': 1.0}
+    try:
+        for label, shims in (('a busy panel', [busy]), ('an old shim', [old]),
+                             ('both together', [busy, old])):
+            uihook.find_local_shims = lambda agent, _s=shims: list(_s)
+
+            config.UI_HOOK_MODE = uihook.UI_HOOK_AUTO
+            target = bridge._resolve_target('claude', None, 'cwd', '/w', True, [])
+            check(f'auto: {label} yields no panel target, so the CLI creates a fresh one',
+                  target is None, str(target))
+
+            config.UI_HOOK_MODE = uihook.UI_HOOK_REQUIRE
+            try:
+                bridge._resolve_target('claude', None, 'cwd', '/w', True, [])
+                check(f'require: {label} is refused', False, 'no error raised')
+            except bridge.BridgeError as e:
+                check(f'require: {label} is refused', 'Nothing was sent' in str(e), str(e))
+    finally:
+        (uihook.find_local_shims, uihook.read_status, config.UI_HOOK_MODE,
+         uihook.is_enabled, discovery.find_active_session) = originals
+
+
+def _deliver_through(shim):
+    """`uihook.send` as the socket would carry it: every argument, into this very shim."""
+    def send(text, ui_shim, session_id, timeout, cwd=None, title=None, accept_timeout=None,
+             create_new=False):
+        return shim.inject(text, session_id, timeout, cwd, title, accept_timeout, create_new)
+    return send
+
+
+def test_a_fresh_claude_panel_conversation_passes_the_bridge_check() -> None:
+    """Without startup hooks the Claude CLI names a new conversation only in its own output,
+    after the message is written, so the panel's hand-over names no session. The check that a
+    new one was opened read that as the panel having failed, and refused every such delivery."""
+    from cross_agent_mcp import uihook
+    shim = _claude_panel_shim(None)
+
+    def await_turn(ui_shim, injection_id, timeout):
+        # the CLI takes the message, names the conversation it opened, and answers
+        shim._observe_from_agent({'type': 'system', 'subtype': 'init', 'session_id': 'sid-new'})
+        shim._observe_from_agent({'type': 'result', 'result': 'fresh answer',
+                                  'session_id': 'sid-new'})
+        return shim.await_turn(injection_id, timeout)
+
+    originals = (uihook.send, uihook.await_turn, bridge._live_session_ids)
+    uihook.send = _deliver_through(shim)
+    uihook.await_turn = await_turn
+    bridge._live_session_ids = lambda agent: {'sid-other'}
+    try:
+        result = bridge._call_via_panel('fresh reviewer please', None, {'socket': '/s'}, 600,
+                                        '/w', target_agent='claude', is_new_session=True)
+        check('a new conversation opened by an idle Claude panel is delivered, not refused',
+              result.get('reply') == 'fresh answer', str(result))
+        check('and reported under the id the CLI gave it',
+              result.get('session_id') == 'sid-new' and result.get('is_new_session') is True,
+              str(result))
+    except bridge.BridgeError as e:
+        check('a new conversation opened by an idle Claude panel is delivered, not refused',
+              False, str(e))
+    finally:
+        (uihook.send, uihook.await_turn, bridge._live_session_ids) = originals
+
+
+def test_a_panel_whose_cli_announced_its_id_early_can_still_host_one() -> None:
+    """With startup hooks configured the CLI names its session before anyone types, so a panel
+    with no conversation already has an id. Reading an id as "busy" ruled out every such panel
+    as a host, and counted the id it would open as a conversation that already existed."""
+    from cross_agent_mcp import uihook
+    shim = _claude_panel_shim(None)
+    shim._observe_from_agent({'type': 'system', 'subtype': 'hook_started',
+                              'session_id': 'sid-announced'})
+    check('a panel that announced an id but has no conversation offers to host one',
+          shim.status().get('can_create_session') is True, str(shim.status()))
+
+    originals = (uihook.find_live_sessions, uihook.find_foreign_sessions)
+    uihook.find_live_sessions = lambda agent: [dict(s) for s in shim.status()['sessions']]
+    uihook.find_foreign_sessions = lambda agent: [{'session_id': 'sid-elsewhere'}]
+    try:
+        existing = bridge._live_session_ids('claude')
+        check('its announced id is not a conversation that already existed',
+              existing == {'sid-elsewhere'}, str(existing))
+    finally:
+        (uihook.find_live_sessions, uihook.find_foreign_sessions) = originals
+
+    receipt = shim.inject('fresh reviewer please', None, timeout=600, accept_timeout=2,
+                          create_new=True)
+    check('the conversation opens there, under the id it announced',
+          receipt.get('accepted') is True and receipt.get('wasCreated') is True
+          and receipt.get('sessionId') == 'sid-announced', str(receipt)[:200])
+    check('which the bridge accepts as new from the hand-over on',
+          bridge._raise_unless_really_new(receipt, existing) is True)
+    check('and from then on the panel no longer offers to host another',
+          shim.status().get('can_create_session') is False)
+    check('so a second fresh conversation is refused there',
+          shim.inject('another', None, timeout=600, accept_timeout=2,
+                      create_new=True).get('accepted') is False)
+
+
+def test_a_conversation_started_while_the_message_waited_is_not_joined() -> None:
+    """The panel was free when asked, and the message waits for it to be idle before writing.
+    A human who starts a conversation in that window leaves it idle again - and driving one."""
+    shim = _claude_panel_shim(None)
+
+    def human_types_meanwhile(deadline):
+        shim._observe_from_client({'type': 'user'})
+        shim._observe_from_agent({'type': 'system', 'session_id': 'sid-human'})
+        shim._observe_from_agent({'type': 'result', 'result': 'hi', 'session_id': 'sid-human'})
+        return True
+
+    shim._wait_for_idle = human_types_meanwhile
+    refusal = shim.inject('fresh reviewer please', None, timeout=600, accept_timeout=2,
+                          create_new=True)
+    check('a conversation the human started during the wait is not joined',
+          refusal.get('accepted') is False and 'sid-human' in str(refusal.get('error')),
+          str(refusal)[:200])
+    check('and nothing was written into it', shim.writes == [], str(shim.writes))
+    check('which is left free for its own user', shim.injection is None)
+
+
+def test_a_panel_chosen_because_nothing_existed_is_told_to_open_one() -> None:
+    """A Codex panel given no thread hands the message to its newest one unless told to open
+    a thread - and resolution may have passed that thread over on purpose. A Claude panel is
+    told only when a new conversation was asked for: as the last resort, one the human has
+    started there since is where the message belongs."""
+    sent = []
+    originals = (bridge.uihook.send, bridge._live_session_ids)
+    bridge.uihook.send = lambda *a, **kw: sent.append(kw.get('create_new')) or {
+        'ok': True, 'sessionId': 'thr-new', 'wasCreated': True, 'reply': 'x'}
+    bridge._live_session_ids = lambda agent: set()
+    try:
+        bridge._call_via_panel('hi', None, {'socket': '/s'}, 600, '/w', target_agent='codex')
+        check('a Codex panel given no thread is told to open one, asked for or not',
+              sent == [True], str(sent))
+        sent.clear()
+        bridge._call_via_panel('hi', 'thr-1', {'socket': '/s'}, 600, '/w', target_agent='codex')
+        check('while a named session is addressed as it always was', sent == [False], str(sent))
+        sent.clear()
+        bridge._call_via_panel('hi', None, {'socket': '/s'}, 600, '/w', target_agent='claude')
+        check('a Claude panel chosen as the last resort is not told to open one',
+              sent == [False], str(sent))
+        sent.clear()
+        bridge._call_via_panel('hi', None, {'socket': '/s'}, 600, '/w', target_agent='claude',
+                               is_new_session=True)
+        check('while one asked for a new conversation is', sent == [True], str(sent))
+    finally:
+        (bridge.uihook.send, bridge._live_session_ids) = originals
+
+
+def test_a_last_resort_claude_panel_the_human_took_up_waits_and_joins() -> None:
+    """Nothing existed to resume, so an idle panel was chosen - and the human started a
+    conversation in it before the message arrived. Had that conversation existed a moment
+    earlier, resolution would have picked it as the one the user is working in, so the message
+    waits for the human's turn to end and goes in, instead of failing."""
+    from cross_agent_mcp import uihook
+    shim = _claude_panel_shim(None)
+    shim._observe_from_client({'type': 'user'})
+    shim._observe_from_agent({'type': 'system', 'session_id': 'sid-human'})
+
+    originals = (uihook.send, uihook.await_turn)
+    uihook.send = _deliver_through(shim)
+    try:
+        # the human's turn is still running when the message arrives
+        shim.is_turn_active = True
+        shim._wait_for_idle = lambda deadline: False
+        try:
+            bridge._call_via_panel('hi', None, {'socket': '/s'}, 600, '/w',
+                                   target_agent='claude')
+            check('a panel busy with the human\'s turn is waited for', False, 'nothing raised')
+        except outbox.PeerBusyError:
+            check('a panel busy with the human\'s turn is waited for, not refused', True)
+        except Exception as e:
+            check('a panel busy with the human\'s turn is waited for, not refused', False,
+                  repr(e))
+        check('and nothing was written while it was busy', shim.writes == [], str(shim.writes))
+
+        # the human's turn ends; the retry finds the panel free
+        shim._observe_from_agent({'type': 'result', 'result': 'human answer',
+                                  'session_id': 'sid-human'})
+        shim._wait_for_idle = lambda deadline: True
+
+        def await_turn(ui_shim, injection_id, timeout):
+            shim._observe_from_agent({'type': 'result', 'result': 'bridged answer',
+                                      'session_id': 'sid-human'})
+            return shim.await_turn(injection_id, timeout)
+
+        uihook.await_turn = await_turn
+        result = bridge._call_via_panel('hi', None, {'socket': '/s'}, 600, '/w',
+                                        target_agent='claude')
+        check('once it is free the message goes into the conversation the human started',
+              result.get('session_id') == 'sid-human' and result.get('reply') == 'bridged answer',
+              str(result))
+        check('reported as joining it, not as opening one',
+              result.get('is_new_session') is False, str(result))
+        check('written exactly once', len(shim.writes) == 1, str(shim.writes))
+    finally:
+        (uihook.send, uihook.await_turn) = originals
 
 
 def run_all() -> None:
@@ -5473,6 +6069,23 @@ def run_all() -> None:
     test_a_proxy_password_is_never_stripped_out_and_forwarded()
     test_a_credential_bearing_proxy_can_still_be_opted_into()
     test_a_claude_error_result_carries_the_hint_too()
+    test_a_busy_claude_panel_refuses_to_host_a_new_conversation()
+    test_an_idle_claude_panel_still_opens_one()
+    test_a_panel_that_cannot_create_is_not_chosen_to_create()
+    test_a_forced_new_session_never_resolves_to_an_existing_one()
+    test_a_reused_session_is_caught_even_if_a_shim_claims_otherwise()
+    test_the_codex_shim_opens_a_thread_rather_than_reusing_one()
+    test_a_recovered_answer_must_echo_the_request_it_answers()
+    test_require_refuses_a_fresh_conversation_the_panel_cannot_open()
+    test_a_busy_panel_and_an_old_shim_are_handled_the_same_under_both_modes()
+    test_a_fresh_cli_session_is_created_under_the_id_the_caller_was_given()
+    test_a_forced_new_codex_session_is_not_resumed()
+    test_an_answer_that_mentions_two_requests_is_matched_by_the_right_one()
+    test_a_fresh_claude_panel_conversation_passes_the_bridge_check()
+    test_a_panel_whose_cli_announced_its_id_early_can_still_host_one()
+    test_a_conversation_started_while_the_message_waited_is_not_joined()
+    test_a_panel_chosen_because_nothing_existed_is_told_to_open_one()
+    test_a_last_resort_claude_panel_the_human_took_up_waits_and_joins()
 
 if __name__ == '__main__':
     # The delivery directory used to be redirected here on its own, because finished jobs left
