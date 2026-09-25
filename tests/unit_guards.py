@@ -697,6 +697,14 @@ def test_strict_mode_refuses_a_send_that_does_not_name_its_target() -> None:
           'refusing to relay' in (same.get('refusal') or '') and not same['submitted'],
           str(same.get('refusal') or (same.get('receipt') or {}).get('target_selected_by')))
 
+    unspaced = _strict_send(False, True, session_id='   ')
+    receipt = unspaced.get('receipt') or {}
+    check('without the mode, a whitespace-only session_id with no new_session reaches the pin '
+          'like naming nothing does, instead of failing as a name that matches nothing',
+          receipt.get('target_selected_by') == bridge.SELECTED_PIN
+          and receipt.get('target_session_id') == PINNED_SID,
+          str(unspaced.get('refusal') or receipt.get('target_selected_by')))
+
     unaddressed = _strict_send(False, False)
     receipt = unaddressed.get('receipt') or {}
     check('with the mode off, a send naming nothing is still delivered by discovery, and warned',

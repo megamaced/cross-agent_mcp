@@ -921,6 +921,7 @@ def _requested_session_id(target_agent: str, session_id: Optional[str],
     `session_id` may be a real id or the conversation's name, because that is what a human
     hands the agent. A sticky pin stands in when nothing was named.
     """
+    session_id = session_id.strip() if session_id else None
     if session_id:
         found = discovery.find_session(target_agent, session_id)
         if found:
